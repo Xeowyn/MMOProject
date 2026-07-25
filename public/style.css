@@ -197,6 +197,9 @@ main {
 .tab-panel {
   height: 100%;
   overflow-y: auto;
+  overflow-x: auto; /* narrow (phone-width) screens get a scrollbar on a
+                        wide panel instead of squished/clipped content —
+                        not a real mobile redesign, just a safety net */
 }
 
 #tab-overworld {
