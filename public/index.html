@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MMOProject (prototype)</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -17,6 +18,7 @@
   <p class="subtitle">fantasy idler MMO &mdash; prototype build</p>
   <form id="login-form">
     <input id="username-input" type="text" placeholder="Choose a name" maxlength="24" autocomplete="off" required>
+    <input id="password-input" type="password" placeholder="Password (blank if none set)" autocomplete="current-password">
     <button type="submit">Enter World</button>
   </form>
 </div>
@@ -26,6 +28,7 @@
   <p class="subtitle">Distribute your points across your traits, then begin your adventure.</p>
   <div id="trait-points-remaining">Points remaining: --</div>
   <div id="trait-allocation-list"></div>
+  <input id="creation-password-input" type="password" placeholder="Set a password (min 4 characters)" autocomplete="new-password">
   <button id="creation-begin-btn" disabled>Begin Adventure</button>
 </div>
 

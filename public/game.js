@@ -9,6 +9,7 @@ const SKILL_DISPLAY_NAMES = {
 
 const state = {
   playerId: localStorage.getItem('mmo_playerId') || null,
+  token: localStorage.getItem('mmo_token') || null,
   player: null,
   locations: [],
   others: [], // [{id, username, locationId}]
@@ -88,8 +89,14 @@ function clearError() {
 // of the button silently doing nothing.
 async function api(path, options) {
   let res;
+  // Every request that identifies a player must prove it with this token
+  // (see verifyToken() in store.js) — attached here once so no individual
+  // call site has to remember to do it.
+  const headers = Object.assign({}, options && options.headers);
+  if (state.token) headers['X-Player-Token'] = state.token;
+  const finalOptions = Object.assign({}, options, { headers });
   try {
-    res = await fetch(path, options);
+    res = await fetch(path, finalOptions);
   } catch (err) {
     showError('Cannot reach the server. Is `npm start` still running?');
     throw err;
@@ -111,13 +118,14 @@ async function api(path, options) {
 document.getElementById('login-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const username = document.getElementById('username-input').value.trim();
+  const password = document.getElementById('password-input').value;
   if (!username) return;
   let result;
   try {
     result = await api('/api/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username }),
+      body: JSON.stringify({ username, password }),
     });
   } catch {
     return;
@@ -126,12 +134,19 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
     await showCreationScreen(result.username);
     return;
   }
-  finishLogin(result.player);
+  finishLogin(result.player, result.token);
 });
 
-function finishLogin(player) {
+function finishLogin(player, token) {
   state.playerId = player.id;
   localStorage.setItem('mmo_playerId', player.id);
+  // token is null for legacy/no-password accounts (see verifyToken() in
+  // store.js) — clearing any stale token in that case, not just skipping
+  // the write, so a re-login on a legacy account can't keep sending a
+  // leftover token from a previous session on this browser.
+  state.token = token || null;
+  if (state.token) localStorage.setItem('mmo_token', state.token);
+  else localStorage.removeItem('mmo_token');
   state.player = player;
   enterGame();
 }
@@ -212,18 +227,19 @@ function renderCreationScreen() {
 
 document.getElementById('creation-begin-btn').addEventListener('click', async () => {
   if (creationPointsRemaining() !== 0) return;
+  const password = document.getElementById('creation-password-input').value;
   let result;
   try {
     result = await api('/api/create-character', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: state.creationUsername, traits: state.creationTraits }),
+      body: JSON.stringify({ username: state.creationUsername, traits: state.creationTraits, password }),
     });
   } catch {
     return;
   }
   document.getElementById('creation-screen').classList.add('hidden');
-  finishLogin(result.player);
+  finishLogin(result.player, result.token);
 });
 
 async function enterGame() {
@@ -2309,7 +2325,7 @@ window.dev = {
 console.log('%cDev commands available — type dev.help() in this console.', 'color:#d8b04a;font-weight:bold;');
 
 if (state.playerId) {
-  fetch(`/api/me?playerId=${state.playerId}`)
+  fetch(`/api/me?playerId=${state.playerId}`, { headers: state.token ? { 'X-Player-Token': state.token } : {} })
     .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))))
     .then((player) => {
       state.player = player;
@@ -2321,8 +2337,10 @@ if (state.playerId) {
         showError('Cannot reach the server. Is `npm start` still running?');
         return;
       }
-      // server reachable but this playerId is no longer valid
+      // server reachable but this playerId/token is no longer valid
       localStorage.removeItem('mmo_playerId');
+      localStorage.removeItem('mmo_token');
       state.playerId = null;
+      state.token = null;
     });
 }

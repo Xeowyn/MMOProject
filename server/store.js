@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 // Overridable so testing/dev tooling can point at a scratch file instead of
 // risking the real save data (this file is the actual player database).
@@ -950,16 +951,50 @@ function getLocation(id) {
   return LOCATIONS.find((l) => l.id === id) || null;
 }
 
+// --- account security: password (login gate) + bearer token (per-request auth) ---
+// Added once the game became reachable over a real internet tunnel rather
+// than just localhost — a friend's playerId is broadcast to every other
+// connected client (needed for the "nearby adventurers" presence list), so
+// without a token check anyone could copy that id out of the websocket
+// traffic and issue actions as that player without ever needing their
+// password. Every account created from here on gets both; accounts that
+// existed before this shipped are backfilled with passwordHash/token left
+// null (see ensurePlayerShape) so they keep working exactly as before —
+// deliberately not force-migrating the user's own existing real account.
+function hashPassword(password, salt) {
+  return crypto.scryptSync(String(password), salt, 64).toString('hex');
+}
+function makePasswordRecord(password) {
+  const passwordSalt = crypto.randomBytes(16).toString('hex');
+  return { passwordHash: hashPassword(password, passwordSalt), passwordSalt };
+}
+function verifyPassword(player, password) {
+  if (!player.passwordHash) return true; // legacy/no-password account — unchanged open behavior
+  if (!password) return false;
+  const candidate = Buffer.from(hashPassword(password, player.passwordSalt), 'hex');
+  const actual = Buffer.from(player.passwordHash, 'hex');
+  return candidate.length === actual.length && crypto.timingSafeEqual(candidate, actual);
+}
+// Used by the server's auth middleware on every mutating/read request.
+// player.token === null means a legacy account with enforcement off, exactly
+// matching today's wide-open behavior for any account that predates this.
+function verifyToken(player, suppliedToken) {
+  return player.token === null || player.token === suppliedToken;
+}
+
 // traits: {strength, dexterity, luck, vigor} — always provided by
 // createCharacter() (validated there); defaults to an even TRAIT_BASE spread
 // only as a fallback (devResetPlayer/legacy callers never actually hit this,
 // but keeps newPlayer callable without traits from not blowing up).
-function newPlayer(username, traits) {
+function newPlayer(username, traits, passwordRecord) {
   const startLoc = LOCATIONS.find((l) => l.startingLocation);
   const id = 'p_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   const player = {
     id,
     username,
+    passwordHash: passwordRecord ? passwordRecord.passwordHash : null,
+    passwordSalt: passwordRecord ? passwordRecord.passwordSalt : null,
+    token: crypto.randomBytes(24).toString('hex'),
     createdAt: Date.now(),
     currentLocation: startLoc.id,
     discoveries: [startLoc.id],
@@ -1001,12 +1036,14 @@ function newPlayer(username, traits) {
 // it hands back { existing: false, username } so the client can show the
 // trait point-buy character-creation screen and call createCharacter()
 // with the chosen traits. A recognized username logs in exactly as before.
-function login(username) {
+function login(username, password) {
   const clean = String(username || '').trim().slice(0, 24);
   if (!clean) return null;
   const existingId = db.usernames[clean.toLowerCase()];
   if (existingId && db.players[existingId]) {
-    return { existing: true, player: getPlayer(existingId) };
+    const player = getPlayer(existingId);
+    if (!verifyPassword(player, password)) return { existing: true, error: 'wrong_password' };
+    return { existing: true, player, token: player.token };
   }
   return { existing: false, username: clean };
 }
@@ -1015,10 +1052,13 @@ function login(username) {
 // TRAIT_EXTRA_POINTS to distribute, each trait clamped to
 // [TRAIT_MIN, TRAIT_MAX]) server-side — never trusts the client's math even
 // though the UI enforces it too.
-function createCharacter(username, rawTraits) {
+const MIN_PASSWORD_LENGTH = 4;
+
+function createCharacter(username, rawTraits, password) {
   const clean = String(username || '').trim().slice(0, 24);
   if (!clean) return { error: 'invalid_username' };
   if (db.usernames[clean.toLowerCase()]) return { error: 'username_taken' };
+  if (String(password || '').length < MIN_PASSWORD_LENGTH) return { error: 'password_too_short' };
 
   const traits = {};
   for (const key of TRAIT_KEYS) {
@@ -1029,8 +1069,8 @@ function createCharacter(username, rawTraits) {
   const totalExtra = TRAIT_KEYS.reduce((sum, k) => sum + (traits[k] - TRAIT_BASE), 0);
   if (totalExtra !== TRAIT_EXTRA_POINTS) return { error: 'invalid_point_total' };
 
-  const player = newPlayer(clean, traits);
-  return { ok: true, player: publicPlayer(player) };
+  const player = newPlayer(clean, traits, makePasswordRecord(password));
+  return { ok: true, player: publicPlayer(player), token: player.token };
 }
 
 // Any player created before a given feature existed (equipment/garden/combat
@@ -1155,6 +1195,15 @@ function ensurePlayerShape(player) {
   }
   if (player.skills.mining && player.skills.mining.activeNode === undefined) {
     player.skills.mining.activeNode = null;
+    changed = true;
+  }
+  if (player.passwordHash === undefined) {
+    player.passwordHash = null;
+    player.passwordSalt = null;
+    changed = true;
+  }
+  if (player.token === undefined) {
+    player.token = null; // legacy account — auth stays open, see verifyToken()
     changed = true;
   }
 
@@ -2863,6 +2912,7 @@ module.exports = {
   TRAIT_EXTRA_POINTS,
   login,
   createCharacter,
+  verifyToken,
   getPlayer,
   publicPlayer,
   startExpedition,

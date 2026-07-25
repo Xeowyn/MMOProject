@@ -33,6 +33,58 @@ app.use(
   })
 );
 
+// Coarse per-IP rate limit — insurance against a runaway client loop or
+// someone hammering the API once the link is shared over the open internet,
+// not fine-grained throttling. Generous on purpose: a single player during
+// combat/exploration polls every 300ms (~33 req/10s) plus occasional action
+// posts, so this only ever trips on something clearly abnormal.
+// cf-connecting-ip is what Cloudflare Tunnel forwards as the real client IP
+// (req.ip would otherwise be the tunnel's local loopback for every request).
+const RATE_LIMIT_WINDOW_MS = 10000;
+const RATE_LIMIT_MAX = 300;
+const rateLimitBuckets = new Map(); // ip -> {count, windowStart}
+setInterval(() => {
+  const cutoff = Date.now() - RATE_LIMIT_WINDOW_MS * 2;
+  for (const [ip, bucket] of rateLimitBuckets.entries()) {
+    if (bucket.windowStart < cutoff) rateLimitBuckets.delete(ip);
+  }
+}, 60000).unref();
+
+app.use('/api', (req, res, next) => {
+  const ip = req.headers['cf-connecting-ip'] || req.ip;
+  const now = Date.now();
+  let bucket = rateLimitBuckets.get(ip);
+  if (!bucket || now - bucket.windowStart > RATE_LIMIT_WINDOW_MS) {
+    bucket = { count: 0, windowStart: now };
+    rateLimitBuckets.set(ip, bucket);
+  }
+  bucket.count++;
+  if (bucket.count > RATE_LIMIT_MAX) {
+    return res.status(429).json({ error: 'rate_limited' });
+  }
+  next();
+});
+
+// Per-request bearer-token auth. Any request carrying a playerId (body for
+// POST, query for GET) must present the matching X-Player-Token header —
+// this is what actually stops one player from acting as another using an id
+// copied out of the websocket presence broadcast (see verifyToken() in
+// store.js for why the id alone was never enough once this crossed onto the
+// open internet). Requests with no playerId at all (login, static metadata
+// GETs) pass through untouched — nothing to check yet. Legacy accounts
+// (player.token === null, created before this shipped) stay fully open,
+// exactly as before.
+app.use('/api', (req, res, next) => {
+  const playerId = (req.body && req.body.playerId) || req.query.playerId;
+  if (!playerId) return next();
+  const player = store.getPlayer(playerId);
+  if (!player) return next(); // let the route's own not_found handling fire
+  if (!store.verifyToken(player, req.headers['x-player-token'])) {
+    return res.status(401).json({ error: 'invalid_token' });
+  }
+  next();
+});
+
 app.get('/api/locations', (req, res) => {
   res.json(
     store.LOCATIONS.map((l) => ({
@@ -72,16 +124,17 @@ app.get('/api/trait-config', (req, res) =>
 // instead of auto-creating a player, so the client can show the trait
 // point-buy character-creation screen and call /api/create-character next.
 app.post('/api/login', (req, res) => {
-  const result = store.login(req.body.username);
+  const result = store.login(req.body.username, req.body.password);
   if (!result) return res.status(400).json({ error: 'invalid_username' });
+  if (result.error === 'wrong_password') return res.status(401).json({ error: 'wrong_password' });
   if (!result.existing) return res.json({ existing: false, username: result.username });
-  res.json({ existing: true, player: store.publicPlayer(result.player) });
+  res.json({ existing: true, player: store.publicPlayer(result.player), token: result.token });
 });
 
 app.post('/api/create-character', (req, res) => {
-  const result = store.createCharacter(req.body.username, req.body.traits);
+  const result = store.createCharacter(req.body.username, req.body.traits, req.body.password);
   if (result.error) return res.status(400).json(result);
-  res.json({ existing: true, player: result.player });
+  res.json({ existing: true, player: result.player, token: result.token });
 });
 
 app.get('/api/me', (req, res) => {
