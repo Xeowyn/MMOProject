@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MMOProject (prototype)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Spectral:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="error-banner" class="hidden"></div>
+
+<div id="login-screen">
+  <h1>MMOProject</h1>
+  <p class="subtitle">fantasy idler MMO &mdash; prototype build</p>
+  <form id="login-form">
+    <input id="username-input" type="text" placeholder="Choose a name" maxlength="24" autocomplete="off" required>
+    <button type="submit">Enter World</button>
+  </form>
+</div>
+
+<div id="creation-screen" class="hidden">
+  <h1>Build Your Character</h1>
+  <p class="subtitle">Distribute your points across your traits, then begin your adventure.</p>
+  <div id="trait-points-remaining">Points remaining: --</div>
+  <div id="trait-allocation-list"></div>
+  <button id="creation-begin-btn" disabled>Begin Adventure</button>
+</div>
+
+<div id="game-screen" class="hidden">
+  <header id="topbar">
+    <span id="player-name"></span>
+    <span id="gold-display">Gold: --</span>
+    <span id="toast"></span>
+  </header>
+
+  <nav id="tab-nav">
+    <button class="tab-btn active" data-tab="overworld"><span class="tab-icon">🗺️</span>Overworld</button>
+    <button class="tab-btn" data-tab="mining"><span class="tab-icon">⛏️</span>Mining</button>
+    <button class="tab-btn" data-tab="skills"><span class="tab-icon">📈</span>Skills</button>
+    <button class="tab-btn" data-tab="character"><span class="tab-icon">🧬</span>Character</button>
+    <button class="tab-btn" data-tab="combat"><span class="tab-icon">⚔️</span>Combat</button>
+    <button class="tab-btn" data-tab="inventory"><span class="tab-icon">🎒</span>Inventory</button>
+    <button class="tab-btn" data-tab="equipment"><span class="tab-icon">🛡️</span>Equipment</button>
+    <button class="tab-btn" data-tab="gardening"><span class="tab-icon">🌾</span>Gardening</button>
+    <button class="tab-btn" data-tab="farming"><span class="tab-icon">🐄</span>Farming</button>
+    <button class="tab-btn" data-tab="crafting"><span class="tab-icon">🔨</span>Crafting</button>
+    <button class="tab-btn" data-tab="alchemy"><span class="tab-icon">🧪</span>Alchemy</button>
+    <button class="tab-btn" data-tab="buildings"><span class="tab-icon">🏛️</span>Buildings</button>
+    <button class="tab-btn" data-tab="npcs"><span class="tab-icon">💬</span>NPCs</button>
+    <button class="tab-btn" data-tab="tavern"><span class="tab-icon">🍺</span>Tavern</button>
+    <button class="tab-btn" data-tab="shop"><span class="tab-icon">🛒</span>Shop</button>
+    <button class="tab-btn" data-tab="stats"><span class="tab-icon">📜</span>Statistics</button>
+  </nav>
+
+  <main>
+    <div id="tab-overworld" class="tab-panel">
+      <div id="map-wrap">
+        <canvas id="map-canvas" width="1600" height="1000"></canvas>
+        <div id="map-controls">
+          <button id="zoom-in-btn" title="Zoom in">+</button>
+          <button id="zoom-out-btn" title="Zoom out">&minus;</button>
+          <button id="center-btn" title="Center on me">&#8982;</button>
+        </div>
+      </div>
+
+      <aside id="sidebar">
+        <section class="panel">
+          <h2>Exploration</h2>
+          <div id="current-location">Location: --</div>
+          <div id="supplies-info">Supplies: -- (max range --)</div>
+          <div id="draw-hint" class="hidden">Click and drag on the map to draw a route from your location, in any shape.</div>
+          <div id="draw-status" class="hidden"></div>
+          <button id="explore-btn">Explore</button>
+          <div id="draw-controls" class="hidden">
+            <button id="confirm-btn">Confirm Route</button>
+            <button id="cancel-btn">Cancel</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Gather</h2>
+          <div class="task-row">
+            <canvas id="hunting-clock" class="task-clock" width="56" height="56"></canvas>
+            <div class="task-info">
+              <div class="bar-wrap"><div id="hunting-bar-fill" class="bar-fill"></div></div>
+              <div id="hunting-label" class="skill-label"></div>
+            </div>
+          </div>
+          <button id="hunting-btn"></button>
+
+          <div class="task-row" style="margin-top: 14px;">
+            <canvas id="scavenging-clock" class="task-clock" width="56" height="56"></canvas>
+            <div class="task-info">
+              <div class="bar-wrap"><div id="scavenging-bar-fill" class="bar-fill"></div></div>
+              <div id="scavenging-label" class="skill-label"></div>
+            </div>
+          </div>
+          <button id="scavenging-btn"></button>
+
+          <div class="task-row" style="margin-top: 14px;">
+            <canvas id="harvesting-clock" class="task-clock" width="56" height="56"></canvas>
+            <div class="task-info">
+              <div class="bar-wrap"><div id="harvesting-bar-fill" class="bar-fill"></div></div>
+              <div id="harvesting-label" class="skill-label"></div>
+            </div>
+          </div>
+          <button id="harvesting-btn"></button>
+        </section>
+
+        <section class="panel">
+          <h2>Nearby Adventurers</h2>
+          <ul id="players-list"></ul>
+        </section>
+      </aside>
+    </div>
+
+    <div id="tab-mining" class="tab-panel hidden">
+      <h2>Mining</h2>
+      <p class="card-sub">Every ore node you've unlocked, in one place &mdash; no travel needed. Discovering a mine's location on the Overworld map unlocks its node here. Click a node to mine it; click the active node again to stop.</p>
+
+      <div id="mining-active-panel" class="skill-card hidden">
+        <h3 id="mining-active-name"></h3>
+        <div class="task-row">
+          <canvas id="mining-clock" class="task-clock" width="70" height="70"></canvas>
+          <div class="task-info">
+            <div class="bar-wrap"><div id="mining-bar-fill" class="bar-fill"></div></div>
+            <div id="mining-label" class="skill-label"></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="mining-grid" class="mining-grid"></div>
+    </div>
+
+    <div id="tab-skills" class="tab-panel hidden">
+      <h2>Skills</h2>
+      <div id="skills-container"></div>
+    </div>
+
+    <div id="tab-character" class="tab-panel hidden">
+      <h2>Character</h2>
+      <div id="character-level-info" class="card-sub"></div>
+      <div class="bar-wrap" style="max-width:480px;"><div id="character-xp-fill" class="bar-fill"></div></div>
+
+      <h3>Traits</h3>
+      <p class="card-sub">Earn a trait point every character level. Spend it to permanently raise a trait.</p>
+      <div id="traits-list" class="card-grid"></div>
+
+      <h3>Perk Tree</h3>
+      <p class="card-sub">Earn a perk point every character level. Higher tiers unlock at higher character levels.</p>
+      <div id="perk-points-info" class="card-sub"></div>
+      <div id="perk-tree"></div>
+    </div>
+
+    <div id="tab-combat" class="tab-panel hidden">
+      <h2>Combat</h2>
+
+      <div id="combat-idle">
+        <div id="combat-idle-main">
+          <div id="combat-location-info">Location: --</div>
+          <div id="combat-enemy-list"></div>
+
+          <h3>Ability Loadout</h3>
+          <p class="card-sub">Abilities fire left to right, then loop back to the start. Select an ability from the panel on the right, then click a slot to place it &mdash; the selection stays active so you can fill several slots in a row.</p>
+          <div id="loadout-slots" class="ability-slot-row"></div>
+          <div id="ability-select-status" class="card-sub"></div>
+        </div>
+
+        <aside id="ability-sidebar">
+          <h3>Abilities</h3>
+          <div id="ability-sidebar-list"></div>
+        </aside>
+      </div>
+
+      <div id="combat-active" class="hidden">
+        <div id="arena-wrap">
+          <canvas id="arena-canvas" width="360" height="360"></canvas>
+        </div>
+
+        <div class="arena-combatant">
+          <div class="arena-combatant-header"><span>You</span><span id="player-hp-label"></span></div>
+          <div class="hp-bar-wrap"><div id="player-hp-fill" class="hp-bar-fill"></div></div>
+          <div id="player-status-line" class="effect-label"></div>
+        </div>
+        <div class="arena-combatant">
+          <div class="arena-combatant-header"><span id="enemy-name">Enemy</span><span id="enemy-hp-label"></span></div>
+          <div class="hp-bar-wrap"><div id="enemy-hp-fill" class="hp-bar-fill enemy"></div></div>
+          <div id="enemy-status-line" class="effect-label"></div>
+        </div>
+
+        <div id="combat-log"></div>
+
+        <h3>Ability Sequence</h3>
+        <div id="ability-slots-live" class="ability-slot-row"></div>
+
+        <div id="combat-result" class="hidden"></div>
+        <div id="combat-potions"></div>
+        <button id="flee-btn">Flee</button>
+        <button id="combat-continue-btn" class="hidden">Continue</button>
+      </div>
+    </div>
+
+    <div id="tab-inventory" class="tab-panel hidden">
+      <h2>Inventory</h2>
+      <div id="inventory-grid" class="card-grid"></div>
+    </div>
+
+    <div id="tab-equipment" class="tab-panel hidden">
+      <h2>Equipment</h2>
+      <div id="equip-slots">
+        <div class="equip-slot">
+          <h3>Weapon</h3>
+          <div id="equipped-weapon">None</div>
+          <button id="unequip-weapon-btn">Unequip</button>
+        </div>
+        <div class="equip-slot">
+          <h3>Armor</h3>
+          <div id="equipped-armor">None</div>
+          <button id="unequip-armor-btn">Unequip</button>
+        </div>
+      </div>
+      <div id="combat-stats-display"></div>
+      <h3>Equip from Inventory</h3>
+      <div id="equippable-list" class="card-grid"></div>
+    </div>
+
+    <div id="tab-gardening" class="tab-panel hidden">
+      <h2>Gardening</h2>
+      <div id="garden-seed-picker" class="seed-picker"></div>
+      <p id="garden-seed-status" class="card-sub"></p>
+      <div id="garden-plots" class="garden-grid"></div>
+    </div>
+
+    <div id="discovery-modal" class="modal hidden">
+      <div class="modal-content discovery-modal-content">
+        <h3>New Location Discovered!</h3>
+        <div id="discovery-modal-name"></div>
+        <div id="discovery-modal-loot"></div>
+        <button id="discovery-modal-ok">Nice!</button>
+      </div>
+    </div>
+
+    <div id="rare-event-modal" class="modal hidden">
+      <div class="modal-content discovery-modal-content rare-event-modal-content">
+        <h3>&#10022; Rare Find! &#10022;</h3>
+        <div id="rare-event-modal-text"></div>
+        <button id="rare-event-modal-ok">Amazing!</button>
+      </div>
+    </div>
+
+    <div id="tab-farming" class="tab-panel hidden">
+      <h2>Farming</h2>
+      <h3>Buy Animals</h3>
+      <div id="farm-buy-list" class="card-grid"></div>
+      <h3>Your Animals</h3>
+      <div id="farm-animals-list" class="card-grid"></div>
+    </div>
+
+    <div id="tab-crafting" class="tab-panel hidden">
+      <h2>Crafting</h2>
+      <div id="crafting-recipes" class="card-grid"></div>
+    </div>
+
+    <div id="tab-alchemy" class="tab-panel hidden">
+      <h2>Alchemy</h2>
+      <p class="card-sub">Combine two ingredients to experiment. Ingredients are found via Harvesting, Scavenging, and monster loot &mdash; unknown combinations are consumed either way, so choose carefully.</p>
+      <section class="panel">
+        <h3>Experiment</h3>
+        <div id="alchemy-experiment-controls">
+          <select id="alchemy-ingredient-a"></select>
+          <span class="combine-plus">+</span>
+          <select id="alchemy-ingredient-b"></select>
+          <button id="alchemy-experiment-btn">Experiment</button>
+        </div>
+        <div id="alchemy-tried-count" class="card-sub"></div>
+      </section>
+      <h3>Known Recipes</h3>
+      <div id="alchemy-known-recipes" class="card-grid"></div>
+    </div>
+
+    <div id="tab-buildings" class="tab-panel hidden">
+      <h2>Buildings</h2>
+      <div id="buildings-list" class="card-grid"></div>
+    </div>
+
+    <div id="tab-npcs" class="tab-panel hidden">
+      <h2>NPCs</h2>
+      <div id="npc-location-info">Location: --</div>
+      <div id="npc-list" class="card-grid"></div>
+    </div>
+
+    <div id="dialogue-modal" class="modal hidden">
+      <div class="modal-content dialogue-modal-content">
+        <h3 id="dialogue-npc-name"></h3>
+        <p id="dialogue-text"></p>
+        <div id="dialogue-options"></div>
+        <div id="dialogue-quest-panel" class="hidden"></div>
+        <button id="dialogue-close-btn" class="btn-danger">Close</button>
+      </div>
+    </div>
+
+    <div id="tab-tavern" class="tab-panel hidden">
+      <h2>Tavern</h2>
+      <div id="tavern-not-here">You need to be at a tavern to chat. Wanderer's Camp has one.</div>
+      <div id="tavern-chat-wrap" class="hidden">
+        <div id="tavern-messages"></div>
+        <form id="tavern-chat-form">
+          <input id="tavern-chat-input" type="text" placeholder="Say something..." maxlength="200" autocomplete="off">
+          <button type="submit">Send</button>
+        </form>
+      </div>
+    </div>
+
+    <div id="tab-shop" class="tab-panel hidden">
+      <h2>Shop</h2>
+      <div id="shop-items" class="card-grid"></div>
+      <button id="buy-location-btn">Buy Location Coordinates (30 gold)</button>
+      <h3>Sell Items</h3>
+      <p class="card-sub">Sell anything in your inventory for gold.</p>
+      <div id="shop-sell-list" class="card-grid"></div>
+    </div>
+
+    <div id="tab-stats" class="tab-panel hidden">
+      <h2>Statistics</h2>
+      <div id="stats-content"></div>
+    </div>
+  </main>
+</div>
+
+<script src="game.js"></script>
+</body>
+</html>

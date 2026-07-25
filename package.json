@@ -1,0 +1,18 @@
+{
+  "name": "mmoproject",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Fantasy idler-MMO prototype (temp name)",
+  "main": "server/server.js",
+  "scripts": {
+    "start": "node server/server.js",
+    "dev": "nodemon --watch server --ext js server/server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}

@@ -1,0 +1,2899 @@
+const fs = require('fs');
+const path = require('path');
+
+// Overridable so testing/dev tooling can point at a scratch file instead of
+// risking the real save data (this file is the actual player database).
+const DB_PATH = process.env.MMO_DB_PATH || path.join(__dirname, '..', 'data', 'db.json');
+
+const XP_PER_LEVEL = 100; // cost of the very first level-up (level 1 -> 2)
+const XP_LEVEL_INCREMENT = 15; // each subsequent level costs this much more than the last
+
+// Combat distance is a 0-100 scale, not real pixels — the frontend maps it
+// onto the arena circle's radius. 0 = adjacent/melee, MAX_DISTANCE = as far
+// back as Quick Step can push things. Declared early since ENEMIES below
+// references MELEE_RANGE.
+const MELEE_RANGE = 30;
+const MAX_DISTANCE = 100;
+const QUICK_STEP_RETREAT = 50;
+const EVASION_DODGE_CHANCE = 0.6;
+
+// --- traits (Fallout SPECIAL-style point-buy at character creation) ---
+// Every trait starts at TRAIT_BASE; the player distributes TRAIT_EXTRA_POINTS
+// on top of that across the 4 traits at creation (createCharacter()),
+// clamped to [TRAIT_MIN, TRAIT_MAX] each. After creation, traits only move by
+// spending a traitPointsAvailable earned from character leveling (see
+// allocateTraitPoint()) — no cap on further growth from leveling, since those
+// points are earned, not front-loaded.
+const TRAIT_KEYS = ['strength', 'dexterity', 'luck', 'vigor'];
+const TRAIT_BASE = 5;
+const TRAIT_MIN = 1;
+const TRAIT_MAX = 10;
+const TRAIT_EXTRA_POINTS = 10;
+
+// Character-level XP is completely separate from skill xp — earned from
+// discovering new locations (see gainCharacterXp()/discoverLocation()).
+// Reuses the same xpCostForLevel()/levelFromXp() curve every skill uses.
+const DISCOVERY_XP = 25;
+
+// Perks are permanent, one-time unlocks (no multi-rank in v1) bought with
+// perkPoints earned from character leveling, gated by character level in
+// tiers so the "tree" has real structure without needing a prerequisite
+// graph. Effects are summed by getPlayerModifiers() below.
+const PERKS = {
+  brute_force: { name: 'Brute Force', description: '+10% melee damage.', tier: 1, requiresLevel: 1, cost: 1, effect: { type: 'meleeDamageMult', value: 0.1 } },
+  swift_strikes: { name: 'Swift Strikes', description: '+8% attack speed (abilities cast faster).', tier: 1, requiresLevel: 1, cost: 1, effect: { type: 'attackSpeedMult', value: 0.08 } },
+  lucky_strikes: { name: 'Lucky Strikes', description: '+5% critical hit chance.', tier: 1, requiresLevel: 1, cost: 1, effect: { type: 'critChance', value: 0.05 } },
+  iron_skin: { name: 'Iron Skin', description: '+3 armor.', tier: 1, requiresLevel: 1, cost: 1, effect: { type: 'armorFlat', value: 3 } },
+  vitality: { name: 'Vitality', description: '+15 max HP.', tier: 1, requiresLevel: 1, cost: 1, effect: { type: 'maxHpFlat', value: 15 } },
+  green_thumb: { name: 'Green Thumb', description: '+15% plant growth speed.', tier: 1, requiresLevel: 1, cost: 1, effect: { type: 'plantGrowthMult', value: 0.15 } },
+  prospector: { name: 'Prospector', description: '+10% mining speed.', tier: 2, requiresLevel: 5, cost: 1, effect: { type: 'miningSpeedMult', value: 0.1 } },
+  woodsman: { name: 'Woodsman', description: '+10% woodcutting speed.', tier: 2, requiresLevel: 5, cost: 1, effect: { type: 'woodcuttingSpeedMult', value: 0.1 } },
+  anglers_patience: { name: "Angler's Patience", description: '+10% fishing speed.', tier: 2, requiresLevel: 5, cost: 1, effect: { type: 'fishingSpeedMult', value: 0.1 } },
+  treasure_hunter: { name: 'Treasure Hunter', description: '+10% success chance on Hunting/Scavenging/Harvesting.', tier: 2, requiresLevel: 5, cost: 1, effect: { type: 'gatherSuccessBonus', value: 0.1 } },
+  brutal_force: { name: 'Brutal Force', description: '+15% melee damage (stacks with Brute Force).', tier: 3, requiresLevel: 10, cost: 1, effect: { type: 'meleeDamageMult', value: 0.15 } },
+  adrenal_focus: { name: 'Adrenal Focus', description: '+12% attack speed (stacks with Swift Strikes).', tier: 3, requiresLevel: 10, cost: 1, effect: { type: 'attackSpeedMult', value: 0.12 } },
+  deep_roots: { name: 'Deep Roots', description: '+20% plant growth speed (stacks with Green Thumb).', tier: 3, requiresLevel: 10, cost: 1, effect: { type: 'plantGrowthMult', value: 0.2 } },
+  hardened: { name: 'Hardened', description: '+5 armor, +25 max HP.', tier: 3, requiresLevel: 10, cost: 1, effect: { type: 'armorFlat', value: 5 } },
+};
+
+// --- mining nodes (Melvor-Idle-style skill grid) ---
+// Mining is decoupled from the overworld map entirely — once a node's
+// linked location has been discovered, it's minable from the Mining tab
+// regardless of where the player currently is (see tickMining()/
+// startMiningNode()). Nodes are ordered so lesser ores sit near the
+// starting location (Wanderer's Camp, 50/50) and rarer ores farther out —
+// see the distance comment on each entry.
+const MINING_NODES = {
+  copper: { name: 'Copper Vein', item: 'copper_ore', locationId: 'wyrmwood_hold', tier: 1, cycleSeconds: 2.5, xpPerItem: 4 }, // dist ~10.7
+  tin: { name: 'Tin Vein', item: 'tin_ore', locationId: 'moonshade_reach', tier: 1, cycleSeconds: 2.5, xpPerItem: 4 }, // dist ~13.3
+  coal: { name: 'Coal Seam', item: 'coal', locationId: 'duskhollow_crossing', tier: 2, cycleSeconds: 3.5, xpPerItem: 8 }, // dist ~13.9
+  iron: { name: 'Iron Vein', item: 'iron_ore', locationId: 'ironbrook_mine', tier: 2, cycleSeconds: 3, xpPerItem: 5 }, // dist ~27.4
+  silver: { name: 'Silver Vein', item: 'silver_ore', locationId: 'tidewater_spire', tier: 3, cycleSeconds: 4, xpPerItem: 11 }, // dist ~32.9
+  gold: { name: 'Gold Vein', item: 'gold_ore', locationId: 'duskmere_mine', tier: 3, cycleSeconds: 4.5, xpPerItem: 14 }, // dist ~33.3
+  mithril: { name: 'Mithril Vein', item: 'mithril_ore', locationId: 'ruined_mine', tier: 4, cycleSeconds: 5.5, xpPerItem: 20 }, // dist ~38.8
+};
+
+// Each skill produces one item per cycle instead of continuous xp/sec —
+// cycleSeconds is how long one item takes, xpPerItem is granted on completion.
+// Mining is NOT here — it moved to its own node-grid system, see
+// MINING_NODES/tickMining()/startMiningNode() below.
+const TASK_CONFIG = {
+  woodcutting: { item: 'wood', cycleSeconds: 4, xpPerItem: 5 },
+  fishing: { item: 'fish', cycleSeconds: 5, xpPerItem: 6 },
+};
+
+// sellPrice: gold paid by sellItem() when the player sells one unit back to
+// the shop. Omitted entirely on 'gold' itself (not sellable) — every other
+// item has one so nothing a player can hold is a dead end if they'd rather
+// have gold. Roughly half of SHOP_ITEMS' buy price for anything also sold
+// there, so buy-then-sell isn't a profitable loop.
+const ITEMS = {
+  iron_ore: { name: 'Iron Ore', sellPrice: 2 },
+  // mining node grid ores (see MINING_NODES) — sellPrice roughly scales with tier
+  copper_ore: { name: 'Copper Ore', sellPrice: 1 },
+  tin_ore: { name: 'Tin Ore', sellPrice: 1 },
+  coal: { name: 'Coal', sellPrice: 3 },
+  silver_ore: { name: 'Silver Ore', sellPrice: 5 },
+  gold_ore: { name: 'Gold Ore', sellPrice: 7 },
+  mithril_ore: { name: 'Mithril Ore', sellPrice: 12 },
+  supplies: { name: 'Supplies', sellPrice: 3 },
+  wood: { name: 'Wood', sellPrice: 2 },
+  fish: { name: 'Fish', sellPrice: 2 },
+  gold: { name: 'Gold' },
+  // weapons — damage is a [min,max] roll per hit, attackSpeed is seconds between attacks
+  rusty_sword: { name: 'Rusty Sword', type: 'weapon', damage: [4, 7], critChance: 0.05, attackSpeed: 2.0, sellPrice: 25 },
+  hunting_bow: { name: 'Hunting Bow', type: 'weapon', damage: [3, 5], critChance: 0.1, attackSpeed: 1.5, sellPrice: 40 },
+  iron_dagger: {
+    name: 'Iron Dagger',
+    type: 'weapon',
+    damage: [2, 4],
+    critChance: 0.15,
+    attackSpeed: 1.0,
+    effect: { type: 'poison', chance: 0.25, dps: 2, duration: 4 },
+    sellPrice: 50,
+  },
+  // armor — flat damage reduction on incoming hits
+  leather_vest: { name: 'Leather Vest', type: 'armor', armor: 3, sellPrice: 20 },
+  iron_plate: { name: 'Iron Plate', type: 'armor', armor: 6, sellPrice: 45 },
+  // gardening
+  wheat_seed: { name: 'Wheat Seed', sellPrice: 2 },
+  carrot_seed: { name: 'Carrot Seed', sellPrice: 4 },
+  potato_seed: { name: 'Potato Seed', sellPrice: 6 },
+  wheat_crop: { name: 'Wheat', sellPrice: 3 },
+  carrot_crop: { name: 'Carrot', sellPrice: 4 },
+  potato_crop: { name: 'Potato', sellPrice: 6 },
+  // farming (animal produce)
+  milk: { name: 'Milk', sellPrice: 4 },
+  egg: { name: 'Egg', sellPrice: 3 },
+  pork: { name: 'Pork', sellPrice: 9 },
+  // gather tasks
+  raw_meat: { name: 'Raw Meat', sellPrice: 4 },
+  // rare gather-task jackpot armor — deliberately better than the shop's
+  // best armor (iron_plate, armor 6), since it's meant to feel like a real
+  // find at 0.01% odds
+  wanderers_plate: { name: "Wanderer's Plate", type: 'armor', armor: 12, sellPrice: 70 },
+  // alchemy ingredients — never crafted or bought, only found via
+  // harvesting/scavenging (flora) or combat loot (monster parts). Inert on
+  // their own; only useful combined via experimentAlchemy().
+  sunpetal: { name: 'Sunpetal', type: 'ingredient', sellPrice: 5 },
+  moonleaf: { name: 'Moonleaf', type: 'ingredient', sellPrice: 5 },
+  redcap_cap: { name: 'Redcap Mushroom', type: 'ingredient', sellPrice: 5 },
+  bog_root: { name: 'Bog Root', type: 'ingredient', sellPrice: 5 },
+  rat_tail: { name: 'Rat Tail', type: 'ingredient', sellPrice: 6 },
+  wolf_fang: { name: 'Wolf Fang', type: 'ingredient', sellPrice: 6 },
+  zombie_ichor: { name: 'Zombie Ichor', type: 'ingredient', sellPrice: 6 },
+  // trophy drops from the 5 new tier-2-4 enemies — sellable flavor items,
+  // not alchemy ingredients (kept separate from POTION_RECIPES scope for now)
+  bandit_dagger: { name: "Bandit's Dagger", sellPrice: 8 },
+  spider_silk: { name: 'Spider Silk', sellPrice: 9 },
+  orc_tusk: { name: 'Orc Tusk', sellPrice: 14 },
+  wraith_essence: { name: 'Wraith Essence', sellPrice: 16 },
+  troll_hide: { name: 'Troll Hide', sellPrice: 25 },
+  // alchemy potions — result items of POTION_RECIPES, consumed via
+  // usePotion() during combat only (see potionEffect.kind)
+  healing_potion: { name: 'Healing Potion', type: 'potion', potionEffect: { kind: 'heal', amount: 30 }, sellPrice: 18 },
+  antidote: { name: 'Antidote', type: 'potion', potionEffect: { kind: 'cure' }, sellPrice: 18 },
+  potion_of_strength: {
+    name: 'Potion of Strength',
+    type: 'potion',
+    potionEffect: { kind: 'buff_damage', multiplier: 1.5, durationSeconds: 15 },
+    sellPrice: 22,
+  },
+  potion_of_swiftness: {
+    name: 'Potion of Swiftness',
+    type: 'potion',
+    potionEffect: { kind: 'buff_speed', multiplier: 0.6, durationSeconds: 15 },
+    sellPrice: 22,
+  },
+  venom_draught: {
+    name: 'Venom Draught',
+    type: 'potion',
+    potionEffect: { kind: 'poison_enemy', dps: 5, duration: 6 },
+    sellPrice: 22,
+  },
+};
+
+// Fixed per-creature attacks/effects (not derived from equipment, unlike the
+// player) — goldReward/xpReward are [min,max] rolled on a win.
+const ENEMIES = {
+  // range/approachSpeed: all three are melee-only for now — range is how
+  // close they need to be to land a hit, approachSpeed (distance units/sec)
+  // is how fast they close in after being pushed back by Quick Step. Varies
+  // per enemy so kiting feels different against each (the zombie is easy to
+  // outrun, the wolf is not).
+  giant_rat: {
+    name: 'Giant Rat',
+    maxHp: 20,
+    damage: [1, 3],
+    critChance: 0.05,
+    attackSpeed: 1.8,
+    effect: null,
+    goldReward: [2, 5],
+    xpReward: 5,
+    lootTable: [{ item: 'rat_tail', chance: 0.25 }],
+    range: MELEE_RANGE,
+    approachSpeed: 45,
+  },
+  wolf: {
+    name: 'Wolf',
+    maxHp: 35,
+    damage: [3, 6],
+    critChance: 0.08,
+    attackSpeed: 1.5,
+    effect: null,
+    goldReward: [5, 10],
+    xpReward: 10,
+    lootTable: [{ item: 'wolf_fang', chance: 0.25 }],
+    range: MELEE_RANGE,
+    approachSpeed: 55,
+  },
+  bog_zombie: {
+    name: 'Bog Zombie',
+    maxHp: 50,
+    damage: [4, 8],
+    critChance: 0.05,
+    attackSpeed: 2.5,
+    effect: { type: 'poison', chance: 0.3, dps: 2, duration: 4 },
+    goldReward: [8, 15],
+    xpReward: 15,
+    lootTable: [{ item: 'zombie_ichor', chance: 0.25 }],
+    range: MELEE_RANGE,
+    approachSpeed: 20,
+  },
+  // Added so the ~40 previously-empty locations have varied, tier-appropriate
+  // fights instead of reusing just these original 3 everywhere — tiers
+  // loosely track distance-from-center the same way MINING_NODES' tiers do
+  // (see LOCATIONS' combat assignments below).
+  bandit: {
+    // tier 1 — a human raider, close to the starting area
+    name: 'Bandit',
+    maxHp: 25,
+    damage: [2, 5],
+    critChance: 0.08,
+    attackSpeed: 1.7,
+    effect: null,
+    goldReward: [4, 9],
+    xpReward: 7,
+    lootTable: [{ item: 'bandit_dagger', chance: 0.2 }],
+    range: MELEE_RANGE,
+    approachSpeed: 40,
+  },
+  forest_spider: {
+    // tier 2 — fast, poisonous
+    name: 'Forest Spider',
+    maxHp: 30,
+    damage: [2, 4],
+    critChance: 0.1,
+    attackSpeed: 1.4,
+    effect: { type: 'poison', chance: 0.35, dps: 2, duration: 3 },
+    goldReward: [4, 8],
+    xpReward: 9,
+    lootTable: [{ item: 'spider_silk', chance: 0.25 }],
+    range: MELEE_RANGE,
+    approachSpeed: 60,
+  },
+  orc_raider: {
+    // tier 3 — a real step up in raw damage
+    name: 'Orc Raider',
+    maxHp: 55,
+    damage: [5, 9],
+    critChance: 0.07,
+    attackSpeed: 2.0,
+    effect: null,
+    goldReward: [10, 18],
+    xpReward: 18,
+    lootTable: [{ item: 'orc_tusk', chance: 0.25 }],
+    range: MELEE_RANGE,
+    approachSpeed: 35,
+  },
+  marsh_wraith: {
+    // tier 3 — a ghostly poisoner, favors a high crit chance over raw damage
+    name: 'Marsh Wraith',
+    maxHp: 45,
+    damage: [4, 8],
+    critChance: 0.15,
+    attackSpeed: 2.2,
+    effect: { type: 'poison', chance: 0.4, dps: 3, duration: 4 },
+    goldReward: [10, 16],
+    xpReward: 18,
+    lootTable: [{ item: 'wraith_essence', chance: 0.25 }],
+    range: MELEE_RANGE,
+    approachSpeed: 25,
+  },
+  stone_troll: {
+    // tier 4 — the toughest fight in the game right now, a real "boss" feel
+    // for the far-flung locations. Slow to approach so Quick Step/kiting
+    // matters more here than anywhere else.
+    name: 'Stone Troll',
+    maxHp: 90,
+    damage: [8, 14],
+    critChance: 0.05,
+    attackSpeed: 2.8,
+    effect: null,
+    goldReward: [20, 35],
+    xpReward: 35,
+    lootTable: [{ item: 'troll_hide', chance: 0.3 }],
+    range: MELEE_RANGE,
+    approachSpeed: 15,
+  },
+};
+
+const PLANTS = {
+  wheat: { name: 'Wheat', seed: 'wheat_seed', growSeconds: 60, yield: 'wheat_crop' },
+  carrot: { name: 'Carrot', seed: 'carrot_seed', growSeconds: 90, yield: 'carrot_crop' },
+  potato: { name: 'Potato', seed: 'potato_seed', growSeconds: 120, yield: 'potato_crop' },
+};
+const GARDEN_PLOT_COUNT = 24;
+
+// Converts garden crops into supplies — the resource expeditions consume —
+// so gardening and exploration feed into each other instead of being
+// isolated systems. resultAmount scales with the crop's grow time (potato
+// takes longest to grow, so it converts to the most supplies) to keep the
+// three crop types roughly comparable in supplies-per-second-grown.
+const RECIPES = [
+  { id: 'wheat_supplies', ingredients: { wheat_crop: 2 }, result: 'supplies', resultAmount: 1 },
+  { id: 'carrot_supplies', ingredients: { carrot_crop: 2 }, result: 'supplies', resultAmount: 2 },
+  { id: 'potato_supplies', ingredients: { potato_crop: 2 }, result: 'supplies', resultAmount: 3 },
+  { id: 'meat_supplies', ingredients: { raw_meat: 2 }, result: 'supplies', resultAmount: 2 },
+];
+
+// Alchemy recipes are deliberately NOT exposed raw via any GET endpoint —
+// unlike RECIPES (crafting), the whole point is the player doesn't know
+// these combos up front and has to discover them via experimentAlchemy().
+// publicPlayer() only ever sends back the subset the player has personally
+// discovered (player.alchemy.knownRecipes), via ingredientComboKey() below.
+// Every recipe combines exactly two distinct ingredients (amount 1 each) —
+// matches the two-ingredient-slot experiment UI, no need for RECIPES'
+// variable-amount object shape here.
+const POTION_RECIPES = [
+  { id: 'healing_potion', ingredients: { sunpetal: 1, moonleaf: 1 }, result: 'healing_potion' },
+  { id: 'antidote', ingredients: { redcap_cap: 1, bog_root: 1 }, result: 'antidote' },
+  { id: 'potion_of_strength', ingredients: { wolf_fang: 1, sunpetal: 1 }, result: 'potion_of_strength' },
+  { id: 'potion_of_swiftness', ingredients: { rat_tail: 1, moonleaf: 1 }, result: 'potion_of_swiftness' },
+  { id: 'venom_draught', ingredients: { zombie_ichor: 1, bog_root: 1 }, result: 'venom_draught' },
+];
+
+function ingredientComboKey(ids) {
+  return [...ids].sort().join('+');
+}
+
+// Animals are bought with gold, take matureSeconds to grow up, then either
+// produce an item repeatedly on a timer (cow/chicken — collect, timer
+// resets) or yield a one-time butcherItem once mature and are then removed
+// (pig) — same two-shape split as PLANTS (repeatable) vs a one-shot resource.
+const ANIMAL_SPECIES = {
+  cow: { name: 'Cow', price: 40, matureSeconds: 45, produceItem: 'milk', produceIntervalSeconds: 30 },
+  chicken: { name: 'Chicken', price: 20, matureSeconds: 25, produceItem: 'egg', produceIntervalSeconds: 15 },
+  pig: { name: 'Pig', price: 60, matureSeconds: 60, butcherItem: 'pork' },
+};
+
+// One of each building type per player (v1 — like equipment slots, not a
+// list). Once built, passively accrues 1 unit of producesItem every
+// produceIntervalSeconds, collected manually (same lazy elapsed-time math as
+// tickSkills, just player-triggered instead of ticked on every poll).
+const BUILDINGS = {
+  sawmill: { name: 'Sawmill', cost: { gold: 60, wood: 10 }, producesItem: 'wood', produceIntervalSeconds: 20 },
+  mineshaft: { name: 'Mineshaft', cost: { gold: 90, iron_ore: 10 }, producesItem: 'iron_ore', produceIntervalSeconds: 25 },
+  granary: { name: 'Granary', cost: { gold: 50, wheat_crop: 5 }, producesItem: 'supplies', produceIntervalSeconds: 15 },
+};
+
+const SHOP_ITEMS = [
+  { id: 'wheat_seed', price: 5 },
+  { id: 'carrot_seed', price: 8 },
+  { id: 'potato_seed', price: 12 },
+  { id: 'supplies', price: 6 },
+  { id: 'rusty_sword', price: 50 },
+  { id: 'hunting_bow', price: 80 },
+  { id: 'iron_dagger', price: 100 },
+  { id: 'leather_vest', price: 40 },
+  { id: 'iron_plate', price: 90 },
+];
+const LOCATION_REVEAL_PRICE = 30;
+
+const PLAYER_BASE_HP = 50;
+const PLAYER_HP_PER_LEVEL = 5;
+
+// Player abilities go in 6 loadout slots and execute left-to-right, looping
+// back to slot 0 — see resolvePlayerAbility()/advanceCursor(). unlockLevel
+// gates them behind the player's Combat skill level (see levelFromXp()),
+// giving a "learn more throughout the game" progression without needing any
+// separate unlock system (shop/quest) for v1.
+const ABILITIES = {
+  swing: {
+    name: 'Swing',
+    tags: ['melee'],
+    castSeconds: 1.6,
+    unlockLevel: 1,
+    description: 'A basic attack with your equipped weapon (or bare fists).',
+  },
+  punch: {
+    name: 'Punch',
+    tags: ['melee'],
+    castSeconds: 0.6,
+    unlockLevel: 1,
+    description: 'A fast, light jab. Primes your next melee ability with bonus damage.',
+  },
+  quick_step: {
+    name: 'Quick Step',
+    tags: ['utility'],
+    castSeconds: 0.7,
+    unlockLevel: 1,
+    description: 'Step back from your enemy, gaining distance and a chance to dodge their next attack.',
+  },
+  guard_up: {
+    name: 'Guard Up',
+    tags: ['utility'],
+    castSeconds: 0.9,
+    unlockLevel: 2,
+    description: 'Raise your guard, temporarily reducing incoming damage.',
+  },
+  throw_dagger: {
+    name: 'Throw Dagger',
+    tags: ['ranged'],
+    castSeconds: 1.3,
+    unlockLevel: 3,
+    description: 'Hurl a dagger at your enemy. Lands at any distance.',
+  },
+  adrenaline_rush: {
+    name: 'Adrenaline Rush',
+    tags: ['utility'],
+    castSeconds: 0.7,
+    unlockLevel: 4,
+    description: 'A burst of speed — your next ability executes faster.',
+  },
+  poison_jab: {
+    name: 'Poison Jab',
+    tags: ['melee'],
+    castSeconds: 1.0,
+    unlockLevel: 5,
+    description: 'A quick jab coated in poison, dealing damage over time.',
+  },
+  second_wind: {
+    name: 'Second Wind',
+    tags: ['utility'],
+    castSeconds: 2.0,
+    unlockLevel: 6,
+    description: 'Catch your breath and recover some health.',
+  },
+  power_strike: {
+    name: 'Power Strike',
+    tags: ['melee'],
+    castSeconds: 2.6,
+    unlockLevel: 7,
+    description: 'A heavy, slow strike with your weapon for big damage.',
+  },
+};
+
+const DEFAULT_ABILITY_LOADOUT = ['punch', 'swing', 'swing', 'quick_step', 'swing', 'swing'];
+
+// Given to brand new players so the expedition mechanic is testable before
+// a real supplies source (shop / garden) exists.
+const STARTER_SUPPLIES = 8;
+
+// Expedition tuning — all distances are in the same 0-100 percent-space the
+// location x/y coordinates use, independent of canvas pixel size.
+const UNIT_LENGTH_PER_SUPPLY = 3; // how far 1 supply lets you draw
+const OVERLAP_THRESHOLD = 3.5; // how close the drawn path must pass to a location to discover it
+const EXPEDITION_SPEED = 1.5; // percent-units of path covered per second — slow, deliberate travel, not a blip
+const MIN_EXPEDITION_DURATION = 8; // seconds — even the shortest possible trip should take a real, watchable while
+
+// Gather tasks — Hunting/Scavenging/Harvesting. Structurally identical to
+// TASK_CONFIG skills (cycle-based, clock UI, xp on success) EXCEPT: usable
+// from anywhere (not tied to a specific location, unlike mining/woodcutting/
+// fishing) and each completed cycle only has a *chance* of yielding
+// anything, resolved in tickGatherTasks() rather than the guaranteed-yield
+// math tickSkills() uses for TASK_CONFIG skills.
+const GATHER_TASKS = {
+  hunting: {
+    cycleSeconds: 6,
+    encounterChance: 0.15, // chance per cycle of a hostile animal instead of a find
+    successChance: 0.3,
+    xpPerSuccess: 10,
+    resultItem: 'raw_meat',
+    huntableEnemies: ['giant_rat', 'wolf', 'bog_zombie'],
+  },
+  scavenging: {
+    cycleSeconds: 4,
+    successChance: 0.3,
+    xpPerSuccess: 6,
+    resultPool: ['supplies', 'gold', 'wood', 'iron_ore', 'fish', 'redcap_cap', 'bog_root'],
+  },
+  harvesting: {
+    cycleSeconds: 5,
+    successChance: 0.3,
+    xpPerSuccess: 6,
+    resultPool: ['wheat_seed', 'carrot_seed', 'potato_seed', 'wheat_crop', 'carrot_crop', 'potato_crop', 'sunpetal', 'moonleaf'],
+  },
+};
+
+// Extremely rare (0.01%), checked on every completed gather-task cycle
+// regardless of which of the three tasks it was, ahead of that task's own
+// roll — a jackpot layer shared across all gather tasks rather than
+// per-task, so it stays meaningfully rare no matter which task is running.
+const RARE_GATHER_EVENT_CHANCE = 0.0001;
+
+const LOCATIONS = [
+  { id: 'wanderers_camp', name: "Wanderer's Camp", x: 50, y: 50, skill: null, startingLocation: true, tavern: true },
+  { id: 'gladewind_grove', name: 'Gladewind Grove', x: 67.1, y: 53.1, skill: 'woodcutting' },
+  { id: 'grimwater_bridge', name: 'Grimwater Bridge', x: 64, y: 58.8, skill: 'fishing' },
+  { id: 'moonshade_reach', name: 'Moonshade Reach', x: 49.4, y: 63.3 },
+  { id: 'duskhollow_crossing', name: 'Duskhollow Crossing', x: 40.5, y: 60.1 },
+  { id: 'ashfall_ruins', name: 'Ashfall Ruins', x: 32.3, y: 54.9, combat: ['bog_zombie'] },
+  { id: 'copperhall_village', name: 'Copperhall Village', x: 36.4, y: 46.4 },
+  { id: 'duskhollow_marsh', name: 'Duskhollow Marsh', x: 39.2, y: 42.7 },
+  { id: 'wyrmwood_hold', name: 'Wyrmwood Hold', x: 48.6, y: 39.4 },
+  { id: 'thornwatch_hall', name: 'Thornwatch Hall', x: 60, y: 36.6 },
+  { id: 'amberfield_vale', name: 'Amberfield Vale', x: 61.8, y: 43.8, combat: ['giant_rat', 'bandit'], loot: { item: 'gold', amount: 8 } },
+  { id: 'sunspire_camp', name: 'Sunspire Camp', x: 81, y: 52.3 },
+  { id: 'highcrest_forest', name: 'Highcrest Forest', x: 74.2, y: 66.7, combat: ['bog_zombie'] },
+  { id: 'tidewater_grove', name: 'Tidewater Grove', x: 65, y: 68, combat: ['wolf', 'forest_spider'], loot: { item: 'fish', amount: 4 } },
+  { id: 'vintermere_keep', name: 'Vintermere Keep', x: 48.5, y: 73.6 },
+  { id: 'vintermere_hollow', name: 'Vintermere Hollow', x: 33.3, y: 68.2, combat: ['forest_spider'], loot: { item: 'wood', amount: 5 } },
+  { id: 'ashgate_ruins', name: 'Ashgate Ruins', x: 32.8, y: 64.8, combat: ['wolf'], loot: { item: 'gold', amount: 12 } },
+  { id: 'tidewater_spire', name: 'Tidewater Spire', x: 17.5, y: 55 },
+  { id: 'ironbrook_mine', name: 'Ironbrook Mine', x: 23.7, y: 42.3 },
+  { id: 'ravenscar_cove', name: 'Ravenscar Cove', x: 24.2, y: 35.1, combat: ['wolf'] },
+  { id: 'nightshade_vale', name: 'Nightshade Vale', x: 35.6, y: 27.5, combat: ['giant_rat', 'wolf'] },
+  { id: 'thornwatch_spire', name: 'Thornwatch Spire', x: 47.2, y: 27, combat: ['bog_zombie'] },
+  { id: 'marrowfell_grove', name: 'Marrowfell Grove', x: 59.9, y: 29.1, combat: ['forest_spider'], loot: { item: 'wood', amount: 5 } },
+  { id: 'nightshade_crossing', name: 'Nightshade Crossing', x: 79.1, y: 38.1, combat: ['marsh_wraith'], loot: { item: 'moonleaf', amount: 2 } },
+  { id: 'whisperwood_camp', name: 'Whisperwood Camp', x: 75.4, y: 43.5 },
+  { id: 'stonehaven_ruins', name: 'Stonehaven Ruins', x: 91.1, y: 60 },
+  { id: 'duskmere_mine', name: 'Duskmere Mine', x: 77.8, y: 68.3 },
+  { id: 'ironvale_hall', name: 'Ironvale Hall', x: 70, y: 77.4 },
+  { id: 'crowsend_forest', name: 'Crowsend Forest', x: 63.3, y: 79.3, combat: ['orc_raider', 'wolf'], loot: { item: 'wood', amount: 8 } },
+  { id: 'thornwatch_marsh', name: 'Thornwatch Marsh', x: 39.3, y: 81.3, combat: ['marsh_wraith'], loot: { item: 'redcap_cap', amount: 2 } },
+  { id: 'gladewind_watch', name: 'Gladewind Watch', x: 30.6, y: 73.7, combat: ['orc_raider'], loot: { item: 'wood', amount: 8 } },
+  { id: 'graywatch_reach', name: 'Graywatch Reach', x: 20.3, y: 72.1, combat: ['orc_raider'], loot: { item: 'supplies', amount: 4 } },
+  { id: 'stormwatch_ruins', name: 'Stormwatch Ruins', x: 12.3, y: 50.8, combat: ['marsh_wraith'], loot: { item: 'gold', amount: 15 } },
+  { id: 'ironbrook_spire', name: 'Ironbrook Spire', x: 13.7, y: 48, combat: ['orc_raider'], loot: { item: 'iron_ore', amount: 5 } },
+  { id: 'crowsend_village', name: 'Crowsend Village', x: 16.6, y: 36, combat: ['orc_raider'], loot: { item: 'gold', amount: 15 } },
+  { id: 'amberfield_cove', name: 'Amberfield Cove', x: 21.8, y: 24.7, combat: ['marsh_wraith'], loot: { item: 'gold', amount: 12 } },
+  { id: 'amberfield_port', name: 'Amberfield Port', x: 38, y: 23.5, combat: ['wolf'], loot: { item: 'gold', amount: 10 } },
+  { id: 'bleakcliff_grove', name: 'Bleakcliff Grove', x: 56.2, y: 20.8, combat: ['forest_spider'], loot: { item: 'sunpetal', amount: 2 } },
+  { id: 'wraithmoor_camp', name: 'Wraithmoor Camp', x: 70.3, y: 25.3, combat: ['marsh_wraith'] },
+  { id: 'wolfden_vale', name: 'Wolfden Vale', x: 84, y: 33, combat: ['orc_raider', 'stone_troll'], loot: { item: 'wolf_fang', amount: 2 } },
+  { id: 'hollowmere_camp', name: 'Hollowmere Camp', x: 86.9, y: 41.5, combat: ['orc_raider', 'marsh_wraith'], loot: { item: 'gold', amount: 15 } },
+  { id: 'wyrmwood_grove', name: 'Wyrmwood Grove', x: 93.2, y: 58.9, combat: ['stone_troll', 'orc_raider'], loot: { item: 'wood', amount: 10 } },
+  { id: 'hollowmere_village', name: 'Hollowmere Village', x: 86.9, y: 67.9, combat: ['stone_troll'], loot: { item: 'gold', amount: 20 } },
+  { id: 'deepwater_watch', name: 'Deepwater Watch', x: 69.1, y: 80.3, combat: ['orc_raider'], loot: { item: 'fish', amount: 6 } },
+  { id: 'oakenshade_hall', name: 'Oakenshade Hall', x: 47, y: 87.7, combat: ['orc_raider'] },
+  { id: 'shadowfen_hold', name: 'Shadowfen Hold', x: 35.9, y: 85.9, combat: ['stone_troll'] },
+  { id: 'emberpeak_bridge', name: 'Emberpeak Bridge', x: 10, y: 68, combat: ['stone_troll'], loot: { item: 'gold', amount: 20 } },
+  { id: 'goldmarsh_crossing', name: 'Goldmarsh Crossing', x: 5.7, y: 54.2, combat: ['stone_troll'], loot: { item: 'gold', amount: 25 } },
+  { id: 'gladewind_hold', name: 'Gladewind Hold', x: 6.7, y: 36.5, combat: ['stone_troll', 'marsh_wraith'], loot: { item: 'wood', amount: 10 } },
+  { id: 'ruined_mine', name: 'Ruined Mine', x: 18.1, y: 27.9 },
+  { id: 'brightmoor_cove', name: 'Brightmoor Cove', x: 28, y: 17.6, combat: ['marsh_wraith', 'stone_troll'], loot: { item: 'gold', amount: 20 } },
+  { id: 'marrowfell_reach', name: 'Marrowfell Reach', x: 54.9, y: 14.1, combat: ['marsh_wraith'], loot: { item: 'bog_root', amount: 2 } },
+  { id: 'foxhollow_reach', name: 'Foxhollow Reach', x: 70.5, y: 19.3, combat: ['wolf', 'orc_raider'] },
+  { id: 'vintermere_bridge', name: 'Vintermere Bridge', x: 87.1, y: 29.9, combat: ['orc_raider', 'stone_troll'], loot: { item: 'supplies', amount: 6 } },
+  { id: 'frostmere_watch', name: 'Frostmere Watch', x: 97, y: 38.4, combat: ['stone_troll'], loot: { item: 'gold', amount: 30 } },
+  { id: 'wickedge_enclave', name: 'Wickedge Enclave', x: 59.2, y: 83.9, combat: ['wolf', 'orc_raider'] },
+  { id: 'silvercliff_hollow', name: 'Silvercliff Hollow', x: 85.7, y: 84.3, combat: ['wolf', 'marsh_wraith'], loot: { item: 'silver_ore', amount: 5 } },
+  { id: 'foxford_fen', name: 'Foxford Fen', x: 70.2, y: 42.3, combat: ['bog_zombie'], loot: { item: 'gold', amount: 10 } },
+  { id: 'coldstonemere_crossing', name: 'Coldstonemere Crossing', x: 81.6, y: 43.5, combat: ['forest_spider', 'orc_raider'], loot: { item: 'coal', amount: 5 } },
+  { id: 'foxshade_bridge', name: 'Foxshade Bridge', x: 70.2, y: 85.6, combat: ['wolf', 'marsh_wraith'], loot: { item: 'gold', amount: 19 } },
+  { id: 'wraithvale_haven', name: 'Wraithvale Haven', x: 36.9, y: 2.9, combat: ['orc_raider'], loot: { item: 'wolf_fang', amount: 2 } },
+  { id: 'kestrelspire_keep', name: 'Kestrelspire Keep', x: 38.2, y: 88.7, combat: ['wolf', 'marsh_wraith'], loot: { item: 'wolf_fang', amount: 2 } },
+  { id: 'bramblewoodburrow_enclave', name: 'Bramblewoodburrow Enclave', x: 87.5, y: 54.3, combat: ['forest_spider', 'orc_raider'], loot: { item: 'coal', amount: 6 } },
+  { id: 'loamhollow_ridge', name: 'Loamhollow Ridge', x: 95.5, y: 6.8, combat: ['stone_troll'], loot: { item: 'troll_hide', amount: 1 } },
+  { id: 'grimhaven_shire', name: 'Grimhaven Shire', x: 3.1, y: 42.2, combat: ['marsh_wraith'], loot: { item: 'wolf_fang', amount: 2 } },
+  { id: 'grayglen_cairn', name: 'Grayglen Cairn', x: 42.5, y: 79.8, combat: ['forest_spider', 'orc_raider'], loot: { item: 'redcap_cap', amount: 2 } },
+  { id: 'timberspire_sanctum', name: 'Timberspire Sanctum', x: 63, y: 49.1, combat: ['giant_rat'], loot: { item: 'supplies', amount: 4 } },
+  { id: 'shadowshore_barrow', name: 'Shadowshore Barrow', x: 83.4, y: 54.6, combat: ['orc_raider'], loot: { item: 'gold', amount: 15 } },
+  { id: 'reedgrove_shire', name: 'Reedgrove Shire', x: 5.6, y: 93.4, combat: ['orc_raider', 'marsh_wraith'] },
+  { id: 'duskmoorhall_spire', name: 'Duskmoorhall Spire', x: 16.9, y: 91.9, combat: ['stone_troll', 'marsh_wraith'], loot: { item: 'troll_hide', amount: 2 } },
+  { id: 'jademoor_glen', name: 'Jademoor Glen', x: 90, y: 78.8, combat: ['wolf', 'marsh_wraith'], loot: { item: 'gold', amount: 22 } },
+  { id: 'wolfridge_hamlet', name: 'Wolfridge Hamlet', x: 41, y: 33.3, combat: ['wolf'], loot: { item: 'gold', amount: 10 } },
+  { id: 'vinegap_den', name: 'Vinegap Den', x: 85.9, y: 75.3, combat: ['wolf', 'marsh_wraith'] },
+  { id: 'granitemire_glen', name: 'Granitemire Glen', x: 50.9, y: 54.9, combat: ['bandit'], loot: { item: 'gold', amount: 5 } },
+  { id: 'goldwick_ruins', name: 'Goldwick Ruins', x: 56.9, y: 46.4, combat: ['giant_rat', 'bandit'] },
+  { id: 'elmdale_watch', name: 'Elmdale Watch', x: 2.6, y: 33.5, combat: ['orc_raider', 'marsh_wraith'] },
+  { id: 'briarglade_camp', name: 'Briarglade Camp', x: 58, y: 33.6, combat: ['forest_spider'] },
+  { id: 'elderkeep_vale', name: 'Elderkeep Vale', x: 7.8, y: 27, combat: ['marsh_wraith'], loot: { item: 'gold', amount: 19 } },
+  { id: 'peatcrest_port', name: 'Peatcrest Port', x: 15.5, y: 58.2, combat: ['wolf', 'orc_raider'] },
+  { id: 'silvershade_watch', name: 'Silvershade Watch', x: 32, y: 26.4, combat: ['marsh_wraith'], loot: { item: 'gold', amount: 14 } },
+  { id: 'gorsespire_vale', name: 'Gorsespire Vale', x: 64, y: 92.1, combat: ['stone_troll'], loot: { item: 'bog_root', amount: 1 } },
+  { id: 'timberhollow_overlook', name: 'Timberhollow Overlook', x: 86.4, y: 57, combat: ['forest_spider', 'orc_raider'], loot: { item: 'redcap_cap', amount: 2 } },
+  { id: 'cinderwick_watch', name: 'Cinderwick Watch', x: 84.2, y: 38.9, combat: ['marsh_wraith'], loot: { item: 'redcap_cap', amount: 3 } },
+  { id: 'wickreach_spire', name: 'Wickreach Spire', x: 76.6, y: 73.5, combat: ['forest_spider', 'orc_raider'] },
+  { id: 'longmoorrun_hold', name: 'Longmoorrun Hold', x: 20.2, y: 41.3, combat: ['forest_spider', 'orc_raider'] },
+  { id: 'mistralhollow_haven', name: 'Mistralhollow Haven', x: 19.1, y: 87.2, combat: ['orc_raider'] },
+  { id: 'thornfen_keep', name: 'Thornfen Keep', x: 67.2, y: 76.2, combat: ['marsh_wraith'], loot: { item: 'moonleaf', amount: 3 } },
+  { id: 'cedarglade_bridge', name: 'Cedarglade Bridge', x: 81.8, y: 29.9, combat: ['forest_spider', 'orc_raider'] },
+  { id: 'larchward_den', name: 'Larchward Den', x: 12.7, y: 4.8, combat: ['stone_troll', 'orc_raider'] },
+  { id: 'juniperkeep_spire', name: 'Juniperkeep Spire', x: 15.4, y: 22.6, combat: ['wolf', 'marsh_wraith'] },
+  { id: 'thornkeep_encampment', name: 'Thornkeep Encampment', x: 5, y: 74.9, combat: ['stone_troll'], loot: { item: 'gold_ore', amount: 2 } },
+  { id: 'heatherglade_ford', name: 'Heatherglade Ford', x: 79.1, y: 3.1, combat: ['stone_troll'], loot: { item: 'gold_ore', amount: 4 } },
+  { id: 'timberhall_barrow', name: 'Timberhall Barrow', x: 11.6, y: 77.7, combat: ['orc_raider'], loot: { item: 'silver_ore', amount: 5 } },
+  { id: 'willowstead_overlook', name: 'Willowstead Overlook', x: 79.2, y: 9.9, combat: ['marsh_wraith'], loot: { item: 'silver_ore', amount: 5 } },
+  { id: 'reedmarsh_glen', name: 'Reedmarsh Glen', x: 64.9, y: 12.6, combat: ['stone_troll'], loot: { item: 'silver_ore', amount: 3 } },
+  { id: 'stormwickbrook_glen', name: 'Stormwickbrook Glen', x: 14.8, y: 14.7, combat: ['marsh_wraith'], loot: { item: 'bog_root', amount: 1 } },
+  { id: 'goldedge_bridge', name: 'Goldedge Bridge', x: 8.5, y: 41.1, combat: ['marsh_wraith'] },
+  { id: 'ashenhall_cove', name: 'Ashenhall Cove', x: 16.2, y: 68.1, combat: ['wolf', 'marsh_wraith'] },
+  { id: 'birchmoor_ridge', name: 'Birchmoor Ridge', x: 7.9, y: 12, combat: ['stone_troll', 'orc_raider'], loot: { item: 'mithril_ore', amount: 3 } },
+  { id: 'fogbridge_moor', name: 'Fogbridge Moor', x: 47.5, y: 97.6, combat: ['orc_raider'], loot: { item: 'bog_root', amount: 2 } },
+  { id: 'hollowpoint_vale', name: 'Hollowpoint Vale', x: 16.9, y: 49.9, combat: ['wolf', 'orc_raider'], loot: { item: 'gold', amount: 17 } },
+  { id: 'ostwickshade_brook', name: 'Ostwickshade Brook', x: 46.4, y: 70.8, combat: ['forest_spider'], loot: { item: 'fish', amount: 6 } },
+  { id: 'cinderwood_sanctum', name: 'Cinderwood Sanctum', x: 27.7, y: 76.7, combat: ['orc_raider'], loot: { item: 'gold', amount: 14 } },
+  { id: 'whisperhollow_ruins', name: 'Whisperhollow Ruins', x: 18.4, y: 46.2, combat: ['orc_raider'], loot: { item: 'gold', amount: 12 } },
+  { id: 'vulturelight_hamlet', name: 'Vulturelight Hamlet', x: 50.4, y: 9.1, combat: ['stone_troll'], loot: { item: 'gold', amount: 18 } },
+  { id: 'elderhall_overlook', name: 'Elderhall Overlook', x: 85.4, y: 49.6, combat: ['marsh_wraith'] },
+  { id: 'hazelfen_enclave', name: 'Hazelfen Enclave', x: 2.7, y: 5.9, combat: ['stone_troll'], loot: { item: 'troll_hide', amount: 2 } },
+  { id: 'duskmoorgap_tower', name: 'Duskmoorgap Tower', x: 54.1, y: 85.6, combat: ['orc_raider'] },
+  { id: 'ridgeglen_bridge', name: 'Ridgeglen Bridge', x: 67.9, y: 66, combat: ['bog_zombie'], loot: { item: 'sunpetal', amount: 1 } },
+  { id: 'vulturelight_hollow', name: 'Vulturelight Hollow', x: 53.8, y: 47.1, combat: ['bandit'] },
+  { id: 'tidedale_landing', name: 'Tidedale Landing', x: 76.3, y: 25.3, combat: ['wolf', 'orc_raider'] },
+  { id: 'ivygate_barrow', name: 'Ivygate Barrow', x: 85.6, y: 70.9, combat: ['marsh_wraith'], loot: { item: 'silver_ore', amount: 2 } },
+  { id: 'yewgap_shrine', name: 'Yewgap Shrine', x: 9.7, y: 64.4, combat: ['marsh_wraith'], loot: { item: 'wolf_fang', amount: 1 } },
+  { id: 'marrowdale_village', name: 'Marrowdale Village', x: 19.3, y: 18.4, combat: ['marsh_wraith'], loot: { item: 'bog_root', amount: 2 } },
+  { id: 'sunglen_hollow', name: 'Sunglen Hollow', x: 55, y: 25, combat: ['bog_zombie'], loot: { item: 'iron_ore', amount: 5 } },
+  { id: 'ironhall_bridge', name: 'Ironhall Bridge', x: 80.1, y: 58.5, combat: ['wolf', 'orc_raider'], loot: { item: 'redcap_cap', amount: 3 } },
+  { id: 'loamview_landing', name: 'Loamview Landing', x: 55.3, y: 66, combat: ['giant_rat', 'bandit'], loot: { item: 'gold', amount: 7 } },
+  { id: 'granitespire_shire', name: 'Granitespire Shire', x: 21.3, y: 76.8, combat: ['marsh_wraith'], loot: { item: 'silver_ore', amount: 2 } },
+  { id: 'loamshade_moor', name: 'Loamshade Moor', x: 2.1, y: 96.1, combat: ['orc_raider', 'marsh_wraith'], loot: { item: 'mithril_ore', amount: 3 } },
+  { id: 'quietgate_keep', name: 'Quietgate Keep', x: 96.2, y: 42.8, combat: ['wolf', 'marsh_wraith'], loot: { item: 'gold', amount: 19 } },
+  { id: 'kestrelwick_reach', name: 'Kestrelwick Reach', x: 44.9, y: 32.5, combat: ['forest_spider'], loot: { item: 'sunpetal', amount: 1 } },
+  { id: 'bramblewoodhall_cairn', name: 'Bramblewoodhall Cairn', x: 91.1, y: 44.2, combat: ['wolf', 'marsh_wraith'] },
+  { id: 'copperglade_crest', name: 'Copperglade Crest', x: 80.7, y: 76.5, combat: ['orc_raider'] },
+  { id: 'wyrmvale_glen', name: 'Wyrmvale Glen', x: 68.6, y: 9.4, combat: ['wolf', 'marsh_wraith'], loot: { item: 'silver_ore', amount: 2 } },
+  { id: 'quietspire_watch', name: 'Quietspire Watch', x: 25.7, y: 88.4, combat: ['stone_troll'] },
+  { id: 'marrowden_hall', name: 'Marrowden Hall', x: 32.9, y: 43.6, combat: ['wolf', 'forest_spider'], loot: { item: 'gold', amount: 14 } },
+  { id: 'granitecliff_spire', name: 'Granitecliff Spire', x: 10.3, y: 90.2, combat: ['stone_troll'], loot: { item: 'troll_hide', amount: 2 } },
+  { id: 'yewridge_overlook', name: 'Yewridge Overlook', x: 64.3, y: 18.5, combat: ['wolf', 'orc_raider'], loot: { item: 'coal', amount: 4 } },
+  { id: 'birchgap_den', name: 'Birchgap Den', x: 50.8, y: 5, combat: ['orc_raider'] },
+  { id: 'ironcladvale_sanctum', name: 'Ironcladvale Sanctum', x: 71.7, y: 82, combat: ['marsh_wraith'] },
+  { id: 'ashcliff_ford', name: 'Ashcliff Ford', x: 91.4, y: 87.2, combat: ['stone_troll', 'orc_raider'], loot: { item: 'mithril_ore', amount: 3 } },
+  { id: 'blackbridge_keep', name: 'Blackbridge Keep', x: 72.2, y: 36.4, combat: ['bog_zombie'] },
+  { id: 'ashengrove_hollow', name: 'Ashengrove Hollow', x: 28.2, y: 40.8, combat: ['wolf'], loot: { item: 'iron_ore', amount: 3 } },
+  { id: 'coldstoneshade_cairn', name: 'Coldstoneshade Cairn', x: 12.4, y: 81.1, combat: ['stone_troll'] },
+  { id: 'larchpoint_hall', name: 'Larchpoint Hall', x: 57.8, y: 70.1, combat: ['bog_zombie'], loot: { item: 'sunpetal', amount: 1 } },
+  { id: 'kestrelgap_haven', name: 'Kestrelgap Haven', x: 47.1, y: 52.2, combat: ['bandit'], loot: { item: 'supplies', amount: 2 } },
+  { id: 'ironford_shire', name: 'Ironford Shire', x: 61.6, y: 53.7, combat: ['giant_rat'], loot: { item: 'gold', amount: 8 } },
+  { id: 'wickmarsh_crossing', name: 'Wickmarsh Crossing', x: 53.3, y: 74.8, combat: ['wolf'], loot: { item: 'gold', amount: 14 } },
+  { id: 'pinekeep_ruins', name: 'Pinekeep Ruins', x: 48, y: 23.3, combat: ['forest_spider'] },
+  { id: 'ravenmoor_watch', name: 'Ravenmoor Watch', x: 80.9, y: 17.3, combat: ['stone_troll'] },
+  { id: 'yewwatch_moor', name: 'Yewwatch Moor', x: 25.3, y: 81, combat: ['orc_raider'], loot: { item: 'gold', amount: 17 } },
+  { id: 'hollowglade_refuge', name: 'Hollowglade Refuge', x: 4.2, y: 89.7, combat: ['stone_troll', 'marsh_wraith'] },
+  { id: 'winterholdfall_landing', name: 'Winterholdfall Landing', x: 73.5, y: 95.3, combat: ['stone_troll'] },
+  { id: 'palewindcrag_cove', name: 'Palewindcrag Cove', x: 97.3, y: 65, combat: ['orc_raider'] },
+  { id: 'bramblewoodgrove_outpost', name: 'Bramblewoodgrove Outpost', x: 7.7, y: 56.3, combat: ['orc_raider', 'marsh_wraith'] },
+  { id: 'quillspire_glen', name: 'Quillspire Glen', x: 88.8, y: 14.4, combat: ['stone_troll', 'orc_raider'], loot: { item: 'mithril_ore', amount: 1 } },
+  { id: 'ironcladwood_den', name: 'Ironcladwood Den', x: 50.2, y: 83.4, combat: ['orc_raider'], loot: { item: 'gold', amount: 14 } },
+  { id: 'ochreden_camp', name: 'Ochreden Camp', x: 14.1, y: 37.9, combat: ['marsh_wraith'], loot: { item: 'redcap_cap', amount: 3 } },
+  { id: 'duskmoormere_crest', name: 'Duskmoormere Crest', x: 45.6, y: 64.1, combat: ['giant_rat'] },
+  { id: 'bramblereach_den', name: 'Bramblereach Den', x: 42.9, y: 93.7, combat: ['wolf', 'marsh_wraith'], loot: { item: 'wolf_fang', amount: 2 } },
+  { id: 'irongrove_village', name: 'Irongrove Village', x: 21.9, y: 87.4, combat: ['orc_raider', 'marsh_wraith'], loot: { item: 'bog_root', amount: 3 } },
+  { id: 'nettlehollow_cairn', name: 'Nettlehollow Cairn', x: 82.6, y: 2.5, combat: ['stone_troll'], loot: { item: 'mithril_ore', amount: 1 } },
+  { id: 'redcliffhold_brook', name: 'Redcliffhold Brook', x: 4.9, y: 21, combat: ['stone_troll', 'marsh_wraith'] },
+  { id: 'ironpoint_tower', name: 'Ironpoint Tower', x: 90.4, y: 48.3, combat: ['stone_troll'], loot: { item: 'bog_root', amount: 3 } },
+  { id: 'bramblecrest_haven', name: 'Bramblecrest Haven', x: 4.4, y: 46.4, combat: ['stone_troll'] },
+  { id: 'jadeford_cove', name: 'Jadeford Cove', x: 14.5, y: 90.3, combat: ['stone_troll', 'orc_raider'] },
+  { id: 'heathershore_crossing', name: 'Heathershore Crossing', x: 74.8, y: 2.6, combat: ['stone_troll', 'orc_raider'], loot: { item: 'gold_ore', amount: 4 } },
+  { id: 'farrowwood_brook', name: 'Farrowwood Brook', x: 23.2, y: 53.1, combat: ['wolf', 'forest_spider'], loot: { item: 'sunpetal', amount: 2 } },
+  { id: 'vinegap_reach', name: 'Vinegap Reach', x: 46.5, y: 76.2, combat: ['wolf'], loot: { item: 'gold', amount: 12 } },
+  { id: 'blackcove_port', name: 'Blackcove Port', x: 8.9, y: 4.7, combat: ['stone_troll', 'marsh_wraith'], loot: { item: 'troll_hide', amount: 1 } },
+  { id: 'ashenview_moor', name: 'Ashenview Moor', x: 43.6, y: 18.8, combat: ['wolf', 'orc_raider'], loot: { item: 'moonleaf', amount: 2 } },
+  { id: 'rowanshade_port', name: 'Rowanshade Port', x: 14, y: 53.9, combat: ['orc_raider'], loot: { item: 'gold', amount: 13 } },
+  { id: 'redcliffridge_waystation', name: 'Redcliffridge Waystation', x: 65.3, y: 44, combat: ['giant_rat', 'bandit'] },
+  { id: 'thistlemarsh_keep', name: 'Thistlemarsh Keep', x: 94.3, y: 47.5, combat: ['orc_raider'], loot: { item: 'silver_ore', amount: 4 } },
+  { id: 'duskmoorcliff_hollow', name: 'Duskmoorcliff Hollow', x: 11.9, y: 57.5, combat: ['stone_troll'], loot: { item: 'silver_ore', amount: 2 } },
+  { id: 'elderford_gate', name: 'Elderford Gate', x: 76, y: 29.8, combat: ['orc_raider'], loot: { item: 'redcap_cap', amount: 1 } },
+  { id: 'timberfall_waystation', name: 'Timberfall Waystation', x: 67.4, y: 89.5, combat: ['wolf', 'marsh_wraith'] },
+  { id: 'ivyshore_cairn', name: 'Ivyshore Cairn', x: 38.5, y: 74.5, combat: ['forest_spider'], loot: { item: 'gold', amount: 9 } },
+  { id: 'larchburrow_sanctum', name: 'Larchburrow Sanctum', x: 6.7, y: 85.9, combat: ['stone_troll', 'marsh_wraith'], loot: { item: 'gold', amount: 31 } },
+  { id: 'fogpoint_waystation', name: 'Fogpoint Waystation', x: 31.7, y: 87.3, combat: ['marsh_wraith'] },
+  { id: 'fogshade_moor', name: 'Fogshade Moor', x: 57.7, y: 62.8, combat: ['giant_rat'], loot: { item: 'wood', amount: 6 } },
+  { id: 'driftwoodshade_hollow', name: 'Driftwoodshade Hollow', x: 44.8, y: 67.8, combat: ['wolf', 'forest_spider'] },
+  { id: 'palewinddale_tower', name: 'Palewinddale Tower', x: 3.5, y: 50.9, combat: ['stone_troll'] },
+  { id: 'wraithridge_keep', name: 'Wraithridge Keep', x: 4.7, y: 31, combat: ['stone_troll'] },
+  { id: 'umbermere_crest', name: 'Umbermere Crest', x: 28.4, y: 65.3, combat: ['wolf', 'forest_spider'], loot: { item: 'iron_ore', amount: 3 } },
+  { id: 'umberrun_hamlet', name: 'Umberrun Hamlet', x: 95.7, y: 89.8, combat: ['stone_troll', 'orc_raider'], loot: { item: 'mithril_ore', amount: 1 } },
+  { id: 'copperview_village', name: 'Copperview Village', x: 97.5, y: 76.4, combat: ['stone_troll', 'marsh_wraith'], loot: { item: 'mithril_ore', amount: 1 } },
+  { id: 'graypoint_village', name: 'Graypoint Village', x: 30.4, y: 28.9, combat: ['wolf', 'orc_raider'] },
+  { id: 'goldvale_cairn', name: 'Goldvale Cairn', x: 3.3, y: 11.5, combat: ['orc_raider', 'marsh_wraith'], loot: { item: 'gold', amount: 31 } },
+  { id: 'stormdale_tower', name: 'Stormdale Tower', x: 16.6, y: 7.5, combat: ['stone_troll'] },
+  { id: 'foxstead_cove', name: 'Foxstead Cove', x: 15.4, y: 75.9, combat: ['stone_troll'], loot: { item: 'silver_ore', amount: 2 } },
+  { id: 'hollowcrag_enclave', name: 'Hollowcrag Enclave', x: 32.2, y: 11.6, combat: ['wolf', 'marsh_wraith'] },
+  { id: 'cindermire_spire', name: 'Cindermire Spire', x: 53.3, y: 95.6, combat: ['marsh_wraith'], loot: { item: 'silver_ore', amount: 2 } },
+  { id: 'hazeldale_overlook', name: 'Hazeldale Overlook', x: 37.4, y: 7.8, combat: ['stone_troll'], loot: { item: 'silver_ore', amount: 2 } },
+  { id: 'stormmire_outpost', name: 'Stormmire Outpost', x: 61.1, y: 94.5, combat: ['stone_troll'], loot: { item: 'gold', amount: 20 } },
+  { id: 'loamreach_brook', name: 'Loamreach Brook', x: 43.7, y: 3.6, combat: ['stone_troll'], loot: { item: 'gold', amount: 24 } },
+  { id: 'thistlewoodward_landing', name: 'Thistlewoodward Landing', x: 71.1, y: 71.8, combat: ['marsh_wraith'] },
+  { id: 'ironcladfen_hollow', name: 'Ironcladfen Hollow', x: 94.5, y: 62.5, combat: ['orc_raider', 'marsh_wraith'] },
+  { id: 'rowancrest_moor', name: 'Rowancrest Moor', x: 59.1, y: 76.2, combat: ['wolf'], loot: { item: 'gold', amount: 9 } },
+  { id: 'whithollow_moor', name: 'Whithollow Moor', x: 73.8, y: 74.1, combat: ['marsh_wraith'], loot: { item: 'gold', amount: 18 } },
+  { id: 'umberkeep_shrine', name: 'Umberkeep Shrine', x: 24.5, y: 92.2, combat: ['wolf', 'marsh_wraith'], loot: { item: 'silver_ore', amount: 4 } },
+  { id: 'elmlight_den', name: 'Elmlight Den', x: 21.4, y: 82.5, combat: ['stone_troll'], loot: { item: 'bog_root', amount: 1 } },
+  { id: 'stormridge_gate', name: 'Stormridge Gate', x: 8.5, y: 19.1, combat: ['orc_raider', 'marsh_wraith'] },
+  { id: 'ashdale_cairn', name: 'Ashdale Cairn', x: 75.2, y: 77.2, combat: ['marsh_wraith'] },
+  { id: 'fernwatch_grove', name: 'Fernwatch Grove', x: 45.8, y: 82.9, combat: ['marsh_wraith'], loot: { item: 'gold', amount: 13 } },
+  { id: 'quarryspire_fen', name: 'Quarryspire Fen', x: 56.8, y: 57, combat: ['giant_rat', 'bandit'] },
+  { id: 'nightgap_hollow', name: 'Nightgap Hollow', x: 5.6, y: 69.4, combat: ['wolf', 'marsh_wraith'] },
+  { id: 'deepmire_haven', name: 'Deepmire Haven', x: 37.5, y: 35.9, combat: ['wolf'], loot: { item: 'iron_ore', amount: 6 } },
+  { id: 'duskmoorwatch_tower', name: 'Duskmoorwatch Tower', x: 25.9, y: 25.8, combat: ['wolf', 'orc_raider'] },
+  { id: 'copperburrow_spire', name: 'Copperburrow Spire', x: 43.6, y: 58.6, combat: ['bandit'], loot: { item: 'supplies', amount: 3 } },
+];
+
+// Pure flavor text + branching, no game-state mutation embedded in the tree
+// itself — an NPC's associated quest (if any) is a separate object shown
+// alongside the tree in the client, not a node in it. Keeps the tree a
+// simple static graph instead of needing a mini scripting language for
+// conditionals.
+const DIALOGUE_TREES = {
+  root_mira: {
+    id: 'root_mira',
+    text: "Welcome, traveler. The roads beyond camp aren't safe for the unprepared.",
+    options: [
+      { text: 'Got any advice?', next: 'mira_advice' },
+      { text: 'Farewell.', next: null },
+    ],
+  },
+  mira_advice: {
+    text: 'Stock up on supplies before drawing a long route, and never pick a fight without checking your gear first.',
+    options: [{ text: 'Thanks.', next: 'root_mira' }],
+  },
+  root_thom: {
+    id: 'root_thom',
+    text: "These groves don't cut themselves. Bring me good timber and I'll make it worth your while.",
+    options: [
+      { text: 'How do I cut wood?', next: 'thom_howto' },
+      { text: 'Farewell.', next: null },
+    ],
+  },
+  thom_howto: {
+    text: "Head to the Skills tab while you're standing here and start the Woodcutting task. Simple as that.",
+    options: [{ text: 'Got it.', next: 'root_thom' }],
+  },
+  root_fen: {
+    id: 'root_fen',
+    text: 'The water runs deep past this bridge. I hear there are old mine shafts west of here, if you know where to look.',
+    options: [
+      { text: 'Tell me more.', next: 'fen_more' },
+      { text: 'Farewell.', next: null },
+    ],
+  },
+  fen_more: {
+    text: "Ironbrook Mine, they call it. Never been myself — my knees aren't what they used to be. Someone younger ought to go see.",
+    options: [{ text: "I'll look into it.", next: 'root_fen' }],
+  },
+  root_yelena: {
+    id: 'root_yelena',
+    text: 'The marsh gives up its secrets slowly, and never for free. Bog root grows thick where the water is deepest.',
+    options: [
+      { text: 'What do you use bog root for?', next: 'yelena_bogroot' },
+      { text: 'Farewell.', next: null },
+    ],
+  },
+  yelena_bogroot: {
+    text: "Cures, mostly. A witch who can't cure a poison isn't much of a witch. Bring me some, if you're willing to get your boots wet.",
+    options: [{ text: "I'll see what I can find.", next: 'root_yelena' }],
+  },
+  root_borin: {
+    id: 'root_borin',
+    text: 'Copperhall was built on the vein under Wyrmwood Hold. Good, honest ore — soft enough to work, strong enough to trust.',
+    options: [
+      { text: 'Need any ore?', next: 'borin_ore' },
+      { text: 'Farewell.', next: null },
+    ],
+  },
+  borin_ore: {
+    text: "Always. Bring me copper and I'll square you up fair — better than you'd get hawking it at the shop.",
+    options: [{ text: "I'll bring some by.", next: 'root_borin' }],
+  },
+  root_reyna: {
+    id: 'root_reyna',
+    text: "Thornwatch holds the line, traveler, but bandits have been bold lately. Too bold. Someone ought to remind them why we're called that.",
+    options: [
+      { text: "I'll deal with them.", next: 'reyna_bandits' },
+      { text: 'Farewell.', next: null },
+    ],
+  },
+  reyna_bandits: {
+    text: "Good. Don't be a hero about it — one clean fight is proof enough. Come back when it's done.",
+    options: [{ text: 'Understood.', next: 'root_reyna' }],
+  },
+  root_aldric: {
+    id: 'root_aldric',
+    text: 'Vintermere Keep fell to wolves out of the north, long before your time. I stayed. Someone has to remember it fell for a reason.',
+    options: [
+      { text: 'What reason?', next: 'aldric_reason' },
+      { text: 'Farewell.', next: null },
+    ],
+  },
+  aldric_reason: {
+    text: "Pride. We thought the walls would hold. They didn't. Thin the packs still prowling nearby and maybe I'll finally believe it's over.",
+    options: [{ text: "I'll thin them out.", next: 'root_aldric' }],
+  },
+  root_fenwick: {
+    id: 'root_fenwick',
+    text: "Best hunting camp for miles, this. You'd be surprised what a patient hunter can bring down out here.",
+    options: [
+      { text: 'Any tips?', next: 'fenwick_tips' },
+      { text: 'Farewell.', next: null },
+    ],
+  },
+  fenwick_tips: {
+    text: "Patience and a full stomach. Bring me some meat off a real hunt and I'll know you've got both.",
+    options: [{ text: 'Noted.', next: 'root_fenwick' }],
+  },
+  root_sera: {
+    id: 'root_sera',
+    text: "I've walked far to reach this spire, and I mean to walk farther still — all the way to the frostbound watch at the world's edge, if my legs allow it.",
+    options: [
+      { text: 'Why go so far?', next: 'sera_why' },
+      { text: 'Farewell.', next: null },
+    ],
+  },
+  sera_why: {
+    text: "Faith needs proof sometimes. If you reach Frostmere Watch before I do, traveler, tell me — I'd take it as a sign I'm not walking alone.",
+    options: [{ text: "I'll let you know.", next: 'root_sera' }],
+  },
+  root_cordelia: {
+    id: 'root_cordelia',
+    text: "Ironvale Hall forges the finest steel this side of the mountains — when I've got the iron for it, that is.",
+    options: [
+      { text: 'You need iron?', next: 'cordelia_iron' },
+      { text: 'Farewell.', next: null },
+    ],
+  },
+  cordelia_iron: {
+    text: "Always short on it. Ironbrook's a long haul from here. Bring me a real haul of ore and you'll see what this forge can really do.",
+    options: [{ text: "I'll bring you plenty.", next: 'root_cordelia' }],
+  },
+  root_thistle: {
+    id: 'root_thistle',
+    text: 'Stonehaven has been ruins longer than anyone living remembers why. Something still moves in the deep stones, traveler. I can feel it.',
+    options: [
+      { text: 'What moves there?', next: 'thistle_warning' },
+      { text: 'Farewell.', next: null },
+    ],
+  },
+  thistle_warning: {
+    text: "Something old, and slow, and made of the stone itself. If you're foolish enough to seek it out, at least come back and tell me it's dead.",
+    options: [{ text: "I'll face it.", next: 'root_thistle' }],
+  },
+};
+
+const NPCS = {
+  elder_mira: { id: 'elder_mira', name: 'Elder Mira', locationId: 'wanderers_camp', dialogueTreeId: 'root_mira', questId: 'first_hunt' },
+  groundskeeper_thom: { id: 'groundskeeper_thom', name: 'Groundskeeper Thom', locationId: 'gladewind_grove', dialogueTreeId: 'root_thom', questId: 'timber_delivery' },
+  old_fen: { id: 'old_fen', name: 'Old Fen', locationId: 'grimwater_bridge', dialogueTreeId: 'root_fen', questId: 'scout_the_mine' },
+  marsh_witch_yelena: { id: 'marsh_witch_yelena', name: 'Marsh Witch Yelena', locationId: 'duskhollow_marsh', dialogueTreeId: 'root_yelena', questId: 'bog_root_tribute' },
+  blacksmith_borin: { id: 'blacksmith_borin', name: 'Blacksmith Borin', locationId: 'copperhall_village', dialogueTreeId: 'root_borin', questId: 'copper_delivery' },
+  captain_reyna: { id: 'captain_reyna', name: 'Captain Reyna', locationId: 'thornwatch_hall', dialogueTreeId: 'root_reyna', questId: 'bandit_trouble' },
+  sentinel_aldric: { id: 'sentinel_aldric', name: 'Sentinel Aldric', locationId: 'vintermere_keep', dialogueTreeId: 'root_aldric', questId: 'thin_the_packs' },
+  hunter_fenwick: { id: 'hunter_fenwick', name: 'Hunter Fenwick', locationId: 'whisperwood_camp', dialogueTreeId: 'root_fenwick', questId: 'proof_of_the_hunt' },
+  pilgrim_sera: { id: 'pilgrim_sera', name: 'Pilgrim Sera', locationId: 'sunspire_camp', dialogueTreeId: 'root_sera', questId: 'edge_of_the_world' },
+  smith_cordelia: { id: 'smith_cordelia', name: 'Smith Cordelia', locationId: 'ironvale_hall', dialogueTreeId: 'root_cordelia', questId: 'ironvale_haul' },
+  sage_thistle: { id: 'sage_thistle', name: 'Sage Thistle', locationId: 'stonehaven_ruins', dialogueTreeId: 'root_thistle', questId: 'the_deep_stone' },
+};
+
+// objective types: 'kill' (cumulative lifetime kill count, so a quest can be
+// satisfied instantly by prior kills — deliberate, keeps this simple rather
+// than needing quest-scoped counters), 'gather' (inventory count, consumed
+// on turn-in), 'visit' (location already discovered).
+const QUESTS = {
+  first_hunt: {
+    id: 'first_hunt',
+    name: 'First Hunt',
+    description: 'Defeat a Giant Rat to prove your mettle.',
+    objective: { type: 'kill', enemyId: 'giant_rat', count: 1 },
+    reward: { gold: 25, xp: { combat: 20 } },
+  },
+  timber_delivery: {
+    id: 'timber_delivery',
+    name: 'Timber Delivery',
+    description: 'Bring 10 Wood to Groundskeeper Thom.',
+    objective: { type: 'gather', itemId: 'wood', count: 10 },
+    reward: { gold: 15, xp: { woodcutting: 25 } },
+  },
+  scout_the_mine: {
+    id: 'scout_the_mine',
+    name: 'Scout the Mine',
+    description: 'Discover Ironbrook Mine.',
+    objective: { type: 'visit', locationId: 'ironbrook_mine' },
+    reward: { gold: 20 },
+  },
+  bog_root_tribute: {
+    id: 'bog_root_tribute',
+    name: 'Bog Root Tribute',
+    description: 'Bring 3 Bog Root to Marsh Witch Yelena.',
+    objective: { type: 'gather', itemId: 'bog_root', count: 3 },
+    reward: { gold: 20 },
+  },
+  copper_delivery: {
+    id: 'copper_delivery',
+    name: 'Copper Delivery',
+    description: 'Bring 5 Copper Ore to Blacksmith Borin.',
+    objective: { type: 'gather', itemId: 'copper_ore', count: 5 },
+    reward: { gold: 20 },
+  },
+  bandit_trouble: {
+    id: 'bandit_trouble',
+    name: 'Bandit Trouble',
+    description: 'Defeat a Bandit for Captain Reyna.',
+    objective: { type: 'kill', enemyId: 'bandit', count: 1 },
+    reward: { gold: 25, xp: { combat: 15 } },
+  },
+  thin_the_packs: {
+    id: 'thin_the_packs',
+    name: 'Thin the Packs',
+    description: 'Defeat 2 Wolves for Sentinel Aldric.',
+    objective: { type: 'kill', enemyId: 'wolf', count: 2 },
+    reward: { gold: 30, xp: { combat: 20 } },
+  },
+  proof_of_the_hunt: {
+    id: 'proof_of_the_hunt',
+    name: 'Proof of the Hunt',
+    description: 'Bring 5 Raw Meat to Hunter Fenwick.',
+    objective: { type: 'gather', itemId: 'raw_meat', count: 5 },
+    reward: { gold: 25, xp: { hunting: 25 } },
+  },
+  edge_of_the_world: {
+    id: 'edge_of_the_world',
+    name: 'Edge of the World',
+    description: 'Discover Frostmere Watch for Pilgrim Sera.',
+    objective: { type: 'visit', locationId: 'frostmere_watch' },
+    reward: { gold: 40 },
+  },
+  ironvale_haul: {
+    id: 'ironvale_haul',
+    name: 'Ironvale Haul',
+    description: 'Bring 8 Iron Ore to Smith Cordelia.',
+    objective: { type: 'gather', itemId: 'iron_ore', count: 8 },
+    reward: { gold: 35 },
+  },
+  the_deep_stone: {
+    id: 'the_deep_stone',
+    name: 'The Deep Stone',
+    description: 'Defeat a Stone Troll for Sage Thistle.',
+    objective: { type: 'kill', enemyId: 'stone_troll', count: 1 },
+    reward: { gold: 60, xp: { combat: 40 } },
+  },
+};
+
+function loadDb() {
+  if (!fs.existsSync(DB_PATH)) {
+    return { players: {}, usernames: {} };
+  }
+  return JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+}
+
+let db = loadDb();
+
+function save() {
+  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+}
+
+function getLocation(id) {
+  return LOCATIONS.find((l) => l.id === id) || null;
+}
+
+// traits: {strength, dexterity, luck, vigor} — always provided by
+// createCharacter() (validated there); defaults to an even TRAIT_BASE spread
+// only as a fallback (devResetPlayer/legacy callers never actually hit this,
+// but keeps newPlayer callable without traits from not blowing up).
+function newPlayer(username, traits) {
+  const startLoc = LOCATIONS.find((l) => l.startingLocation);
+  const id = 'p_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const player = {
+    id,
+    username,
+    createdAt: Date.now(),
+    currentLocation: startLoc.id,
+    discoveries: [startLoc.id],
+    inventory: { supplies: STARTER_SUPPLIES, gold: 20 },
+    expedition: null,
+    equipment: { weapon: null, armor: null },
+    combat: null,
+    garden: { plots: new Array(GARDEN_PLOT_COUNT).fill(null) },
+    skills: {
+      mining: { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null },
+      woodcutting: { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null },
+      fishing: { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null },
+      hunting: { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null },
+      scavenging: { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null },
+      harvesting: { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null },
+      combat: { xp: 0 },
+    },
+    farm: { animals: [] },
+    buildings: {},
+    quests: { started: [], completed: [] },
+    killCounts: {},
+    combatRecord: { wins: 0, losses: 0 },
+    lastRareEvent: null,
+    alchemy: { knownRecipes: [], triedCombos: [] },
+    abilityLoadout: [...DEFAULT_ABILITY_LOADOUT],
+    traits: traits || { strength: TRAIT_BASE, dexterity: TRAIT_BASE, luck: TRAIT_BASE, vigor: TRAIT_BASE },
+    characterXp: 0,
+    traitPointsAvailable: 0,
+    perkPoints: 0,
+    perks: [],
+  };
+  db.players[id] = player;
+  db.usernames[username.toLowerCase()] = id;
+  save();
+  return player;
+}
+
+// Two-step now: an unrecognized username no longer auto-creates a player —
+// it hands back { existing: false, username } so the client can show the
+// trait point-buy character-creation screen and call createCharacter()
+// with the chosen traits. A recognized username logs in exactly as before.
+function login(username) {
+  const clean = String(username || '').trim().slice(0, 24);
+  if (!clean) return null;
+  const existingId = db.usernames[clean.toLowerCase()];
+  if (existingId && db.players[existingId]) {
+    return { existing: true, player: getPlayer(existingId) };
+  }
+  return { existing: false, username: clean };
+}
+
+// Validates the Fallout-SPECIAL-style point-buy pool (TRAIT_BASE each +
+// TRAIT_EXTRA_POINTS to distribute, each trait clamped to
+// [TRAIT_MIN, TRAIT_MAX]) server-side — never trusts the client's math even
+// though the UI enforces it too.
+function createCharacter(username, rawTraits) {
+  const clean = String(username || '').trim().slice(0, 24);
+  if (!clean) return { error: 'invalid_username' };
+  if (db.usernames[clean.toLowerCase()]) return { error: 'username_taken' };
+
+  const traits = {};
+  for (const key of TRAIT_KEYS) {
+    const v = Math.round(Number(rawTraits && rawTraits[key]));
+    if (!Number.isFinite(v) || v < TRAIT_MIN || v > TRAIT_MAX) return { error: 'invalid_traits' };
+    traits[key] = v;
+  }
+  const totalExtra = TRAIT_KEYS.reduce((sum, k) => sum + (traits[k] - TRAIT_BASE), 0);
+  if (totalExtra !== TRAIT_EXTRA_POINTS) return { error: 'invalid_point_total' };
+
+  const player = newPlayer(clean, traits);
+  return { ok: true, player: publicPlayer(player) };
+}
+
+// Any player created before a given feature existed (equipment/garden/combat
+// skill/gold, added in the big 2026-07-21 batch) is missing those fields on
+// disk. Backfill them on load instead of assuming every player object has
+// the current shape — without this, publicPlayer() throws the moment it
+// touches e.g. player.equipment.weapon on an old record, which surfaces to
+// the client as a bare 500 on login with no indication why.
+function ensurePlayerShape(player) {
+  let changed = false;
+  if (player.inventory.gold === undefined) {
+    player.inventory.gold = 0;
+    changed = true;
+  }
+  if (!player.equipment) {
+    player.equipment = { weapon: null, armor: null };
+    changed = true;
+  }
+  if (player.combat === undefined) {
+    player.combat = null;
+    changed = true;
+  }
+  // Combat 2.0 (ability-sequencer arena) changed the shape of an in-progress
+  // fight (added loadout/distance/abilityCursor/etc). Any account that had
+  // an UNRESOLVED fight open at the moment that shipped is stuck holding an
+  // old-shape combat object — publicPlayer() unconditionally reads
+  // c.loadout.map(...), which throws on the old shape and breaks /api/me
+  // entirely for that account (not just the fight button). Same class of
+  // bug as the login-500 and dangling-location-id incidents: schema
+  // evolved, old in-flight state didn't migrate. Resetting to null loses
+  // that one stale fight, same tradeoff already accepted for the location
+  // migration.
+  if (player.combat && !Array.isArray(player.combat.loadout)) {
+    player.combat = null;
+    changed = true;
+  }
+  if (!player.garden) {
+    player.garden = { plots: new Array(GARDEN_PLOT_COUNT).fill(null) };
+    changed = true;
+  } else if (player.garden.plots.length < GARDEN_PLOT_COUNT) {
+    // plot count was increased (4 -> 24) after some accounts already existed
+    while (player.garden.plots.length < GARDEN_PLOT_COUNT) player.garden.plots.push(null);
+    changed = true;
+  }
+  if (!player.skills.woodcutting) {
+    player.skills.woodcutting = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null };
+    changed = true;
+  }
+  if (!player.skills.fishing) {
+    player.skills.fishing = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null };
+    changed = true;
+  }
+  if (!player.skills.hunting) {
+    player.skills.hunting = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null };
+    changed = true;
+  }
+  if (!player.skills.scavenging) {
+    player.skills.scavenging = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null };
+    changed = true;
+  }
+  if (!player.skills.harvesting) {
+    player.skills.harvesting = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null };
+    changed = true;
+  }
+  if (!player.skills.combat) {
+    player.skills.combat = { xp: 0 };
+    changed = true;
+  }
+  if (!player.farm) {
+    player.farm = { animals: [] };
+    changed = true;
+  }
+  if (!player.buildings) {
+    player.buildings = {};
+    changed = true;
+  }
+  if (!player.quests) {
+    player.quests = { started: [], completed: [] };
+    changed = true;
+  }
+  if (!player.killCounts) {
+    player.killCounts = {};
+    changed = true;
+  }
+  if (!player.combatRecord) {
+    player.combatRecord = { wins: 0, losses: 0 };
+    changed = true;
+  }
+  if (player.lastRareEvent === undefined) {
+    player.lastRareEvent = null;
+    changed = true;
+  }
+  if (!player.alchemy) {
+    player.alchemy = { knownRecipes: [], triedCombos: [] };
+    changed = true;
+  }
+  if (!player.abilityLoadout) {
+    player.abilityLoadout = [...DEFAULT_ABILITY_LOADOUT];
+    changed = true;
+  }
+  if (!player.traits) {
+    // pre-traits accounts get an even spread rather than retroactively
+    // running them through character creation
+    player.traits = { strength: TRAIT_BASE, dexterity: TRAIT_BASE, luck: TRAIT_BASE, vigor: TRAIT_BASE };
+    changed = true;
+  }
+  if (player.characterXp === undefined) {
+    player.characterXp = 0;
+    changed = true;
+  }
+  if (player.traitPointsAvailable === undefined) {
+    player.traitPointsAvailable = 0;
+    changed = true;
+  }
+  if (player.perkPoints === undefined) {
+    player.perkPoints = 0;
+    changed = true;
+  }
+  if (!player.perks) {
+    player.perks = [];
+    changed = true;
+  }
+  if (player.skills.mining && player.skills.mining.activeNode === undefined) {
+    player.skills.mining.activeNode = null;
+    changed = true;
+  }
+
+  // The location list was completely regenerated (6 hand-written locations
+  // -> 55 procedurally-placed ones) when the expedition-drawing feature was
+  // built. Any player from before that has discoveries/currentLocation
+  // pointing at ids that no longer exist at all — every location-driven
+  // feature (mining's location check, drawing a route from "current
+  // location", travel) silently fails to find a match and no-ops, which is
+  // indistinguishable from those features just being broken.
+  const validLocationIds = new Set(LOCATIONS.map((l) => l.id));
+  const filteredDiscoveries = player.discoveries.filter((id) => validLocationIds.has(id));
+  if (filteredDiscoveries.length !== player.discoveries.length) {
+    changed = true;
+  }
+  if (filteredDiscoveries.length === 0) {
+    filteredDiscoveries.push(LOCATIONS.find((l) => l.startingLocation).id);
+  }
+  player.discoveries = filteredDiscoveries;
+  if (!validLocationIds.has(player.currentLocation)) {
+    player.currentLocation = LOCATIONS.find((l) => l.startingLocation).id;
+    changed = true;
+  }
+
+  if (changed) save();
+  return player;
+}
+
+function getPlayer(id) {
+  const player = db.players[id];
+  if (!player) return null;
+  return ensurePlayerShape(player);
+}
+
+// Advances xp/items for any running task based on elapsed real time (works
+// the same whether the player has been polling continuously or was away —
+// both cases are just "elapsed seconds since lastTick"), then persists.
+// Also enforces that a task only keeps running while the player is still at
+// its required location — starting a task only checked location once, at
+// the moment of clicking Start, so traveling away afterward let it keep
+// accruing forever with nothing to stop it.
+// Maps a TASK_CONFIG skillId to the matching getPlayerModifiers() speed-mult
+// field (woodsman/angler's patience perks) — mining has its own analogous
+// lookup in tickMining() since it isn't in TASK_CONFIG at all.
+const SPEED_MULT_FIELD = { woodcutting: 'woodcuttingSpeedMult', fishing: 'fishingSpeedMult' };
+const MIN_CYCLE_SECONDS = 0.5; // floor so a stacked speed bonus can never hit 0/negative cycle time
+
+function tickSkills(player) {
+  const loc = getLocation(player.currentLocation);
+  for (const [skillId, skill] of Object.entries(player.skills)) {
+    const config = TASK_CONFIG[skillId];
+    if (!skill.taskStartedAt || !config) continue;
+
+    if (!loc || loc.skill !== skillId) {
+      skill.taskStartedAt = null;
+      skill.lastTick = null;
+      continue;
+    }
+
+    const now = Date.now();
+    const from = skill.lastTick || skill.taskStartedAt;
+    const elapsedSeconds = (now - from) / 1000;
+    if (elapsedSeconds > 0) {
+      const speedField = SPEED_MULT_FIELD[skillId];
+      const speedMult = speedField ? getPlayerModifiers(player)[speedField] : 0;
+      const effectiveCycleSeconds = Math.max(MIN_CYCLE_SECONDS, config.cycleSeconds * (1 - speedMult));
+      const totalSeconds = (skill.progressSeconds || 0) + elapsedSeconds;
+      const itemsCompleted = Math.floor(totalSeconds / effectiveCycleSeconds);
+      skill.progressSeconds = totalSeconds % effectiveCycleSeconds;
+      if (itemsCompleted > 0) {
+        player.inventory[config.item] = (player.inventory[config.item] || 0) + itemsCompleted;
+        skill.xp += itemsCompleted * config.xpPerItem;
+      }
+      skill.lastTick = now;
+    }
+  }
+}
+
+// Mining's own node-grid tick — locationless (unlike tickSkills, no travel
+// required once a node is unlocked), keyed off skill.activeNode rather than
+// the player's currentLocation. See MINING_NODES/startMiningNode().
+function tickMining(player) {
+  const skill = player.skills.mining;
+  if (!skill || !skill.taskStartedAt || !skill.activeNode) return;
+  const node = MINING_NODES[skill.activeNode];
+  if (!node || !player.discoveries.includes(node.locationId)) {
+    skill.taskStartedAt = null;
+    skill.lastTick = null;
+    return;
+  }
+
+  const now = Date.now();
+  const from = skill.lastTick || skill.taskStartedAt;
+  const elapsedSeconds = (now - from) / 1000;
+  if (elapsedSeconds <= 0) return;
+
+  const speedMult = getPlayerModifiers(player).miningSpeedMult;
+  const effectiveCycleSeconds = Math.max(MIN_CYCLE_SECONDS, node.cycleSeconds * (1 - speedMult));
+  const totalSeconds = (skill.progressSeconds || 0) + elapsedSeconds;
+  const itemsCompleted = Math.floor(totalSeconds / effectiveCycleSeconds);
+  skill.progressSeconds = totalSeconds % effectiveCycleSeconds;
+  if (itemsCompleted > 0) {
+    player.inventory[node.item] = (player.inventory[node.item] || 0) + itemsCompleted;
+    skill.xp += itemsCompleted * node.xpPerItem;
+  }
+  skill.lastTick = now;
+}
+
+// Starts mining a node the player has unlocked (its linked location has been
+// discovered) — usable from anywhere, same "own tab, no travel needed" idea
+// as the gather tasks, just deterministic-yield like mining always was.
+// Switching to a different node (or re-clicking the active one to stop) both
+// go through this + stopTask('mining') on the client.
+function startMiningNode(playerId, nodeId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const node = MINING_NODES[nodeId];
+  if (!node) return { error: 'unknown_node' };
+  if (!player.discoveries.includes(node.locationId)) return { error: 'not_unlocked' };
+  if (player.combat && !player.combat.result) return { error: 'busy_fighting' };
+  if (player.expedition) return { error: 'busy_exploring' };
+
+  stopAllSkillTasks(player); // only one task at a time
+  player.skills.mining.activeNode = nodeId;
+  player.skills.mining.taskStartedAt = Date.now();
+  player.skills.mining.lastTick = Date.now();
+  save();
+  return { ok: true };
+}
+
+// Every node, locked or not — the Mining tab shows the whole grid so
+// players can see what's still out there to discover, same idea as the
+// ability sidebar showing locked abilities.
+function publicMiningNodes(player) {
+  const skill = player.skills.mining;
+  return Object.entries(MINING_NODES).map(([id, node]) => {
+    const unlocked = player.discoveries.includes(node.locationId);
+    const loc = getLocation(node.locationId);
+    return {
+      id,
+      name: node.name,
+      item: node.item,
+      itemName: ITEMS[node.item].name,
+      tier: node.tier,
+      cycleSeconds: node.cycleSeconds,
+      xpPerItem: node.xpPerItem,
+      unlocked,
+      locationName: loc ? loc.name : node.locationId,
+      active: unlocked && skill.activeNode === id && !!skill.taskStartedAt,
+      progressSeconds: skill.activeNode === id ? skill.progressSeconds || 0 : 0,
+    };
+  });
+}
+
+// Resolves elapsed time on a gather task (hunting/scavenging/harvesting)
+// into whole completed cycles, then rolls each one independently instead of
+// granting a guaranteed yield like tickSkills does — see GATHER_TASKS/
+// RARE_GATHER_EVENT_CHANCE for the odds. A hunting cycle can trigger an
+// ambush (see resolveGatherCycle/beginAmbushCombat), which immediately stops
+// the task — combat is a hard block on every other task in this codebase,
+// same as it is for mining/expeditions, so a mid-hunt ambush is no
+// different. Cycles are capped per tick (same idea as tickCombat's guard
+// cap) so a very long AFK gap can't turn into an unbounded loop; any
+// still-unprocessed whole cycles just carry over as extra progressSeconds
+// and get resolved on the next tick.
+const GATHER_TICK_CAP = 500;
+
+function tickGatherTasks(player) {
+  for (const [skillId, config] of Object.entries(GATHER_TASKS)) {
+    const skill = player.skills[skillId];
+    if (!skill || !skill.taskStartedAt) continue;
+
+    if (player.combat && !player.combat.result) {
+      // something else (an earlier ambush this same tick, or any other path
+      // into combat) already put the player in a fight — stop gathering
+      skill.taskStartedAt = null;
+      skill.lastTick = null;
+      continue;
+    }
+
+    const now = Date.now();
+    const from = skill.lastTick || skill.taskStartedAt;
+    // Clamp (not skip-on-<=0): after a GATHER_TICK_CAP-limited tick,
+    // progressSeconds can hold far more than one cycle's worth of
+    // still-unprocessed backlog. Bailing out whenever elapsedSeconds isn't
+    // strictly positive (e.g. two ticks landing in the same millisecond —
+    // unreachable over real network polling, but trivially hit by any
+    // tight synchronous loop calling publicPlayer() repeatedly) would stall
+    // that backlog from ever draining further, even though there's still
+    // real progress to process. Only skip entirely when there's truly
+    // nothing to do.
+    const elapsedSeconds = Math.max(0, (now - from) / 1000);
+    const totalSeconds = (skill.progressSeconds || 0) + elapsedSeconds;
+    const cyclesCompleted = Math.floor(totalSeconds / config.cycleSeconds);
+    if (cyclesCompleted <= 0) {
+      skill.lastTick = now;
+      continue;
+    }
+
+    let processed = 0;
+    let interrupted = false;
+    for (; processed < cyclesCompleted && processed < GATHER_TICK_CAP; processed++) {
+      const outcome = resolveGatherCycle(player, skillId, config);
+      if (outcome === 'combat') {
+        processed += 1;
+        interrupted = true;
+        break;
+      }
+    }
+
+    if (interrupted) {
+      skill.taskStartedAt = null;
+      skill.lastTick = null;
+      skill.progressSeconds = 0;
+    } else {
+      skill.progressSeconds = totalSeconds - processed * config.cycleSeconds;
+      skill.lastTick = now;
+    }
+  }
+}
+
+function resolveGatherCycle(player, skillId, config) {
+  if (Math.random() < RARE_GATHER_EVENT_CHANCE) {
+    resolveRareGatherEvent(player);
+    return 'rare';
+  }
+
+  // luck trait + Treasure Hunter perk — added on top of the task's own
+  // successChance, never touches encounterChance (an ambush isn't a
+  // "success" to boost away)
+  const successBonus = getPlayerModifiers(player).gatherSuccessBonus;
+
+  if (skillId === 'hunting') {
+    const roll = Math.random();
+    if (roll < config.encounterChance) {
+      const enemyId = config.huntableEnemies[Math.floor(Math.random() * config.huntableEnemies.length)];
+      beginAmbushCombat(player, enemyId);
+      return 'combat';
+    }
+    if (roll < config.encounterChance + config.successChance + successBonus) {
+      player.inventory[config.resultItem] = (player.inventory[config.resultItem] || 0) + 1;
+      player.skills.hunting.xp += config.xpPerSuccess;
+      return 'success';
+    }
+    return 'nothing';
+  }
+
+  // scavenging / harvesting — flat successChance, one random item from the pool
+  if (Math.random() < config.successChance + successBonus) {
+    const itemId = config.resultPool[Math.floor(Math.random() * config.resultPool.length)];
+    player.inventory[itemId] = (player.inventory[itemId] || 0) + 1;
+    player.skills[skillId].xp += config.xpPerSuccess;
+    return 'success';
+  }
+  return 'nothing';
+}
+
+// Shared combat-instance constructor used by both startCombat() (the player
+// chose to fight) and beginAmbushCombat() (a hunting gather task triggered
+// it with nobody clicking anything) — same shape either way, just an
+// `ambush` flag the client uses to show a distinct toast. Snapshots
+// player.abilityLoadout into c.loadout at fight start rather than reading it
+// live, since loadout edits are blocked during combat (see setLoadoutSlot) —
+// this keeps mid-fight state simple and immune to any future relaxation of
+// that rule.
+function beginCombatInstance(player, enemyId, ambush) {
+  const enemy = ENEMIES[enemyId];
+  const now = Date.now();
+  const maxHp = playerMaxHp(player);
+  player.combat = {
+    enemyId,
+    playerHp: maxHp,
+    playerMaxHp: maxHp,
+    enemyHp: enemy.maxHp,
+    enemyMaxHp: enemy.maxHp,
+    distance: 0,
+    lastDistanceUpdate: now,
+    loadout: [...player.abilityLoadout],
+    abilityCursor: -1,
+    nextEnemyAttackAt: now + enemy.attackSpeed * 1000,
+    dotOnEnemy: null,
+    dotOnPlayer: null,
+    buff: null,
+    armorBuff: null,
+    pendingMeleeComboBuff: null,
+    pendingHasteBuff: null,
+    evasionUntil: 0,
+    lastPlayerActionText: '',
+    lastEnemyActionText: '',
+    startedAt: now,
+    result: null,
+    rewardGold: 0,
+    rewardLoot: [],
+    ambush,
+  };
+  advanceCursor(player.combat);
+  scheduleNextAbility(player, player.combat, now);
+}
+
+function beginAmbushCombat(player, enemyId) {
+  beginCombatInstance(player, enemyId, true);
+}
+
+// The 0.01% jackpot, shared across all three gather tasks: either the rare
+// armor drop or a nudge toward an NPC's quest (any NPC anywhere, unlike the
+// gather tasks' own results — "meeting someone" is a chance encounter, not
+// tied to where the player is standing). Falls back to the armor branch if
+// no quest is left to offer, so the rare roll is never wasted on nothing.
+function resolveRareGatherEvent(player) {
+  const questNpc = Object.values(NPCS).find(
+    (n) => n.questId && !player.quests.started.includes(n.questId) && !player.quests.completed.includes(n.questId)
+  );
+  if (questNpc && Math.random() < 0.5) {
+    player.quests.started.push(questNpc.questId);
+    const quest = QUESTS[questNpc.questId];
+    player.lastRareEvent = { type: 'quest', questId: quest.id, questName: quest.name, npcName: questNpc.name, at: Date.now() };
+  } else {
+    player.inventory.wanderers_plate = (player.inventory.wanderers_plate || 0) + 1;
+    player.lastRareEvent = { type: 'armor', itemId: 'wanderers_plate', itemName: ITEMS.wanderers_plate.name, at: Date.now() };
+  }
+}
+
+// Stops any currently-running skill task (banking whatever progress had
+// already accrued first) — used to enforce "only one task at a time":
+// starting any new task (a different skill, an expedition, or combat) stops
+// whatever else was running instead of letting them stack.
+function stopAllSkillTasks(player) {
+  tickSkills(player);
+  tickMining(player);
+  tickGatherTasks(player);
+  for (const skill of Object.values(player.skills)) {
+    if (skill.taskStartedAt) {
+      skill.taskStartedAt = null;
+      skill.lastTick = null;
+    }
+  }
+}
+
+// Closest point on segment a-b to point p, in the same 0-100 percent-space
+// as location/path coordinates. Returns the distance and how far along the
+// segment (0-1) that closest point falls.
+function closestPointOnSegment(p, a, b) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const lengthSq = dx * dx + dy * dy;
+  let t = lengthSq === 0 ? 0 : ((p.x - a.x) * dx + (p.y - a.y) * dy) / lengthSq;
+  t = Math.max(0, Math.min(1, t));
+  const cx = a.x + t * dx;
+  const cy = a.y + t * dy;
+  return { distance: Math.hypot(p.x - cx, p.y - cy), t };
+}
+
+// Distance from a location to the nearest point anywhere along a drawn path,
+// plus the arc-length (distance traveled along the path) at that point —
+// used both to decide whether the path "overlaps" the location and to know
+// how far into the expedition the sweeping fill has to reach to reveal it.
+function closestPointOnPath(loc, path) {
+  let best = { distance: Infinity, arcLength: 0 };
+  let cumulative = 0;
+  for (let i = 0; i < path.length - 1; i++) {
+    const a = path[i];
+    const b = path[i + 1];
+    const segLen = Math.hypot(b.x - a.x, b.y - a.y);
+    const { distance, t } = closestPointOnSegment(loc, a, b);
+    if (distance < best.distance) {
+      best = { distance, arcLength: cumulative + t * segLen };
+    }
+    cumulative += segLen;
+  }
+  return best;
+}
+
+// Grants a newly-discovered location + character xp for it in one place, so
+// every path that can add to player.discoveries (expedition reveal, paid
+// shop reveal) awards xp consistently rather than duplicating the
+// already-discovered check + level-up math. Returns true if this was a real
+// new discovery (false if already known — callers that only want to push
+// once, like tickExpedition's trigger loop, rely on this).
+function discoverLocation(player, locationId) {
+  if (player.discoveries.includes(locationId)) return false;
+  player.discoveries.push(locationId);
+  gainCharacterXp(player, DISCOVERY_XP);
+  const loc = getLocation(locationId);
+  if (loc && loc.loot) {
+    player.inventory[loc.loot.item] = (player.inventory[loc.loot.item] || 0) + loc.loot.amount;
+  }
+  return true;
+}
+
+// Character-level xp is a separate pool from every skill's xp, reusing the
+// same xpCostForLevel()/levelFromXp() curve (defined further down, but
+// function declarations are hoisted so the forward reference is fine). A
+// single grant can cross more than one level (e.g. several locations
+// revealed by one expedition tick) — loop rather than assume at most one.
+function gainCharacterXp(player, amount) {
+  const before = levelFromXp(player.characterXp);
+  player.characterXp += amount;
+  const after = levelFromXp(player.characterXp);
+  if (after > before) {
+    const levelsGained = after - before;
+    player.traitPointsAvailable += levelsGained;
+    player.perkPoints += levelsGained;
+  }
+}
+
+// Advances the sweeping "fill" along an active expedition's drawn path and
+// reveals any location the fill has reached, without pausing the expedition
+// itself — matches ticking pattern of tickSkills (elapsed real time since
+// last check, so it's the same math whether polled continuously or after
+// being away).
+function tickExpedition(player) {
+  const exp = player.expedition;
+  if (!exp) return;
+  const elapsedSeconds = (Date.now() - exp.startedAt) / 1000;
+  const fraction = Math.min(1, elapsedSeconds / exp.durationSeconds);
+  for (const trigger of exp.triggers) {
+    if (fraction >= trigger.fraction) {
+      discoverLocation(player, trigger.locationId);
+    }
+  }
+  if (fraction >= 1) {
+    player.expedition = null;
+  }
+}
+
+function randInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+// Sums trait (from creation/leveling) and perk (from the skill-tree tab)
+// bonuses into one flat modifiers object, computed fresh from player state
+// rather than cached — cheap enough to recompute per-tick/per-request, and
+// avoids any risk of a cached value going stale after a trait/perk change.
+function getPlayerModifiers(player) {
+  const t = player.traits;
+  const perkMods = {
+    meleeDamageMult: 0,
+    attackSpeedMult: 0,
+    plantGrowthMult: 0,
+    critChanceBonus: 0,
+    armorFlat: 0,
+    maxHpFlat: 0,
+    miningSpeedMult: 0,
+    woodcuttingSpeedMult: 0,
+    fishingSpeedMult: 0,
+    gatherSuccessBonus: 0,
+  };
+  for (const perkId of player.perks) {
+    const perk = PERKS[perkId];
+    if (!perk) continue;
+    const { type, value } = perk.effect;
+    if (type in perkMods) perkMods[type] += value;
+  }
+  return {
+    // strength: +5% melee damage per point above TRAIT_BASE
+    meleeDamageMult: 1 + (t.strength - TRAIT_BASE) * 0.05 + perkMods.meleeDamageMult,
+    // dexterity: -2% ability cast time per point above TRAIT_BASE, floor at 50% of base cast time
+    castSpeedMult: Math.max(0.5, 1 - (t.dexterity - TRAIT_BASE) * 0.02 - perkMods.attackSpeedMult),
+    // dexterity: a flat chance to dodge an incoming enemy attack entirely (separate from Quick Step's evasion window)
+    dodgeChance: Math.max(0, (t.dexterity - TRAIT_BASE) * 0.015),
+    // luck + a sliver of dexterity: bonus crit chance
+    critChanceBonus: (t.luck - TRAIT_BASE) * 0.01 + (t.dexterity - TRAIT_BASE) * 0.005 + perkMods.critChanceBonus,
+    // luck: bonus chance on any %-based loot roll (enemy lootTable drops)
+    lootChanceBonus: (t.luck - TRAIT_BASE) * 0.01,
+    // luck + Treasure Hunter perk: bonus success chance on gather tasks
+    gatherSuccessBonus: (t.luck - TRAIT_BASE) * 0.01 + perkMods.gatherSuccessBonus,
+    // vigor + Vitality/Hardened perks: flat bonus max HP
+    hpBonus: (t.vigor - TRAIT_BASE) * 4 + perkMods.maxHpFlat,
+    armorFlat: perkMods.armorFlat,
+    plantGrowthMult: perkMods.plantGrowthMult,
+    miningSpeedMult: perkMods.miningSpeedMult,
+    woodcuttingSpeedMult: perkMods.woodcuttingSpeedMult,
+    fishingSpeedMult: perkMods.fishingSpeedMult,
+  };
+}
+
+// Combat stats come from whatever's equipped — unarmed defaults if nothing
+// is. Enemies use their own fixed ENEMIES entry instead (creature-based, not
+// equipment-based), per the design requirement that only the player's side
+// is gear-driven. Trait/perk bonuses (armor, crit) layer on top of gear.
+function getEquippedStats(player) {
+  const weapon = player.equipment.weapon ? ITEMS[player.equipment.weapon] : null;
+  const armorItem = player.equipment.armor ? ITEMS[player.equipment.armor] : null;
+  const mods = getPlayerModifiers(player);
+  return {
+    damage: weapon ? weapon.damage : [1, 2],
+    critChance: (weapon ? weapon.critChance : 0.02) + mods.critChanceBonus,
+    attackSpeed: weapon ? weapon.attackSpeed : 2.5,
+    effect: weapon ? weapon.effect || null : null,
+    armor: (armorItem ? armorItem.armor : 0) + mods.armorFlat,
+  };
+}
+
+function playerMaxHp(player) {
+  const level = levelFromXp(player.skills.combat.xp);
+  const mods = getPlayerModifiers(player);
+  return PLAYER_BASE_HP + (level - 1) * PLAYER_HP_PER_LEVEL + mods.hpBonus;
+}
+
+// Both sides attack on independent timers (like the mining clock, just two
+// of them racing) plus up to one poison/fire DOT per side. Rather than
+// stepping in fixed increments, this walks event-by-event in chronological
+// order (whichever of: player attack / enemy attack / either DOT tick comes
+// next) until it catches up to "now" or someone dies — same elapsed-real-time
+// idea as tickSkills/tickExpedition, just with more event types interleaved.
+// Alchemy combat buffs (Potion of Strength/Swiftness) live as a single slot
+// on the combat object, same one-effect-at-a-time pattern as dotOnEnemy/
+// dotOnPlayer — checked fresh against real time on every tick rather than
+// decremented, so it expires correctly whether the player is polling
+// continuously or comes back to a stale tab.
+function getActiveCombatBuff(c) {
+  if (!c.buff) return null;
+  if (Date.now() >= c.buff.expiresAt) {
+    c.buff = null;
+    return null;
+  }
+  return c.buff;
+}
+
+// Same one-effect-at-a-time / check-fresh-against-real-time pattern as
+// getActiveCombatBuff(), for Guard Up's temporary flat armor bonus.
+function getActiveArmorBuff(c) {
+  if (!c.armorBuff) return null;
+  if (Date.now() >= c.armorBuff.expiresAt) {
+    c.armorBuff = null;
+    return null;
+  }
+  return c.armorBuff;
+}
+
+// Moves the ability cursor to the next non-empty loadout slot, wrapping
+// around after slot 5 back to slot 0 — this IS the "abilities execute in
+// order left to right, looping" rotation. Starting from cursor -1 (a fresh
+// fight) correctly lands on slot 0 first.
+function advanceCursor(c) {
+  for (let i = 1; i <= 6; i++) {
+    const idx = (c.abilityCursor + i) % 6;
+    if (c.loadout[idx]) {
+      c.abilityCursor = idx;
+      return;
+    }
+  }
+  // no abilities anywhere in the loadout — leave cursor as-is, resolvePlayerAbility no-ops forever until the fight ends
+}
+
+// Schedules when the ability now under the cursor finishes casting.
+// Adrenaline Rush's pendingHasteBuff and a Potion of Swiftness's speed buff
+// both shorten THIS upcoming cast (not the one that set them) — consumed
+// here, at the moment the timer is actually set, same idea as the potion
+// damage buff being consumed at the moment damage is computed.
+function scheduleNextAbility(player, c, now) {
+  const abilityId = c.loadout[c.abilityCursor];
+  let castSeconds = abilityId ? ABILITIES[abilityId].castSeconds : 1;
+  if (c.pendingHasteBuff) {
+    castSeconds *= c.pendingHasteBuff.multiplier;
+    c.pendingHasteBuff = null;
+  }
+  const speedBuff = getActiveCombatBuff(c);
+  if (speedBuff && speedBuff.type === 'speed') castSeconds *= speedBuff.multiplier;
+  castSeconds *= getPlayerModifiers(player).castSpeedMult; // dexterity + Swift Strikes/Adrenal Focus perks
+  c.currentAbilityStartedAt = now;
+  c.currentAbilityCastSeconds = castSeconds;
+  c.nextAbilityAt = now + castSeconds * 1000;
+}
+
+// Resolves whatever ability is currently under the cursor, then advances to
+// the next slot and schedules it. Melee-tagged abilities only take effect if
+// c.distance is within MELEE_RANGE — otherwise they "whiff" (cast time is
+// still spent, cursor still advances, but no effect), which is the real cost
+// of queuing a melee ability while the enemy has been pushed back.
+function resolvePlayerAbility(player, c, enemy, equip, now) {
+  const abilityId = c.loadout[c.abilityCursor];
+  const ability = abilityId ? ABILITIES[abilityId] : null;
+
+  if (ability) {
+    const isMelee = ability.tags.includes('melee');
+    const inRange = c.distance <= MELEE_RANGE;
+    let comboMultiplier = 1;
+    if (isMelee && c.pendingMeleeComboBuff) {
+      comboMultiplier = c.pendingMeleeComboBuff.multiplier;
+      c.pendingMeleeComboBuff = null;
+    }
+    const potionBuff = getActiveCombatBuff(c);
+    const potionDmgMultiplier = potionBuff && potionBuff.type === 'damage' ? potionBuff.multiplier : 1;
+    // strength + Brute Force/Brutal Force perks only apply to melee-tagged abilities
+    const strMultiplier = isMelee ? getPlayerModifiers(player).meleeDamageMult : 1;
+    const totalMultiplier = comboMultiplier * potionDmgMultiplier * strMultiplier;
+
+    if (abilityId === 'swing') {
+      if (inRange) {
+        let dmg = Math.round(randInt(equip.damage[0], equip.damage[1]) * totalMultiplier);
+        if (Math.random() < equip.critChance) dmg *= 2;
+        c.enemyHp = Math.max(0, c.enemyHp - dmg);
+        c.lastPlayerActionText = `Swing hits for ${dmg}`;
+        if (equip.effect && Math.random() < equip.effect.chance) {
+          c.dotOnEnemy = { type: equip.effect.type, dps: equip.effect.dps, ticksLeft: equip.effect.duration, nextTickAt: now + 1000 };
+        }
+      } else {
+        c.lastPlayerActionText = 'Swing misses — too far away!';
+      }
+    } else if (abilityId === 'punch') {
+      if (inRange) {
+        const dmg = Math.round(randInt(2, 4) * totalMultiplier);
+        c.enemyHp = Math.max(0, c.enemyHp - dmg);
+        c.pendingMeleeComboBuff = { multiplier: 1.5 };
+        c.lastPlayerActionText = `Punch hits for ${dmg} — next melee ability is primed`;
+      } else {
+        c.lastPlayerActionText = 'Punch misses — too far away!';
+      }
+    } else if (abilityId === 'power_strike') {
+      if (inRange) {
+        let dmg = Math.round(randInt(equip.damage[0], equip.damage[1]) * 1.8 * totalMultiplier);
+        if (Math.random() < equip.critChance) dmg *= 2;
+        c.enemyHp = Math.max(0, c.enemyHp - dmg);
+        c.lastPlayerActionText = `Power Strike hits for ${dmg}!`;
+      } else {
+        c.lastPlayerActionText = 'Power Strike misses — too far away!';
+      }
+    } else if (abilityId === 'poison_jab') {
+      if (inRange) {
+        const dmg = Math.round(randInt(1, 3) * totalMultiplier);
+        c.enemyHp = Math.max(0, c.enemyHp - dmg);
+        c.dotOnEnemy = { type: 'poison', dps: 3, ticksLeft: 4, nextTickAt: now + 1000 };
+        c.lastPlayerActionText = `Poison Jab hits for ${dmg} and poisons the enemy`;
+      } else {
+        c.lastPlayerActionText = 'Poison Jab misses — too far away!';
+      }
+    } else if (abilityId === 'throw_dagger') {
+      let dmg = Math.round(randInt(3, 6) * potionDmgMultiplier);
+      if (Math.random() < 0.05) dmg *= 2;
+      c.enemyHp = Math.max(0, c.enemyHp - dmg);
+      c.lastPlayerActionText = `Throw Dagger hits for ${dmg}`;
+    } else if (abilityId === 'quick_step') {
+      c.distance = Math.min(MAX_DISTANCE, c.distance + QUICK_STEP_RETREAT);
+      c.evasionUntil = now + 1200;
+      c.lastPlayerActionText = 'Quick Step — you put distance between you and the enemy';
+    } else if (abilityId === 'guard_up') {
+      c.armorBuff = { amount: 5, expiresAt: now + 4000 };
+      c.lastPlayerActionText = 'Guard Up — your defense is bolstered';
+    } else if (abilityId === 'second_wind') {
+      c.playerHp = Math.min(c.playerMaxHp, c.playerHp + 15);
+      c.lastPlayerActionText = 'Second Wind — you recover some health';
+    } else if (abilityId === 'adrenaline_rush') {
+      c.pendingHasteBuff = { multiplier: 0.5 };
+      c.lastPlayerActionText = 'Adrenaline Rush — your next ability will be faster';
+    }
+  }
+
+  advanceCursor(c);
+  scheduleNextAbility(player, c, now);
+}
+
+// If the enemy hasn't closed the distance yet (see the lazy approach-speed
+// update in tickCombat), the attack simply doesn't land and gets
+// rescheduled — no damage, no dot roll. Quick Step's evasionUntil window
+// gives a real chance to fully dodge an attack that DOES land in range; a
+// dexterity-based dodgeChance (getPlayerModifiers) is checked separately and
+// applies at all times, not just during that window.
+function resolveEnemyAttack(player, c, enemy, equip, now) {
+  if (c.distance > enemy.range) {
+    c.nextEnemyAttackAt = now + enemy.attackSpeed * 1000;
+    return;
+  }
+  if (c.evasionUntil && now < c.evasionUntil && Math.random() < EVASION_DODGE_CHANCE) {
+    c.lastEnemyActionText = `${enemy.name} attacks — dodged!`;
+    c.nextEnemyAttackAt = now + enemy.attackSpeed * 1000;
+    return;
+  }
+  if (Math.random() < getPlayerModifiers(player).dodgeChance) {
+    c.lastEnemyActionText = `${enemy.name} attacks — you dodge!`;
+    c.nextEnemyAttackAt = now + enemy.attackSpeed * 1000;
+    return;
+  }
+  let dmg = randInt(enemy.damage[0], enemy.damage[1]);
+  if (Math.random() < enemy.critChance) dmg *= 2;
+  const armorBuff = getActiveArmorBuff(c);
+  const totalArmor = equip.armor + (armorBuff ? armorBuff.amount : 0);
+  dmg = Math.max(1, dmg - totalArmor);
+  c.playerHp = Math.max(0, c.playerHp - dmg);
+  c.lastEnemyActionText = `${enemy.name} hits you for ${dmg}`;
+  if (enemy.effect && Math.random() < enemy.effect.chance) {
+    c.dotOnPlayer = { type: enemy.effect.type, dps: enemy.effect.dps, ticksLeft: enemy.effect.duration, nextTickAt: now + 1000 };
+  }
+  c.nextEnemyAttackAt = now + enemy.attackSpeed * 1000;
+}
+
+function tickCombat(player) {
+  const c = player.combat;
+  if (!c || c.result) return;
+  const enemy = ENEMIES[c.enemyId];
+  const equip = getEquippedStats(player);
+
+  // Lazy elapsed-time distance-closing (same idiom as tickSkills/
+  // tickExpedition) — advanced up to each event's own timestamp as the walk
+  // below progresses, then one final time to "now" so distance is accurate
+  // even between events.
+  function advanceDistanceTo(t) {
+    const elapsedSeconds = Math.max(0, (t - c.lastDistanceUpdate) / 1000);
+    if (elapsedSeconds > 0) {
+      c.distance = Math.max(0, c.distance - enemy.approachSpeed * elapsedSeconds);
+      c.lastDistanceUpdate = t;
+    }
+  }
+
+  const now = Date.now();
+  let guard = 0;
+  while (guard++ < 2000) {
+    if (c.playerHp <= 0 || c.enemyHp <= 0) break;
+    const candidates = [
+      { t: c.nextAbilityAt, type: 'ability' },
+      { t: c.nextEnemyAttackAt, type: 'enemyAttack' },
+    ];
+    if (c.dotOnEnemy) candidates.push({ t: c.dotOnEnemy.nextTickAt, type: 'dotEnemy' });
+    if (c.dotOnPlayer) candidates.push({ t: c.dotOnPlayer.nextTickAt, type: 'dotPlayer' });
+    candidates.sort((a, b) => a.t - b.t);
+    const next = candidates[0];
+    if (next.t > now) break;
+    advanceDistanceTo(next.t);
+
+    if (next.type === 'ability') {
+      resolvePlayerAbility(player, c, enemy, equip, next.t);
+    } else if (next.type === 'enemyAttack') {
+      resolveEnemyAttack(player, c, enemy, equip, next.t);
+    } else if (next.type === 'dotEnemy') {
+      c.enemyHp = Math.max(0, c.enemyHp - c.dotOnEnemy.dps);
+      c.dotOnEnemy.ticksLeft -= 1;
+      c.dotOnEnemy.nextTickAt = next.t + 1000;
+      if (c.dotOnEnemy.ticksLeft <= 0) c.dotOnEnemy = null;
+    } else if (next.type === 'dotPlayer') {
+      c.playerHp = Math.max(0, c.playerHp - c.dotOnPlayer.dps);
+      c.dotOnPlayer.ticksLeft -= 1;
+      c.dotOnPlayer.nextTickAt = next.t + 1000;
+      if (c.dotOnPlayer.ticksLeft <= 0) c.dotOnPlayer = null;
+    }
+  }
+  advanceDistanceTo(now);
+
+  if (c.enemyHp <= 0 && !c.result) {
+    c.result = 'win';
+    const gold = randInt(enemy.goldReward[0], enemy.goldReward[1]);
+    player.inventory.gold = (player.inventory.gold || 0) + gold;
+    player.skills.combat.xp += enemy.xpReward;
+    c.rewardGold = gold;
+    c.rewardLoot = [];
+    const lootChanceBonus = getPlayerModifiers(player).lootChanceBonus;
+    for (const drop of enemy.lootTable || []) {
+      if (Math.random() < drop.chance + lootChanceBonus) {
+        player.inventory[drop.item] = (player.inventory[drop.item] || 0) + 1;
+        c.rewardLoot.push(drop.item);
+      }
+    }
+    player.killCounts[c.enemyId] = (player.killCounts[c.enemyId] || 0) + 1;
+    player.combatRecord.wins += 1;
+  } else if (c.playerHp <= 0 && !c.result) {
+    c.result = 'loss';
+    player.combatRecord.losses += 1;
+  }
+}
+
+// xp needed to advance FROM `level` TO `level+1` — grows by XP_LEVEL_INCREMENT
+// every level rather than a flat XP_PER_LEVEL, so later levels take
+// noticeably longer than early ones (like the levelling curves in other
+// idle/RPG games), while staying simple (linear, not exponential) and cheap
+// to compute exactly via the loops below rather than needing an inverse
+// formula.
+function xpCostForLevel(level) {
+  return XP_PER_LEVEL + XP_LEVEL_INCREMENT * (level - 1);
+}
+
+function levelFromXp(xp) {
+  let level = 1;
+  let remaining = xp;
+  while (remaining >= xpCostForLevel(level)) {
+    remaining -= xpCostForLevel(level);
+    level += 1;
+  }
+  return level;
+}
+
+// Same walk as levelFromXp but also returns how far into the current level
+// the player is and how much the next level costs — computed together so
+// publicSkill() doesn't have to re-walk the curve twice per skill per poll.
+function xpProgress(xp) {
+  let level = 1;
+  let remaining = xp;
+  while (remaining >= xpCostForLevel(level)) {
+    remaining -= xpCostForLevel(level);
+    level += 1;
+  }
+  return { level, xpIntoLevel: remaining, xpToNextLevel: xpCostForLevel(level) };
+}
+
+const GATHER_ITEM_NAMES = {
+  hunting: 'Raw Meat (chance)',
+  scavenging: 'Random Finds (chance)',
+  harvesting: 'Seeds & Crops (chance)',
+};
+
+function publicSkill(skillId, skill) {
+  const config = TASK_CONFIG[skillId];
+  const gatherConfig = GATHER_TASKS[skillId];
+  const { level, xpIntoLevel, xpToNextLevel } = xpProgress(skill.xp);
+  const base = {
+    xp: skill.xp,
+    level,
+    xpIntoLevel,
+    xpToNextLevel,
+  };
+  if (gatherConfig) {
+    // usable from anywhere (locationless: true) and each cycle only has a
+    // chance of a yield, unlike TASK_CONFIG's guaranteed-per-cycle items
+    return {
+      ...base,
+      active: !!skill.taskStartedAt,
+      itemName: GATHER_ITEM_NAMES[skillId],
+      cycleSeconds: gatherConfig.cycleSeconds,
+      progressSeconds: skill.progressSeconds || 0,
+      locationless: true,
+    };
+  }
+  if (skillId === 'mining') {
+    // its own node-grid system (see MINING_NODES/publicMiningNodes) — this
+    // entry is just level/xp/active for anything reading player.skills
+    // generically (e.g. the Statistics tab); the Mining tab uses
+    // player.miningNodes instead.
+    return { ...base, active: !!skill.taskStartedAt };
+  }
+  if (!config) {
+    // e.g. combat — leveled by xp like any skill, but not a passive cycle task
+    return { ...base, active: false };
+  }
+  return {
+    ...base,
+    active: !!skill.taskStartedAt,
+    item: config.item,
+    itemName: ITEMS[config.item].name,
+    cycleSeconds: config.cycleSeconds,
+    progressSeconds: skill.progressSeconds || 0,
+  };
+}
+
+function questObjectiveMet(player, quest) {
+  const obj = quest.objective;
+  if (obj.type === 'kill') return (player.killCounts[obj.enemyId] || 0) >= obj.count;
+  if (obj.type === 'gather') return (player.inventory[obj.itemId] || 0) >= obj.count;
+  if (obj.type === 'visit') return player.discoveries.includes(obj.locationId);
+  return false;
+}
+
+function publicPlayer(player) {
+  tickSkills(player);
+  tickMining(player);
+  tickGatherTasks(player);
+  tickExpedition(player);
+  tickCombat(player);
+  save();
+  const skills = {};
+  for (const [id, skill] of Object.entries(player.skills)) {
+    skills[id] = publicSkill(id, skill);
+  }
+  const inventory = Object.entries(player.inventory).map(([itemId, count]) => ({
+    id: itemId,
+    name: ITEMS[itemId].name,
+    count,
+  }));
+  let expedition = null;
+  if (player.expedition) {
+    const elapsedSeconds = (Date.now() - player.expedition.startedAt) / 1000;
+    expedition = {
+      path: player.expedition.path,
+      totalLength: player.expedition.totalLength,
+      durationSeconds: player.expedition.durationSeconds,
+      startedAt: player.expedition.startedAt,
+      fraction: Math.min(1, elapsedSeconds / player.expedition.durationSeconds),
+    };
+  }
+
+  const equipStats = getEquippedStats(player);
+  const equipment = {
+    weapon: player.equipment.weapon ? { id: player.equipment.weapon, name: ITEMS[player.equipment.weapon].name } : null,
+    armor: player.equipment.armor ? { id: player.equipment.armor, name: ITEMS[player.equipment.armor].name } : null,
+    stats: equipStats,
+  };
+
+  let combat = null;
+  if (player.combat) {
+    const c = player.combat;
+    const enemy = ENEMIES[c.enemyId];
+    const activeBuff = getActiveCombatBuff(c);
+    const armorBuffActive = getActiveArmorBuff(c);
+    combat = {
+      enemyId: c.enemyId,
+      enemyName: enemy.name,
+      playerHp: c.playerHp,
+      playerMaxHp: c.playerMaxHp,
+      enemyHp: c.enemyHp,
+      enemyMaxHp: c.enemyMaxHp,
+      distance: c.distance,
+      maxDistance: MAX_DISTANCE,
+      meleeRange: MELEE_RANGE,
+      enemyRange: enemy.range,
+      loadout: c.loadout.map((id) => (id ? { id, name: ABILITIES[id].name, castSeconds: ABILITIES[id].castSeconds } : null)),
+      abilityCursor: c.abilityCursor,
+      currentAbilityStartedAt: c.currentAbilityStartedAt,
+      currentAbilityCastSeconds: c.currentAbilityCastSeconds,
+      result: c.result,
+      rewardGold: c.rewardGold || 0,
+      rewardLoot: (c.rewardLoot || []).map((itemId) => ({ id: itemId, name: ITEMS[itemId].name })),
+      enemyAttackSpeed: enemy.attackSpeed,
+      nextEnemyAttackAt: c.nextEnemyAttackAt,
+      dotOnEnemy: c.dotOnEnemy ? { type: c.dotOnEnemy.type } : null,
+      dotOnPlayer: c.dotOnPlayer ? { type: c.dotOnPlayer.type } : null,
+      buff: activeBuff ? { type: activeBuff.type } : null,
+      armorBuffActive: !!armorBuffActive,
+      comboReady: !!c.pendingMeleeComboBuff,
+      hasteReady: !!c.pendingHasteBuff,
+      evasionActive: Date.now() < (c.evasionUntil || 0),
+      lastPlayerActionText: c.lastPlayerActionText || '',
+      lastEnemyActionText: c.lastEnemyActionText || '',
+      ambush: !!c.ambush,
+    };
+  }
+
+  const plantGrowthMult = getPlayerModifiers(player).plantGrowthMult;
+  const garden = {
+    plots: player.garden.plots.map((plot) => {
+      if (!plot) return null;
+      const plant = PLANTS[plot.plantId];
+      const effectiveGrowSeconds = effectivePlantGrowSeconds(plant, plantGrowthMult);
+      const elapsedSeconds = (Date.now() - plot.plantedAt) / 1000;
+      const progress = Math.min(1, elapsedSeconds / effectiveGrowSeconds);
+      return {
+        plantId: plot.plantId,
+        plantName: plant.name,
+        growSeconds: effectiveGrowSeconds,
+        progress,
+        ready: progress >= 1,
+      };
+    }),
+  };
+
+  const farm = {
+    animals: player.farm.animals.map((a) => {
+      const species = ANIMAL_SPECIES[a.species];
+      const ageSeconds = (Date.now() - a.bornAt) / 1000;
+      const mature = ageSeconds >= species.matureSeconds;
+      const oneTime = !!species.butcherItem;
+      let progress = Math.min(1, ageSeconds / species.matureSeconds);
+      let ready = false;
+      if (mature) {
+        if (oneTime) {
+          ready = true;
+          progress = 1;
+        } else {
+          const since = a.lastCollectedAt || a.bornAt + species.matureSeconds * 1000;
+          const elapsedSeconds = (Date.now() - since) / 1000;
+          progress = Math.min(1, elapsedSeconds / species.produceIntervalSeconds);
+          ready = elapsedSeconds >= species.produceIntervalSeconds;
+        }
+      }
+      return {
+        id: a.id,
+        species: a.species,
+        speciesName: species.name,
+        mature,
+        ready,
+        progress,
+        oneTime,
+        producesItem: species.produceItem || species.butcherItem,
+        producesItemName: ITEMS[species.produceItem || species.butcherItem].name,
+      };
+    }),
+  };
+
+  const buildings = {};
+  for (const [type, b] of Object.entries(player.buildings)) {
+    const config = BUILDINGS[type];
+    const elapsedSeconds = (Date.now() - b.lastCollectedAt) / 1000;
+    const pendingAmount = Math.floor(elapsedSeconds / config.produceIntervalSeconds);
+    buildings[type] = {
+      type,
+      name: config.name,
+      producesItem: config.producesItem,
+      producesItemName: ITEMS[config.producesItem].name,
+      produceIntervalSeconds: config.produceIntervalSeconds,
+      pendingAmount,
+      progress: Math.min(1, (elapsedSeconds % config.produceIntervalSeconds) / config.produceIntervalSeconds),
+    };
+  }
+
+  const quests = {
+    started: player.quests.started.map((id) => {
+      const q = QUESTS[id];
+      return { id, name: q.name, description: q.description, objectiveMet: questObjectiveMet(player, q) };
+    }),
+    completed: player.quests.completed,
+  };
+
+  return {
+    id: player.id,
+    username: player.username,
+    currentLocation: player.currentLocation,
+    discoveries: player.discoveries,
+    inventory,
+    skills,
+    expedition,
+    maxExplorationRange: (player.inventory.supplies || 0) * UNIT_LENGTH_PER_SUPPLY,
+    equipment,
+    combat,
+    combatMaxHp: playerMaxHp(player),
+    garden,
+    farm,
+    buildings,
+    quests,
+    killCounts: player.killCounts,
+    combatRecord: player.combatRecord,
+    lastRareEvent: player.lastRareEvent,
+    alchemy: {
+      // Only recipes the player has personally discovered are ever sent —
+      // the full POTION_RECIPES table stays server-only so combos can't be
+      // read out of the network tab.
+      knownRecipes: player.alchemy.knownRecipes.map((id) => {
+        const r = POTION_RECIPES.find((rec) => rec.id === id);
+        return { id: r.id, ingredients: Object.keys(r.ingredients), result: r.result, resultName: ITEMS[r.result].name };
+      }),
+      triedCount: player.alchemy.triedCombos.length,
+    },
+    abilityLoadout: player.abilityLoadout,
+    abilities: Object.entries(ABILITIES).map(([id, a]) => ({
+      id,
+      name: a.name,
+      description: a.description,
+      tags: a.tags,
+      castSeconds: a.castSeconds,
+      unlockLevel: a.unlockLevel,
+      unlocked: a.unlockLevel <= levelFromXp(player.skills.combat.xp),
+    })),
+    traits: player.traits,
+    character: xpProgress(player.characterXp), // { level, xpIntoLevel, xpToNextLevel }
+    traitPointsAvailable: player.traitPointsAvailable,
+    perkPoints: player.perkPoints,
+    perks: Object.entries(PERKS).map(([id, perk]) => ({
+      id,
+      name: perk.name,
+      description: perk.description,
+      tier: perk.tier,
+      requiresLevel: perk.requiresLevel,
+      cost: perk.cost,
+      unlocked: player.perks.includes(id),
+      levelMet: levelFromXp(player.characterXp) >= perk.requiresLevel,
+    })),
+    miningNodes: publicMiningNodes(player),
+  };
+}
+
+// path: [{x, y}, ...] in percent-space, drawn by the player starting at
+// their current location. Supplies cap how far it's allowed to reach and
+// are spent proportionally to the length actually drawn (not the max).
+function startExpedition(playerId, path) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  if (player.expedition) return { error: 'expedition_in_progress' };
+  if (player.combat && !player.combat.result) return { error: 'busy_fighting' };
+  if (!Array.isArray(path) || path.length < 2) return { error: 'invalid_path' };
+
+  const supplies = player.inventory.supplies || 0;
+  if (supplies <= 0) return { error: 'no_supplies' };
+
+  let totalLength = 0;
+  for (let i = 1; i < path.length; i++) {
+    totalLength += Math.hypot(path[i].x - path[i - 1].x, path[i].y - path[i - 1].y);
+  }
+  if (totalLength <= 0) return { error: 'invalid_path' };
+
+  const maxLength = supplies * UNIT_LENGTH_PER_SUPPLY;
+  if (totalLength > maxLength + 0.01) return { error: 'path_too_long' };
+
+  const suppliesCost = Math.min(supplies, Math.max(1, Math.ceil(totalLength / UNIT_LENGTH_PER_SUPPLY)));
+  player.inventory.supplies = supplies - suppliesCost;
+
+  const triggers = [];
+  for (const loc of LOCATIONS) {
+    if (player.discoveries.includes(loc.id)) continue;
+    const { distance, arcLength } = closestPointOnPath(loc, path);
+    if (distance <= OVERLAP_THRESHOLD) {
+      triggers.push({ locationId: loc.id, fraction: arcLength / totalLength });
+    }
+  }
+  triggers.sort((a, b) => a.fraction - b.fraction);
+
+  stopAllSkillTasks(player); // only one task at a time — starting an expedition stops any active skill
+
+  const durationSeconds = Math.max(MIN_EXPEDITION_DURATION, totalLength / EXPEDITION_SPEED);
+  player.expedition = {
+    path,
+    totalLength,
+    durationSeconds,
+    startedAt: Date.now(),
+    triggers,
+  };
+  save();
+  return {
+    ok: true,
+    durationSeconds,
+    totalLength,
+    suppliesCost,
+    suppliesRemaining: player.inventory.supplies,
+    locationsFound: triggers.length,
+  };
+}
+
+function travel(playerId, locationId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  if (!player.discoveries.includes(locationId)) return { error: 'not_discovered' };
+  player.currentLocation = locationId;
+  save();
+  return { currentLocation: locationId };
+}
+
+function startTask(playerId, skillId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const skill = player.skills[skillId];
+  if (!skill) return { error: 'unknown_skill' };
+  // gather tasks (hunting/scavenging/harvesting) are usable from anywhere —
+  // only TASK_CONFIG skills (mining/woodcutting/fishing) require standing at
+  // their specific location
+  if (!GATHER_TASKS[skillId]) {
+    const loc = getLocation(player.currentLocation);
+    if (!loc || loc.skill !== skillId) return { error: 'wrong_location' };
+  }
+  if (player.combat && !player.combat.result) return { error: 'busy_fighting' };
+  if (player.expedition) return { error: 'busy_exploring' };
+
+  // only one skill task at a time — starting this one stops any other
+  stopAllSkillTasks(player);
+
+  skill.taskStartedAt = Date.now();
+  skill.lastTick = Date.now();
+  save();
+  return { ok: true };
+}
+
+function stopTask(playerId, skillId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const skill = player.skills[skillId];
+  if (!skill) return { error: 'unknown_skill' };
+  if (skillId === 'mining') tickMining(player);
+  else tickSkills(player);
+  skill.taskStartedAt = null;
+  skill.lastTick = null;
+  save();
+  return { ok: true };
+}
+
+// --- equipment ---
+
+// Equipping consumes 1 unit from inventory (it's "worn"); whatever was
+// previously in that slot goes back to inventory. Unequip is the reverse.
+function equipItem(playerId, itemId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const item = ITEMS[itemId];
+  if (!item || (item.type !== 'weapon' && item.type !== 'armor')) return { error: 'not_equippable' };
+  const owned = player.inventory[itemId] || 0;
+  if (owned <= 0) return { error: 'not_owned' };
+
+  const slot = item.type;
+  const previous = player.equipment[slot];
+
+  player.inventory[itemId] = owned - 1;
+  if (player.inventory[itemId] <= 0) delete player.inventory[itemId];
+  if (previous) {
+    player.inventory[previous] = (player.inventory[previous] || 0) + 1;
+  }
+  player.equipment[slot] = itemId;
+  save();
+  return { ok: true, slot, itemId };
+}
+
+function unequipItem(playerId, slot) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  if (slot !== 'weapon' && slot !== 'armor') return { error: 'invalid_slot' };
+  const current = player.equipment[slot];
+  if (!current) return { error: 'nothing_equipped' };
+  player.inventory[current] = (player.inventory[current] || 0) + 1;
+  player.equipment[slot] = null;
+  save();
+  return { ok: true, slot };
+}
+
+// --- combat ---
+
+function startCombat(playerId, enemyId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  if (player.combat && !player.combat.result) return { error: 'combat_in_progress' };
+  if (player.expedition) return { error: 'busy_exploring' };
+  const loc = getLocation(player.currentLocation);
+  if (!loc || !loc.combat || !loc.combat.includes(enemyId)) return { error: 'enemy_not_here' };
+  const enemy = ENEMIES[enemyId];
+  if (!enemy) return { error: 'unknown_enemy' };
+  if (!player.abilityLoadout.some(Boolean)) return { error: 'no_abilities_equipped' };
+
+  stopAllSkillTasks(player); // only one task at a time — starting a fight stops any active skill
+  beginCombatInstance(player, enemyId, false);
+  save();
+  return { ok: true };
+}
+
+// Used both to flee an ongoing fight (no reward) and to acknowledge/clear a
+// finished result (win or loss) so the player can fight again.
+function endCombat(playerId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  if (!player.combat) return { error: 'no_combat' };
+  player.combat = null;
+  save();
+  return { ok: true };
+}
+
+function unlockedAbilityIds(player) {
+  const level = levelFromXp(player.skills.combat.xp);
+  return Object.entries(ABILITIES)
+    .filter(([, a]) => a.unlockLevel <= level)
+    .map(([id]) => id);
+}
+
+// Loadout editing is blocked mid-fight — c.loadout is a snapshot taken at
+// combat start (see beginCombatInstance), so an edit here can never desync
+// an in-progress fight; it just wouldn't be reflected in the current one.
+function setLoadoutSlot(playerId, slotIndex, abilityId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  if (player.combat && !player.combat.result) return { error: 'combat_in_progress' };
+  if (!Number.isInteger(slotIndex) || slotIndex < 0 || slotIndex >= 6) return { error: 'invalid_slot' };
+  if (abilityId !== null) {
+    if (!ABILITIES[abilityId]) return { error: 'unknown_ability' };
+    if (!unlockedAbilityIds(player).includes(abilityId)) return { error: 'not_unlocked' };
+  }
+  player.abilityLoadout[slotIndex] = abilityId;
+  save();
+  return { ok: true, loadout: player.abilityLoadout };
+}
+
+// --- character progression (traits + perks, see Character tab) ---
+
+function allocateTraitPoint(playerId, traitName) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  if (!TRAIT_KEYS.includes(traitName)) return { error: 'invalid_trait' };
+  if (player.traitPointsAvailable <= 0) return { error: 'no_points_available' };
+  player.traitPointsAvailable -= 1;
+  player.traits[traitName] += 1;
+  save();
+  return { ok: true, trait: traitName, value: player.traits[traitName] };
+}
+
+function unlockPerk(playerId, perkId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const perk = PERKS[perkId];
+  if (!perk) return { error: 'unknown_perk' };
+  if (player.perks.includes(perkId)) return { error: 'already_unlocked' };
+  if (player.perkPoints < perk.cost) return { error: 'not_enough_points' };
+  if (levelFromXp(player.characterXp) < perk.requiresLevel) return { error: 'level_too_low' };
+  player.perkPoints -= perk.cost;
+  player.perks.push(perkId);
+  save();
+  return { ok: true, perkId };
+}
+
+// --- gardening ---
+
+function plantSeed(playerId, plotIndex, plantId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const plant = PLANTS[plantId];
+  if (!plant) return { error: 'unknown_plant' };
+  if (plotIndex < 0 || plotIndex >= player.garden.plots.length) return { error: 'invalid_plot' };
+  if (player.garden.plots[plotIndex]) return { error: 'plot_occupied' };
+  const owned = player.inventory[plant.seed] || 0;
+  if (owned <= 0) return { error: 'no_seed' };
+
+  player.inventory[plant.seed] = owned - 1;
+  if (player.inventory[plant.seed] <= 0) delete player.inventory[plant.seed];
+  player.garden.plots[plotIndex] = { plantId, plantedAt: Date.now() };
+  save();
+  return { ok: true };
+}
+
+// Green Thumb/Deep Roots perks shrink grow time — floored so a stacked
+// bonus can never reach 0/negative. Shared by harvestPlot()'s ready-check
+// and publicPlayer()'s live progress display so they can never disagree.
+function effectivePlantGrowSeconds(plant, plantGrowthMult) {
+  return Math.max(5, plant.growSeconds * (1 - plantGrowthMult));
+}
+
+function harvestPlot(playerId, plotIndex) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const plot = player.garden.plots[plotIndex];
+  if (!plot) return { error: 'plot_empty' };
+  const plant = PLANTS[plot.plantId];
+  const effectiveGrowSeconds = effectivePlantGrowSeconds(plant, getPlayerModifiers(player).plantGrowthMult);
+  const elapsedSeconds = (Date.now() - plot.plantedAt) / 1000;
+  if (elapsedSeconds < effectiveGrowSeconds) return { error: 'not_ready' };
+
+  player.inventory[plant.yield] = (player.inventory[plant.yield] || 0) + 1;
+  player.garden.plots[plotIndex] = null;
+  save();
+  return { ok: true, yield: plant.yield };
+}
+
+// --- crafting ---
+
+function craftItem(playerId, recipeId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const recipe = RECIPES.find((r) => r.id === recipeId);
+  if (!recipe) return { error: 'unknown_recipe' };
+  for (const [itemId, amount] of Object.entries(recipe.ingredients)) {
+    if ((player.inventory[itemId] || 0) < amount) return { error: 'missing_ingredients' };
+  }
+  for (const [itemId, amount] of Object.entries(recipe.ingredients)) {
+    player.inventory[itemId] -= amount;
+    if (player.inventory[itemId] <= 0) delete player.inventory[itemId];
+  }
+  player.inventory[recipe.result] = (player.inventory[recipe.result] || 0) + recipe.resultAmount;
+  save();
+  return { ok: true, result: recipe.result, resultAmount: recipe.resultAmount };
+}
+
+// --- alchemy ---
+
+// Combine two owned ingredients. Ingredients are ALWAYS consumed on attempt
+// (success or not) — that's the real cost of experimentation, same as real
+// Oblivion-style alchemy. A combo that's already been tried and failed is
+// remembered per-player (player.alchemy.triedCombos) so retrying it doesn't
+// waste more ingredients pointlessly, but a fresh attempt at a combo that
+// hasn't been tried always costs the ingredients regardless of outcome.
+function experimentAlchemy(playerId, ingredientA, ingredientB) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  if (!ITEMS[ingredientA] || ITEMS[ingredientA].type !== 'ingredient') return { error: 'invalid_ingredient' };
+  if (!ITEMS[ingredientB] || ITEMS[ingredientB].type !== 'ingredient') return { error: 'invalid_ingredient' };
+  if (ingredientA === ingredientB) return { error: 'need_two_different_ingredients' };
+
+  if ((player.inventory[ingredientA] || 0) < 1 || (player.inventory[ingredientB] || 0) < 1) {
+    return { error: 'missing_ingredients' };
+  }
+
+  const comboKey = ingredientComboKey([ingredientA, ingredientB]);
+  const recipe = POTION_RECIPES.find((r) => ingredientComboKey(Object.keys(r.ingredients)) === comboKey);
+
+  if (!recipe && player.alchemy.triedCombos.includes(comboKey)) {
+    return { ok: true, discovered: false, alreadyTried: true };
+  }
+
+  player.inventory[ingredientA] -= 1;
+  if (player.inventory[ingredientA] <= 0) delete player.inventory[ingredientA];
+  player.inventory[ingredientB] -= 1;
+  if (player.inventory[ingredientB] <= 0) delete player.inventory[ingredientB];
+
+  if (recipe) {
+    player.inventory[recipe.result] = (player.inventory[recipe.result] || 0) + 1;
+    const newDiscovery = !player.alchemy.knownRecipes.includes(recipe.id);
+    if (newDiscovery) player.alchemy.knownRecipes.push(recipe.id);
+    save();
+    return { ok: true, discovered: true, newDiscovery, recipeId: recipe.id, result: recipe.result, resultName: ITEMS[recipe.result].name };
+  }
+
+  if (!player.alchemy.triedCombos.includes(comboKey)) player.alchemy.triedCombos.push(comboKey);
+  save();
+  return { ok: true, discovered: false };
+}
+
+// Re-brew a potion whose recipe this player has already discovered — same
+// idea as craftItem() but gated on player.alchemy.knownRecipes instead of
+// being universally available, since the whole point of alchemy is that
+// recipes start hidden.
+function craftKnownPotion(playerId, recipeId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  if (!player.alchemy.knownRecipes.includes(recipeId)) return { error: 'not_known' };
+  const recipe = POTION_RECIPES.find((r) => r.id === recipeId);
+  if (!recipe) return { error: 'unknown_recipe' };
+  for (const [itemId, amount] of Object.entries(recipe.ingredients)) {
+    if ((player.inventory[itemId] || 0) < amount) return { error: 'missing_ingredients' };
+  }
+  for (const [itemId, amount] of Object.entries(recipe.ingredients)) {
+    player.inventory[itemId] -= amount;
+    if (player.inventory[itemId] <= 0) delete player.inventory[itemId];
+  }
+  player.inventory[recipe.result] = (player.inventory[recipe.result] || 0) + 1;
+  save();
+  return { ok: true, result: recipe.result, resultName: ITEMS[recipe.result].name };
+}
+
+// Potions only do something meaningful mid-fight (heal/cure/buff/poison the
+// enemy) — there's no persistent HP outside combat to heal in this game, so
+// usage is restricted to an active, unresolved fight rather than inventing a
+// resting-HP concept that doesn't exist anywhere else in the codebase.
+function usePotion(playerId, itemId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const item = ITEMS[itemId];
+  if (!item || item.type !== 'potion') return { error: 'not_a_potion' };
+  if ((player.inventory[itemId] || 0) < 1) return { error: 'not_owned' };
+  if (!player.combat || player.combat.result) return { error: 'not_in_combat' };
+
+  tickCombat(player); // resolve anything pending up to now before the potion lands
+  const c = player.combat;
+  if (!c || c.result) return { error: 'not_in_combat' };
+
+  const effect = item.potionEffect;
+  if (effect.kind === 'heal') {
+    c.playerHp = Math.min(c.playerMaxHp, c.playerHp + effect.amount);
+  } else if (effect.kind === 'cure') {
+    if (!c.dotOnPlayer) return { error: 'nothing_to_cure' };
+    c.dotOnPlayer = null;
+  } else if (effect.kind === 'buff_damage') {
+    c.buff = { type: 'damage', multiplier: effect.multiplier, expiresAt: Date.now() + effect.durationSeconds * 1000 };
+  } else if (effect.kind === 'buff_speed') {
+    c.buff = { type: 'speed', multiplier: effect.multiplier, expiresAt: Date.now() + effect.durationSeconds * 1000 };
+  } else if (effect.kind === 'poison_enemy') {
+    c.dotOnEnemy = { type: 'venom', dps: effect.dps, ticksLeft: effect.duration, nextTickAt: Date.now() + 1000 };
+  }
+
+  player.inventory[itemId] -= 1;
+  if (player.inventory[itemId] <= 0) delete player.inventory[itemId];
+  save();
+  return { ok: true, effect: effect.kind };
+}
+
+// --- farming (animals) ---
+
+function buyAnimal(playerId, speciesId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const species = ANIMAL_SPECIES[speciesId];
+  if (!species) return { error: 'unknown_species' };
+  const gold = player.inventory.gold || 0;
+  if (gold < species.price) return { error: 'not_enough_gold' };
+
+  player.inventory.gold = gold - species.price;
+  const id = 'a_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  player.farm.animals.push({ id, species: speciesId, bornAt: Date.now(), lastCollectedAt: null });
+  save();
+  return { ok: true, id };
+}
+
+// Collect on a mature cow/chicken grants one unit of produce and resets its
+// timer; collect on a mature pig is a one-time butcher that removes it.
+function collectAnimal(playerId, animalId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const animal = player.farm.animals.find((a) => a.id === animalId);
+  if (!animal) return { error: 'unknown_animal' };
+  const species = ANIMAL_SPECIES[animal.species];
+  const ageSeconds = (Date.now() - animal.bornAt) / 1000;
+  if (ageSeconds < species.matureSeconds) return { error: 'not_mature' };
+
+  if (species.butcherItem) {
+    player.inventory[species.butcherItem] = (player.inventory[species.butcherItem] || 0) + 1;
+    player.farm.animals = player.farm.animals.filter((a) => a.id !== animalId);
+    save();
+    return { ok: true, item: species.butcherItem, removed: true };
+  }
+
+  const since = animal.lastCollectedAt || animal.bornAt + species.matureSeconds * 1000;
+  const elapsedSeconds = (Date.now() - since) / 1000;
+  if (elapsedSeconds < species.produceIntervalSeconds) return { error: 'not_ready' };
+  player.inventory[species.produceItem] = (player.inventory[species.produceItem] || 0) + 1;
+  animal.lastCollectedAt = Date.now();
+  save();
+  return { ok: true, item: species.produceItem, removed: false };
+}
+
+// --- buildings ---
+
+function buildBuilding(playerId, buildingType) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const building = BUILDINGS[buildingType];
+  if (!building) return { error: 'unknown_building' };
+  if (player.buildings[buildingType]) return { error: 'already_built' };
+  for (const [itemId, amount] of Object.entries(building.cost)) {
+    if ((player.inventory[itemId] || 0) < amount) return { error: 'missing_resources' };
+  }
+  for (const [itemId, amount] of Object.entries(building.cost)) {
+    player.inventory[itemId] -= amount;
+    if (player.inventory[itemId] <= 0) delete player.inventory[itemId];
+  }
+  player.buildings[buildingType] = { builtAt: Date.now(), lastCollectedAt: Date.now() };
+  save();
+  return { ok: true };
+}
+
+function collectBuilding(playerId, buildingType) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const built = player.buildings[buildingType];
+  if (!built) return { error: 'not_built' };
+  const building = BUILDINGS[buildingType];
+  const elapsedSeconds = (Date.now() - built.lastCollectedAt) / 1000;
+  const amount = Math.floor(elapsedSeconds / building.produceIntervalSeconds);
+  if (amount <= 0) return { error: 'nothing_ready' };
+  player.inventory[building.producesItem] = (player.inventory[building.producesItem] || 0) + amount;
+  built.lastCollectedAt += amount * building.produceIntervalSeconds * 1000;
+  save();
+  return { ok: true, item: building.producesItem, amount };
+}
+
+// --- quests ---
+
+function acceptQuest(playerId, questId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const quest = QUESTS[questId];
+  if (!quest) return { error: 'unknown_quest' };
+  if (player.quests.completed.includes(questId)) return { error: 'already_completed' };
+  if (player.quests.started.includes(questId)) return { error: 'already_started' };
+  player.quests.started.push(questId);
+  save();
+  return { ok: true };
+}
+
+function turnInQuest(playerId, questId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const quest = QUESTS[questId];
+  if (!quest) return { error: 'unknown_quest' };
+  if (!player.quests.started.includes(questId)) return { error: 'not_started' };
+  if (!questObjectiveMet(player, quest)) return { error: 'objective_not_met' };
+
+  if (quest.objective.type === 'gather') {
+    player.inventory[quest.objective.itemId] -= quest.objective.count;
+    if (player.inventory[quest.objective.itemId] <= 0) delete player.inventory[quest.objective.itemId];
+  }
+  if (quest.reward.gold) {
+    player.inventory.gold = (player.inventory.gold || 0) + quest.reward.gold;
+  }
+  if (quest.reward.xp) {
+    for (const [skillId, xp] of Object.entries(quest.reward.xp)) {
+      if (player.skills[skillId]) player.skills[skillId].xp += xp;
+    }
+  }
+  player.quests.started = player.quests.started.filter((id) => id !== questId);
+  player.quests.completed.push(questId);
+  save();
+  return { ok: true, reward: quest.reward };
+}
+
+// --- shop ---
+
+function buyItem(playerId, itemId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const shopEntry = SHOP_ITEMS.find((s) => s.id === itemId);
+  if (!shopEntry) return { error: 'not_for_sale' };
+  const gold = player.inventory.gold || 0;
+  if (gold < shopEntry.price) return { error: 'not_enough_gold' };
+
+  player.inventory.gold = gold - shopEntry.price;
+  player.inventory[itemId] = (player.inventory[itemId] || 0) + 1;
+  save();
+  return { ok: true, itemId, price: shopEntry.price, goldRemaining: player.inventory.gold };
+}
+
+// Sells any amount of any item that has a sellPrice (everything except
+// 'gold' itself) — deliberately not restricted to SHOP_ITEMS, so raw
+// materials/loot/potions the player has no other use for can always be
+// converted to gold instead of being a dead end in the inventory.
+function sellItem(playerId, itemId, amount) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const item = ITEMS[itemId];
+  if (!item || !item.sellPrice) return { error: 'not_sellable' };
+  const qty = Math.floor(amount) || 1;
+  if (qty < 1) return { error: 'invalid_amount' };
+  if ((player.inventory[itemId] || 0) < qty) return { error: 'not_enough_owned' };
+
+  const total = item.sellPrice * qty;
+  player.inventory[itemId] -= qty;
+  if (player.inventory[itemId] <= 0) delete player.inventory[itemId];
+  player.inventory.gold = (player.inventory.gold || 0) + total;
+  save();
+  return { ok: true, itemId, amount: qty, goldEarned: total, goldTotal: player.inventory.gold };
+}
+
+function buyLocationReveal(playerId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const gold = player.inventory.gold || 0;
+  if (gold < LOCATION_REVEAL_PRICE) return { error: 'not_enough_gold' };
+  const undiscovered = LOCATIONS.filter((l) => !player.discoveries.includes(l.id));
+  if (undiscovered.length === 0) return { error: 'nothing_left' };
+
+  const found = undiscovered[Math.floor(Math.random() * undiscovered.length)];
+  player.inventory.gold = gold - LOCATION_REVEAL_PRICE;
+  discoverLocation(player, found.id); // grants character xp same as a free expedition find
+  save();
+  return { ok: true, location: found, goldRemaining: player.inventory.gold };
+}
+
+// --- dev/testing commands only — not gated behind auth since this is a
+// solo/local prototype; remove or lock these down before any public launch. ---
+
+function devGiveItem(playerId, itemId, amount) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  if (!ITEMS[itemId]) return { error: 'unknown_item' };
+  player.inventory[itemId] = Math.max(0, (player.inventory[itemId] || 0) + amount);
+  save();
+  return { ok: true, itemId, count: player.inventory[itemId] };
+}
+
+function devDiscoverLocation(playerId, locationId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const loc = getLocation(locationId);
+  if (!loc) return { error: 'unknown_location' };
+  if (!player.discoveries.includes(locationId)) player.discoveries.push(locationId);
+  save();
+  return { ok: true, locationId };
+}
+
+function devSetSkillXp(playerId, skillId, xp) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const skill = player.skills[skillId];
+  if (!skill) return { error: 'unknown_skill' };
+  skill.xp = Math.max(0, xp);
+  save();
+  return { ok: true, skillId, xp: skill.xp };
+}
+
+// Resets the CURRENT player back to a fresh-character state, in place —
+// same id/username, so the browser session stays logged in. For testing
+// things like exploration repeatedly without burning real supplies or
+// permanently using up locations, without needing to touch the save file
+// directly (which is live player data, not test scratch — see the incident
+// this was added in response to).
+function devResetPlayer(playerId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const startLoc = LOCATIONS.find((l) => l.startingLocation);
+
+  player.currentLocation = startLoc.id;
+  player.discoveries = [startLoc.id];
+  player.inventory = { supplies: STARTER_SUPPLIES, gold: 20 };
+  player.expedition = null;
+  player.equipment = { weapon: null, armor: null };
+  player.combat = null;
+  player.garden = { plots: new Array(GARDEN_PLOT_COUNT).fill(null) };
+  for (const skillId of Object.keys(player.skills)) {
+    if (skillId === 'mining') {
+      player.skills.mining = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null };
+    } else {
+      player.skills[skillId] = TASK_CONFIG[skillId] || GATHER_TASKS[skillId]
+        ? { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null }
+        : { xp: 0 };
+    }
+  }
+  player.farm = { animals: [] };
+  player.buildings = {};
+  player.quests = { started: [], completed: [] };
+  player.killCounts = {};
+  player.combatRecord = { wins: 0, losses: 0 };
+  player.lastRareEvent = null;
+  player.alchemy = { knownRecipes: [], triedCombos: [] };
+  player.abilityLoadout = [...DEFAULT_ABILITY_LOADOUT];
+  // Deliberately NOT reset: traits/characterXp/traitPointsAvailable/
+  // perkPoints/perks. Those represent the chosen character build, not
+  // explore/economy state — dev.reset() is for repeat-testing exploration
+  // and the economy, not relitigating a character's build.
+
+  save();
+  return { ok: true };
+}
+
+module.exports = {
+  LOCATIONS,
+  ITEMS,
+  ENEMIES,
+  ABILITIES,
+  PLANTS,
+  RECIPES,
+  ANIMAL_SPECIES,
+  BUILDINGS,
+  NPCS,
+  DIALOGUE_TREES,
+  QUESTS,
+  SHOP_ITEMS,
+  LOCATION_REVEAL_PRICE,
+  PERKS,
+  MINING_NODES,
+  TRAIT_KEYS,
+  TRAIT_BASE,
+  TRAIT_MIN,
+  TRAIT_MAX,
+  TRAIT_EXTRA_POINTS,
+  login,
+  createCharacter,
+  getPlayer,
+  publicPlayer,
+  startExpedition,
+  travel,
+  startTask,
+  stopTask,
+  startMiningNode,
+  equipItem,
+  unequipItem,
+  startCombat,
+  endCombat,
+  setLoadoutSlot,
+  plantSeed,
+  harvestPlot,
+  craftItem,
+  experimentAlchemy,
+  craftKnownPotion,
+  usePotion,
+  buyAnimal,
+  collectAnimal,
+  buildBuilding,
+  collectBuilding,
+  acceptQuest,
+  turnInQuest,
+  buyItem,
+  sellItem,
+  buyLocationReveal,
+  allocateTraitPoint,
+  unlockPerk,
+  devGiveItem,
+  devDiscoverLocation,
+  devSetSkillXp,
+  devResetPlayer,
+};

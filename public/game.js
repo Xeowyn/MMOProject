@@ -1,0 +1,2328 @@
+const SKILL_DISPLAY_NAMES = {
+  mining: 'Mining',
+  woodcutting: 'Woodcutting',
+  fishing: 'Fishing',
+  hunting: 'Hunting',
+  scavenging: 'Scavenging',
+  harvesting: 'Harvesting',
+};
+
+const state = {
+  playerId: localStorage.getItem('mmo_playerId') || null,
+  player: null,
+  locations: [],
+  others: [], // [{id, username, locationId}]
+  markers: [], // hit-test cache: [{x, y, r, locationId}] in canvas pixel space
+  clockSync: {}, // { [skillId]: { progressSeconds, cycleSeconds, active, syncedAt } }
+  expeditionSync: null, // { path, totalLength, durationSeconds, startedAt } — fixed anchor, set once per expedition
+  drawMode: false,
+  isDrawing: false,
+  drawPath: [], // percent-space points while actively dragging out a route
+  drawLength: 0,
+  itemsMeta: {},
+  enemiesMeta: {},
+  plantsMeta: {},
+  recipesMeta: [],
+  animalSpeciesMeta: {},
+  buildingsMeta: {},
+  npcsMeta: [],
+  dialogueTreesMeta: {},
+  questsMeta: {},
+  shopMeta: { items: [], locationRevealPrice: 0 },
+  activeTab: 'overworld',
+  discoveryQueue: [], // location names waiting to show a popup
+  discoveryPopupShowing: false,
+  dialogue: { npcId: null, nodeId: null },
+  tavernMessages: [],
+  tavernLocationId: null, // which tavern's history is currently loaded, so it's only fetched once per location change
+  selectedSeed: null, // plantId currently picked in the Gardening tab's seed-then-click-plots flow
+  selectedAbility: null, // ability id (or CLEAR_SLOT_SENTINEL) currently picked in the Combat tab's sidebar-then-click-slots flow
+  lastSeenRareEventAt: null, // dedupes lastRareEvent across polls, same idea as the discovery-array diff
+  traitConfig: null, // { keys, base, min, max, extraPoints } — fetched once, drives the character-creation screen
+  creationTraits: null, // { strength, dexterity, luck, vigor } while allocating on the creation screen
+  creationUsername: null,
+  perksMeta: {}, // static perk definitions, keyed by id (tier/requiresLevel/cost) — merged with player.perks' per-player unlocked/levelMet flags
+  camera: { x: 50, y: 50, zoom: 1 }, // percent-space camera center + zoom (1 = whole map visible, up to CAMERA_MAX_ZOOM)
+  isPanning: false,
+  panStart: null, // { clientX, clientY, camX, camY }
+  wasPanning: false, // suppresses the click-to-travel handler right after a pan drag
+};
+
+const CAMERA_MAX_ZOOM = 20;
+
+// Camera-aware world<->screen transforms — the map's underlying 0-100
+// percent-space world is unchanged (so all server-side distance math for
+// expeditions stays correct), but the camera lets the player zoom into a
+// small slice of it (as tight as 1/20th) or pan around, purely as a
+// rendering transform.
+function pixelToPercent(px, py) {
+  const viewSize = 100 / state.camera.zoom;
+  const left = state.camera.x - viewSize / 2;
+  const top = state.camera.y - viewSize / 2;
+  return { x: left + (px / canvas.width) * viewSize, y: top + (py / canvas.height) * viewSize };
+}
+
+function percentToPixel(x, y) {
+  const viewSize = 100 / state.camera.zoom;
+  const left = state.camera.x - viewSize / 2;
+  const top = state.camera.y - viewSize / 2;
+  return { x: ((x - left) / viewSize) * canvas.width, y: ((y - top) / viewSize) * canvas.height };
+}
+
+const loginScreen = document.getElementById('login-screen');
+const gameScreen = document.getElementById('game-screen');
+const canvas = document.getElementById('map-canvas');
+const ctx = canvas.getContext('2d');
+
+function showError(text) {
+  const el = document.getElementById('error-banner');
+  el.textContent = text;
+  el.classList.remove('hidden');
+}
+
+function clearError() {
+  document.getElementById('error-banner').classList.add('hidden');
+}
+
+// Wraps fetch so a dead/unreachable server shows a visible message instead
+// of the button silently doing nothing.
+async function api(path, options) {
+  let res;
+  try {
+    res = await fetch(path, options);
+  } catch (err) {
+    showError('Cannot reach the server. Is `npm start` still running?');
+    throw err;
+  }
+  let body = {};
+  try {
+    body = await res.json();
+  } catch {
+    // no JSON body
+  }
+  if (!res.ok) {
+    showError(body.error ? `Error: ${body.error}` : `Request failed (${res.status})`);
+    throw new Error(body.error || `HTTP ${res.status}`);
+  }
+  clearError();
+  return body;
+}
+
+document.getElementById('login-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const username = document.getElementById('username-input').value.trim();
+  if (!username) return;
+  let result;
+  try {
+    result = await api('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username }),
+    });
+  } catch {
+    return;
+  }
+  if (!result.existing) {
+    await showCreationScreen(result.username);
+    return;
+  }
+  finishLogin(result.player);
+});
+
+function finishLogin(player) {
+  state.playerId = player.id;
+  localStorage.setItem('mmo_playerId', player.id);
+  state.player = player;
+  enterGame();
+}
+
+// --- character creation (Fallout-SPECIAL-style trait point-buy) ---
+
+async function showCreationScreen(username) {
+  if (!state.traitConfig) {
+    state.traitConfig = await api('/api/trait-config');
+  }
+  state.creationUsername = username;
+  const cfg = state.traitConfig;
+  state.creationTraits = {};
+  for (const key of cfg.keys) state.creationTraits[key] = cfg.base;
+
+  document.getElementById('login-screen').classList.add('hidden');
+  document.getElementById('creation-screen').classList.remove('hidden');
+  renderCreationScreen();
+}
+
+const TRAIT_DISPLAY_NAMES = { strength: 'Strength', dexterity: 'Dexterity', luck: 'Luck', vigor: 'Vigor' };
+const TRAIT_DESCRIPTIONS = {
+  strength: 'Increases melee damage.',
+  dexterity: 'Increases ability speed, crit chance, and dodge chance.',
+  luck: 'Increases crit chance, loot chance, and gather success chance.',
+  vigor: 'Increases max HP.',
+};
+
+function creationPointsRemaining() {
+  const cfg = state.traitConfig;
+  const spent = cfg.keys.reduce((sum, k) => sum + (state.creationTraits[k] - cfg.base), 0);
+  return cfg.extraPoints - spent;
+}
+
+function renderCreationScreen() {
+  const cfg = state.traitConfig;
+  const remaining = creationPointsRemaining();
+  document.getElementById('trait-points-remaining').textContent = `Points remaining: ${remaining}`;
+
+  const list = document.getElementById('trait-allocation-list');
+  list.innerHTML = '';
+  for (const key of cfg.keys) {
+    const value = state.creationTraits[key];
+    const row = document.createElement('div');
+    row.className = 'trait-alloc-row';
+    row.innerHTML = `
+      <div class="trait-alloc-name">${TRAIT_DISPLAY_NAMES[key]}</div>
+      <div class="trait-alloc-desc">${TRAIT_DESCRIPTIONS[key]}</div>
+      <div class="trait-alloc-controls">
+        <button data-trait-dec="${key}" ${value <= cfg.min ? 'disabled' : ''}>&minus;</button>
+        <span class="trait-alloc-value">${value}</span>
+        <button data-trait-inc="${key}" ${value >= cfg.max || remaining <= 0 ? 'disabled' : ''}>+</button>
+      </div>
+    `;
+    list.appendChild(row);
+  }
+  list.querySelectorAll('button[data-trait-inc]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const key = btn.dataset.traitInc;
+      if (state.creationTraits[key] < cfg.max && creationPointsRemaining() > 0) {
+        state.creationTraits[key] += 1;
+        renderCreationScreen();
+      }
+    });
+  });
+  list.querySelectorAll('button[data-trait-dec]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const key = btn.dataset.traitDec;
+      if (state.creationTraits[key] > cfg.min) {
+        state.creationTraits[key] -= 1;
+        renderCreationScreen();
+      }
+    });
+  });
+
+  document.getElementById('creation-begin-btn').disabled = remaining !== 0;
+}
+
+document.getElementById('creation-begin-btn').addEventListener('click', async () => {
+  if (creationPointsRemaining() !== 0) return;
+  let result;
+  try {
+    result = await api('/api/create-character', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: state.creationUsername, traits: state.creationTraits }),
+    });
+  } catch {
+    return;
+  }
+  document.getElementById('creation-screen').classList.add('hidden');
+  finishLogin(result.player);
+});
+
+async function enterGame() {
+  loginScreen.classList.add('hidden');
+  gameScreen.classList.remove('hidden');
+  document.getElementById('player-name').textContent = state.player.username;
+
+  state.locations = await api('/api/locations');
+  state.itemsMeta = await api('/api/items');
+  state.enemiesMeta = await api('/api/enemies');
+  state.plantsMeta = await api('/api/plants');
+  state.recipesMeta = await api('/api/recipes');
+  state.animalSpeciesMeta = await api('/api/animal-species');
+  state.buildingsMeta = await api('/api/buildings');
+  state.npcsMeta = await api('/api/npcs');
+  state.dialogueTreesMeta = await api('/api/dialogue-trees');
+  state.questsMeta = await api('/api/quests');
+  state.shopMeta = await api('/api/shop');
+  state.perksMeta = await api('/api/perks');
+  document.getElementById('buy-location-btn').textContent =
+    `Buy Location Coordinates (${state.shopMeta.locationRevealPrice} gold)`;
+
+  buildSkillsTab();
+  setupTabs();
+  connectSocket();
+  await refreshMe();
+  scheduleNextPoll();
+
+  // gather tasks live on the Overworld tab, not the generic Skills-tab
+  // builder (buildSkillsTab() skips them), so their buttons are wired here
+  document.getElementById('hunting-btn').addEventListener('click', () => toggleTask('hunting'));
+  document.getElementById('scavenging-btn').addEventListener('click', () => toggleTask('scavenging'));
+  document.getElementById('harvesting-btn').addEventListener('click', () => toggleTask('harvesting'));
+  document.getElementById('explore-btn').addEventListener('click', toggleDrawMode);
+  document.getElementById('confirm-btn').addEventListener('click', confirmDrawnPath);
+  document.getElementById('cancel-btn').addEventListener('click', cancelDrawnPath);
+  document.getElementById('unequip-weapon-btn').addEventListener('click', () => unequipSlot('weapon'));
+  document.getElementById('unequip-armor-btn').addEventListener('click', () => unequipSlot('armor'));
+  document.getElementById('flee-btn').addEventListener('click', endCombat);
+  document.getElementById('combat-continue-btn').addEventListener('click', endCombat);
+  document.getElementById('buy-location-btn').addEventListener('click', buyLocationReveal);
+  document.getElementById('alchemy-experiment-btn').addEventListener('click', runExperiment);
+  document.getElementById('alchemy-ingredient-a').addEventListener('change', renderAlchemyTab);
+  document.getElementById('alchemy-ingredient-b').addEventListener('change', renderAlchemyTab);
+  document.getElementById('discovery-modal-ok').addEventListener('click', closeDiscoveryPopup);
+  document.getElementById('rare-event-modal-ok').addEventListener('click', () => {
+    document.getElementById('rare-event-modal').classList.add('hidden');
+  });
+  document.getElementById('dialogue-close-btn').addEventListener('click', closeDialogue);
+  document.getElementById('tavern-chat-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const input = document.getElementById('tavern-chat-input');
+    const text = input.value.trim();
+    if (!text) return;
+    socket.send(JSON.stringify({ type: 'chat', playerId: state.playerId, text }));
+    input.value = '';
+  });
+  canvas.addEventListener('click', onCanvasClick);
+  canvas.addEventListener('mousedown', onCanvasMouseDown);
+  canvas.addEventListener('mousemove', onCanvasMouseMove);
+  window.addEventListener('mouseup', onCanvasMouseUp);
+  canvas.addEventListener('wheel', onCanvasWheel, { passive: false });
+  document.getElementById('zoom-in-btn').addEventListener('click', () => zoomCamera(1.5));
+  document.getElementById('zoom-out-btn').addEventListener('click', () => zoomCamera(1 / 1.5));
+  document.getElementById('center-btn').addEventListener('click', centerCameraOnPlayer);
+
+  render();
+}
+
+function setupTabs() {
+  document.querySelectorAll('.tab-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));
+      document.querySelectorAll('.tab-panel').forEach((p) => p.classList.add('hidden'));
+      btn.classList.add('active');
+      document.getElementById(`tab-${btn.dataset.tab}`).classList.remove('hidden');
+      state.activeTab = btn.dataset.tab;
+    });
+  });
+}
+
+// Polls faster while a fight or an expedition is active. Combat attack
+// speeds (1-2.5s) are faster than the normal 2s poll, so combat needs
+// tighter sync or the on-screen attack timers visibly lag. Expeditions are
+// often even shorter (as little as ~2s) — at the normal poll rate the whole
+// trip could complete between two polls, and every location it found would
+// appear to be revealed all at once instead of one by one as the sweep
+// actually passes over each one.
+function scheduleNextPoll() {
+  const inCombat = state.player && state.player.combat && !state.player.combat.result;
+  const exploring = state.player && state.player.expedition;
+  const delay = inCombat || exploring ? 300 : 2000;
+  setTimeout(async () => {
+    await refreshMe();
+    scheduleNextPoll();
+  }, delay);
+}
+
+async function refreshMe() {
+  const previousDiscoveries = new Set(state.player ? state.player.discoveries : []);
+  const wasInCombat = !!(state.player && state.player.combat);
+  try {
+    state.player = await api(`/api/me?playerId=${state.playerId}`);
+  } catch {
+    return;
+  }
+
+  const newlyDiscovered = state.player.discoveries
+    .filter((id) => !previousDiscoveries.has(id))
+    .map((id) => state.locations.find((l) => l.id === id))
+    .filter(Boolean);
+  if (newlyDiscovered.length > 0) {
+    queueDiscoveryPopups(newlyDiscovered.map((l) => ({ name: l.name, loot: l.loot })));
+  }
+
+  // A hunting cycle can trigger combat server-side with nobody clicking
+  // anything — surface that transition distinctly from a fight the player
+  // chose to start (which they already know about, having just clicked it).
+  if (!wasInCombat && state.player.combat && state.player.combat.ambush) {
+    showToast(`Ambushed! A ${state.player.combat.enemyName} attacks while you were hunting!`);
+  }
+
+  if (
+    state.player.lastRareEvent &&
+    (!state.lastSeenRareEventAt || state.player.lastRareEvent.at > state.lastSeenRareEventAt)
+  ) {
+    state.lastSeenRareEventAt = state.player.lastRareEvent.at;
+    showRareEventPopup(state.player.lastRareEvent);
+  }
+
+  const now = Date.now();
+  for (const [skillId, skill] of Object.entries(state.player.skills)) {
+    if (skill.cycleSeconds === undefined) continue;
+    state.clockSync[skillId] = {
+      progressSeconds: skill.progressSeconds,
+      cycleSeconds: skill.cycleSeconds,
+      active: skill.active,
+      syncedAt: now,
+    };
+  }
+  // Mining's clock isn't a player.skills entry (it lives in miningNodes,
+  // one active node at a time) — sync the same shape separately so
+  // animate() can drive #mining-clock with the identical extrapolation
+  // trick every other skill clock uses.
+  const activeNode = state.player.miningNodes.find((n) => n.active);
+  state.clockSync.mining = activeNode
+    ? { progressSeconds: activeNode.progressSeconds, cycleSeconds: activeNode.cycleSeconds, active: true, syncedAt: now }
+    : { progressSeconds: 0, cycleSeconds: 1, active: false, syncedAt: now };
+
+  // Anchor the sweep to the expedition's fixed startedAt/durationSeconds
+  // ONCE, the moment it's first seen — never re-derive it from a later
+  // poll's fraction. Recomputing the anchor every poll let small per-request
+  // latency accumulate into real drift (worse the more often we poll), so
+  // the client's estimate could end up well behind the server's true
+  // progress; when the server then reported the expedition finished, the
+  // line would vanish wherever the drifted estimate happened to be instead
+  // of at 100%. Computing fraction fresh every frame from fixed anchor
+  // values is immune to that regardless of network/processing latency.
+  if (state.player.expedition) {
+    const exp = state.player.expedition;
+    if (!state.expeditionSync || state.expeditionSync.startedAt !== exp.startedAt) {
+      state.expeditionSync = {
+        path: exp.path,
+        totalLength: exp.totalLength,
+        durationSeconds: exp.durationSeconds,
+        startedAt: exp.startedAt,
+      };
+    }
+  } else if (state.expeditionSync) {
+    // Server says it's done — but let the local animation actually finish
+    // reaching 100% before clearing, rather than cutting it off the instant
+    // this poll landed (which is exactly the premature-disappearance bug).
+    const localFraction = (Date.now() - state.expeditionSync.startedAt) / 1000 / state.expeditionSync.durationSeconds;
+    if (localFraction >= 1) {
+      state.expeditionSync = null;
+    }
+  }
+
+  // Tavern chat history is only fetched once per tavern entered (not on
+  // every poll) — new messages after that arrive live over the socket.
+  const currentLoc = state.locations.find((l) => l.id === state.player.currentLocation);
+  if (currentLoc && currentLoc.tavern) {
+    if (state.tavernLocationId !== currentLoc.id) {
+      state.tavernLocationId = currentLoc.id;
+      try {
+        const data = await api(`/api/tavern/history?locationId=${currentLoc.id}`);
+        state.tavernMessages = data.history;
+      } catch {
+        // ignore — chat is non-critical, don't block the rest of the poll on it
+      }
+    }
+  } else {
+    state.tavernLocationId = null;
+  }
+
+  render();
+}
+
+// Popups (not toasts) for newly discovered locations, per the original
+// request — shown one at a time via a queue in case several land close
+// together (e.g. two locations near each other on the same route). Each
+// entry is {name, loot} — loot (if the location has one) was already
+// granted server-side the instant it was discovered (see discoverLocation()
+// in store.js), this is purely informational.
+function queueDiscoveryPopups(entries) {
+  state.discoveryQueue.push(...entries);
+  showNextDiscoveryPopup();
+}
+
+function showNextDiscoveryPopup() {
+  if (state.discoveryPopupShowing || state.discoveryQueue.length === 0) return;
+  state.discoveryPopupShowing = true;
+  const entry = state.discoveryQueue.shift();
+  document.getElementById('discovery-modal-name').textContent = entry.name;
+  document.getElementById('discovery-modal-loot').textContent = entry.loot
+    ? `Found: ${entry.loot.amount}x ${entry.loot.itemName}!`
+    : '';
+  document.getElementById('discovery-modal').classList.remove('hidden');
+}
+
+function closeDiscoveryPopup() {
+  document.getElementById('discovery-modal').classList.add('hidden');
+  state.discoveryPopupShowing = false;
+  showNextDiscoveryPopup();
+}
+
+// The 0.01% gather-task jackpot (armor or a quest nudge) — rare enough that
+// it gets its own distinct, more celebratory modal rather than sharing the
+// plain discovery popup.
+function showRareEventPopup(event) {
+  const text =
+    event.type === 'armor'
+      ? `While gathering, you stumble upon ${event.itemName}!`
+      : `While gathering, you meet ${event.npcName}, who could use your help. Quest started: ${event.questName}!`;
+  document.getElementById('rare-event-modal-text').textContent = text;
+  document.getElementById('rare-event-modal').classList.remove('hidden');
+}
+
+function toggleDrawMode() {
+  if (state.player.expedition) return; // button should already be disabled in this case
+  if (state.drawMode) {
+    console.log('[explore] exiting draw mode via toggle');
+    exitDrawMode();
+    return;
+  }
+  if ((state.player.maxExplorationRange || 0) <= 0) {
+    console.log('[explore] blocked — no supplies (maxExplorationRange <= 0)');
+    showToast('Not enough supplies to explore.');
+    return;
+  }
+  console.log('[explore] entering draw mode, maxRange =', state.player.maxExplorationRange);
+  state.drawMode = true;
+  canvas.classList.add('draw-mode');
+  document.getElementById('draw-hint').classList.remove('hidden');
+  render();
+}
+
+function exitDrawMode() {
+  state.drawMode = false;
+  state.isDrawing = false;
+  state.drawPath = [];
+  state.drawLength = 0;
+  canvas.classList.remove('draw-mode');
+  document.getElementById('draw-hint').classList.add('hidden');
+  render();
+}
+
+// --- map camera: pan (click-drag) + zoom (wheel/buttons) ---
+// Only active outside draw mode — while drawing an expedition route,
+// mousedown/move/up already mean "draw the path", so panning would collide
+// with that. A plain click (no real drag) still falls through to
+// onCanvasClick for travel — wasPanning distinguishes the two.
+
+function zoomCamera(factor) {
+  state.camera.zoom = Math.min(CAMERA_MAX_ZOOM, Math.max(1, state.camera.zoom * factor));
+}
+
+function clampCamera() {
+  state.camera.x = Math.min(100, Math.max(0, state.camera.x));
+  state.camera.y = Math.min(100, Math.max(0, state.camera.y));
+}
+
+function centerCameraOnPlayer() {
+  const loc = state.locations.find((l) => l.id === state.player.currentLocation);
+  if (loc) {
+    state.camera.x = loc.x;
+    state.camera.y = loc.y;
+  }
+}
+
+function onCanvasWheel(e) {
+  e.preventDefault();
+  zoomCamera(e.deltaY < 0 ? 1.15 : 1 / 1.15);
+}
+
+function onCanvasMouseDown(e) {
+  if (!state.drawMode) {
+    state.isPanning = true;
+    state.wasPanning = false;
+    state.panStart = { clientX: e.clientX, clientY: e.clientY, camX: state.camera.x, camY: state.camera.y };
+    return;
+  }
+  const currentLoc = state.locations.find((l) => l.id === state.player.currentLocation);
+  if (!currentLoc) {
+    console.warn('[explore] mousedown: could not find current location', state.player.currentLocation);
+    return;
+  }
+  console.log('[explore] mousedown — starting path at', currentLoc.name);
+  state.isDrawing = true;
+  state.drawPath = [{ x: currentLoc.x, y: currentLoc.y }];
+  state.drawLength = 0;
+  render();
+}
+
+function onCanvasMouseMove(e) {
+  if (!state.drawMode) {
+    if (!state.isPanning) return;
+    const rect = canvas.getBoundingClientRect();
+    const dxPixel = e.clientX - state.panStart.clientX;
+    const dyPixel = e.clientY - state.panStart.clientY;
+    if (Math.hypot(dxPixel, dyPixel) > 3) state.wasPanning = true;
+    const viewSize = 100 / state.camera.zoom;
+    const dxPercent = (dxPixel / rect.width) * viewSize;
+    const dyPercent = (dyPixel / rect.height) * viewSize;
+    state.camera.x = state.panStart.camX - dxPercent;
+    state.camera.y = state.panStart.camY - dyPercent;
+    clampCamera();
+    return;
+  }
+  if (!state.isDrawing) return;
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  const px = (e.clientX - rect.left) * scaleX;
+  const py = (e.clientY - rect.top) * scaleY;
+  const point = pixelToPercent(px, py);
+
+  const last = state.drawPath[state.drawPath.length - 1];
+  const segLength = Math.hypot(point.x - last.x, point.y - last.y);
+  const MIN_STEP = 0.4; // percent-units, avoids flooding the path with points
+  if (segLength < MIN_STEP) return;
+
+  const maxLength = state.player.maxExplorationRange;
+  if (state.drawLength + segLength > maxLength) {
+    const remaining = Math.max(0, maxLength - state.drawLength);
+    if (remaining <= 0) return; // already at max range, ignore further movement
+    const ratio = remaining / segLength;
+    state.drawPath.push({ x: last.x + (point.x - last.x) * ratio, y: last.y + (point.y - last.y) * ratio });
+    state.drawLength = maxLength;
+    return;
+  }
+
+  state.drawPath.push(point);
+  state.drawLength += segLength;
+}
+
+// Releasing the mouse just stops the drag — the drawn route stays on
+// screen until the player explicitly confirms or cancels it, so there's
+// no window where the line silently disappears before anything happens.
+function onCanvasMouseUp() {
+  if (state.isPanning) {
+    state.isPanning = false;
+  }
+  if (!state.drawMode || !state.isDrawing) {
+    return;
+  }
+  state.isDrawing = false;
+  console.log('[explore] mouseup — path points:', state.drawPath.length, 'length:', state.drawLength.toFixed(2));
+  if (state.drawPath.length < 2 || state.drawLength <= 0) {
+    console.log('[explore] path too short, discarding (normal for a click with no drag)');
+    state.drawPath = [];
+    state.drawLength = 0;
+  }
+  render();
+}
+
+function cancelDrawnPath() {
+  if (state.drawPath.length === 0) {
+    // nothing drawn yet — cancel backs all the way out of draw mode
+    exitDrawMode();
+    return;
+  }
+  state.drawPath = [];
+  state.drawLength = 0;
+  render();
+}
+
+async function confirmDrawnPath() {
+  if (state.drawPath.length < 2 || state.drawLength <= 0) return;
+  const path = state.drawPath;
+
+  let result;
+  try {
+    result = await api('/api/expedition/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, path }),
+    });
+  } catch {
+    return;
+  }
+  exitDrawMode();
+  showToast(
+    result.locationsFound > 0
+      ? `Expedition underway — ${result.locationsFound} location${result.locationsFound === 1 ? '' : 's'} within reach!`
+      : 'Expedition underway...'
+  );
+  await refreshMe();
+}
+
+async function travelTo(locationId) {
+  try {
+    await api('/api/travel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, locationId }),
+    });
+  } catch {
+    return;
+  }
+  await refreshMe();
+}
+
+// --- skills tab ---
+
+function buildSkillsTab() {
+  const container = document.getElementById('skills-container');
+  container.innerHTML = '';
+  for (const [skillId, skill] of Object.entries(state.player.skills)) {
+    if (skill.cycleSeconds === undefined) continue; // not a cycle/task skill (e.g. combat)
+    if (skill.locationless) continue; // gather tasks (hunting/scavenging/harvesting) live on the Overworld tab instead
+    const displayName = SKILL_DISPLAY_NAMES[skillId] || skillId;
+    const card = document.createElement('div');
+    card.className = 'skill-card';
+    card.innerHTML = `
+      <h3>${displayName}</h3>
+      <div class="task-row">
+        <canvas id="${skillId}-clock" class="task-clock" width="70" height="70"></canvas>
+        <div class="task-info">
+          <div class="bar-wrap"><div id="${skillId}-bar-fill" class="bar-fill"></div></div>
+          <div id="${skillId}-label" class="skill-label"></div>
+        </div>
+      </div>
+      <button id="${skillId}-btn"></button>
+    `;
+    container.appendChild(card);
+    document.getElementById(`${skillId}-btn`).addEventListener('click', () => toggleTask(skillId));
+  }
+}
+
+async function toggleTask(skillId) {
+  const skill = state.player.skills[skillId];
+  const endpoint = skill.active ? '/api/task/stop' : '/api/task/start';
+  try {
+    await api(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, skillId }),
+    });
+  } catch {
+    return;
+  }
+  await refreshMe();
+}
+
+function updateSkillsTab() {
+  const currentLoc = state.locations.find((l) => l.id === state.player.currentLocation);
+  for (const [skillId, skill] of Object.entries(state.player.skills)) {
+    if (skill.cycleSeconds === undefined) continue;
+    const barFill = document.getElementById(`${skillId}-bar-fill`);
+    if (!barFill) continue;
+    const label = document.getElementById(`${skillId}-label`);
+    const btn = document.getElementById(`${skillId}-btn`);
+
+    barFill.style.width = `${(skill.xpIntoLevel / skill.xpToNextLevel) * 100}%`;
+    label.textContent = `Lvl ${skill.level} — ${skill.xpIntoLevel} / ${skill.xpToNextLevel} xp — yields ${skill.itemName}`;
+
+    const atLoc = skill.locationless || (currentLoc && currentLoc.skill === skillId);
+    const skillLoc = state.locations.find((l) => l.skill === skillId);
+    btn.disabled = !atLoc;
+    const displayName = SKILL_DISPLAY_NAMES[skillId] || skillId;
+    btn.textContent = !atLoc
+      ? `Travel to ${skillLoc ? skillLoc.name : 'the right location'}`
+      : skill.active
+        ? `Stop ${displayName}`
+        : `Start ${displayName}`;
+  }
+}
+
+// --- mining tab (Melvor-Idle-style node grid) ---
+// Unlike woodcutting/fishing (TASK_CONFIG, tied to a physical location),
+// mining nodes unlock via discovery and are minable from here regardless of
+// where the player currently is — see MINING_NODES/tickMining() in
+// server/store.js. Tiles reuse the same visual language as the garden's
+// plot grid (.garden-plot-tile) rather than inventing a new pattern.
+
+function renderMiningTab() {
+  const nodes = state.player.miningNodes;
+  const activeNode = nodes.find((n) => n.active);
+
+  const panel = document.getElementById('mining-active-panel');
+  if (activeNode) {
+    const miningSkill = state.player.skills.mining;
+    panel.classList.remove('hidden');
+    document.getElementById('mining-active-name').textContent = `Mining: ${activeNode.name}`;
+    document.getElementById('mining-bar-fill').style.width = `${(miningSkill.xpIntoLevel / miningSkill.xpToNextLevel) * 100}%`;
+    document.getElementById('mining-label').textContent =
+      `Lvl ${miningSkill.level} — ${miningSkill.xpIntoLevel} / ${miningSkill.xpToNextLevel} xp — yields ${activeNode.itemName} every ${activeNode.cycleSeconds}s`;
+  } else {
+    panel.classList.add('hidden');
+  }
+
+  const grid = document.getElementById('mining-grid');
+  grid.innerHTML = '';
+  for (const node of nodes) {
+    const tile = document.createElement('div');
+    tile.className = 'mining-node-tile';
+    if (!node.unlocked) {
+      tile.classList.add('locked');
+      tile.title = `${node.name}: locked — discover ${node.locationName} on the Overworld map to unlock.`;
+      tile.innerHTML = `<span class="mining-node-icon">🔒</span><span class="mining-node-label">${node.name}</span>`;
+    } else {
+      tile.classList.toggle('active', node.active);
+      tile.title = node.active
+        ? `${node.name}: mining now — click to stop`
+        : `${node.name}: click to mine (yields ${node.itemName})`;
+      tile.innerHTML = `<span class="mining-node-icon">⛏️</span><span class="mining-node-label">${node.name}</span><span class="mining-node-sub">${node.itemName}</span>`;
+      tile.addEventListener('click', () => onMiningTileClick(node));
+    }
+    grid.appendChild(tile);
+  }
+}
+
+async function onMiningTileClick(node) {
+  try {
+    if (node.active) {
+      await api('/api/task/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId: state.playerId, skillId: 'mining' }),
+      });
+    } else {
+      await api('/api/mining/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId: state.playerId, nodeId: node.id }),
+      });
+    }
+  } catch {
+    return;
+  }
+  await refreshMe();
+}
+
+// --- inventory tab ---
+
+function renderInventoryTab() {
+  const grid = document.getElementById('inventory-grid');
+  grid.innerHTML = '';
+  if (state.player.inventory.length === 0) {
+    grid.innerHTML = '<div class="card">Empty.</div>';
+    return;
+  }
+  for (const item of state.player.inventory) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `<h3>${item.name}</h3><div class="card-sub">Quantity: ${item.count}</div>`;
+    grid.appendChild(card);
+  }
+}
+
+// --- equipment tab ---
+
+function renderEquipmentTab() {
+  const equip = state.player.equipment;
+  document.getElementById('equipped-weapon').textContent = equip.weapon ? equip.weapon.name : 'None';
+  document.getElementById('equipped-armor').textContent = equip.armor ? equip.armor.name : 'None';
+  document.getElementById('unequip-weapon-btn').disabled = !equip.weapon;
+  document.getElementById('unequip-armor-btn').disabled = !equip.armor;
+
+  const s = equip.stats;
+  const effectLine = s.effect
+    ? ` &nbsp; Effect: ${s.effect.type} (${Math.round(s.effect.chance * 100)}% chance, ${s.effect.dps}/s for ${s.effect.duration}s)`
+    : '';
+  document.getElementById('combat-stats-display').innerHTML = `
+    <strong>Combat stats</strong><br>
+    Damage: ${s.damage[0]}-${s.damage[1]} &nbsp; Crit: ${Math.round(s.critChance * 100)}% &nbsp; Attack speed: ${s.attackSpeed}s<br>
+    Armor: ${s.armor}${effectLine}
+  `;
+
+  const list = document.getElementById('equippable-list');
+  list.innerHTML = '';
+  const equippable = state.player.inventory.filter((i) => {
+    const meta = state.itemsMeta[i.id];
+    return meta && (meta.type === 'weapon' || meta.type === 'armor');
+  });
+  if (equippable.length === 0) {
+    list.innerHTML = '<div class="card">Nothing equippable in inventory.</div>';
+    return;
+  }
+  for (const item of equippable) {
+    const meta = state.itemsMeta[item.id];
+    const statsLine =
+      meta.type === 'weapon'
+        ? `Dmg ${meta.damage[0]}-${meta.damage[1]}, Crit ${Math.round(meta.critChance * 100)}%, Speed ${meta.attackSpeed}s`
+        : `Armor ${meta.armor}`;
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `<h3>${item.name} (x${item.count})</h3><div class="card-sub">${statsLine}</div><button data-item="${item.id}">Equip</button>`;
+    list.appendChild(card);
+  }
+  list.querySelectorAll('button[data-item]').forEach((btn) => {
+    btn.addEventListener('click', () => equipItem(btn.dataset.item));
+  });
+}
+
+async function equipItem(itemId) {
+  try {
+    await api('/api/equip', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, itemId }),
+    });
+  } catch {
+    return;
+  }
+  await refreshMe();
+}
+
+async function unequipSlot(slot) {
+  try {
+    await api('/api/unequip', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, slot }),
+    });
+  } catch {
+    return;
+  }
+  await refreshMe();
+}
+
+// --- character tab (traits + perk tree) ---
+// Character-level xp is a separate pool from every skill's xp, earned from
+// discovering new locations (see gainCharacterXp() in store.js). Each
+// character level grants one trait point and one perk point.
+
+function renderCharacterTab() {
+  const ch = state.player.character;
+  document.getElementById('character-level-info').textContent =
+    `Level ${ch.level} — ${ch.xpIntoLevel} / ${ch.xpToNextLevel} xp — Trait points: ${state.player.traitPointsAvailable} — Perk points: ${state.player.perkPoints}`;
+  document.getElementById('character-xp-fill').style.width = `${(ch.xpIntoLevel / ch.xpToNextLevel) * 100}%`;
+
+  const traitsList = document.getElementById('traits-list');
+  traitsList.innerHTML = '';
+  for (const [key, value] of Object.entries(state.player.traits)) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `<h3>${TRAIT_DISPLAY_NAMES[key]}: ${value}</h3><div class="card-sub">${TRAIT_DESCRIPTIONS[key]}</div><button data-alloc-trait="${key}" ${state.player.traitPointsAvailable > 0 ? '' : 'disabled'}>+1 (spend a trait point)</button>`;
+    traitsList.appendChild(card);
+  }
+  traitsList.querySelectorAll('button[data-alloc-trait]').forEach((btn) => {
+    btn.addEventListener('click', () => allocateTrait(btn.dataset.allocTrait));
+  });
+
+  document.getElementById('perk-points-info').textContent = `Perk points available: ${state.player.perkPoints}`;
+
+  const tree = document.getElementById('perk-tree');
+  tree.innerHTML = '';
+  const tiers = [...new Set(state.player.perks.map((p) => p.tier))].sort((a, b) => a - b);
+  for (const tier of tiers) {
+    const tierPerks = state.player.perks.filter((p) => p.tier === tier);
+    const section = document.createElement('div');
+    section.className = 'perk-tier';
+    section.innerHTML = `<h3>Tier ${tier} &mdash; requires character level ${tierPerks[0].requiresLevel}</h3>`;
+    const grid = document.createElement('div');
+    grid.className = 'card-grid';
+    for (const perk of tierPerks) {
+      const card = document.createElement('div');
+      card.className = 'card' + (perk.unlocked ? ' perk-unlocked' : !perk.levelMet ? ' perk-locked' : '');
+      const canAfford = state.player.perkPoints >= perk.cost;
+      let buttonHtml = '';
+      if (perk.unlocked) {
+        buttonHtml = `<div class="card-sub">Unlocked</div>`;
+      } else if (!perk.levelMet) {
+        buttonHtml = `<div class="card-sub">🔒 Requires character level ${perk.requiresLevel}</div>`;
+      } else {
+        buttonHtml = `<button data-unlock-perk="${perk.id}" ${canAfford ? '' : 'disabled'}>Unlock (${perk.cost} pt)</button>`;
+      }
+      card.innerHTML = `<h3>${perk.name}</h3><div class="card-sub">${perk.description}</div>${buttonHtml}`;
+      grid.appendChild(card);
+    }
+    section.appendChild(grid);
+    tree.appendChild(section);
+  }
+  tree.querySelectorAll('button[data-unlock-perk]').forEach((btn) => {
+    btn.addEventListener('click', () => unlockPerkUI(btn.dataset.unlockPerk));
+  });
+}
+
+async function allocateTrait(traitName) {
+  try {
+    await api('/api/trait/allocate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, trait: traitName }),
+    });
+  } catch {
+    return;
+  }
+  showToast(`${TRAIT_DISPLAY_NAMES[traitName]} increased!`);
+  await refreshMe();
+}
+
+async function unlockPerkUI(perkId) {
+  let result;
+  try {
+    result = await api('/api/perk/unlock', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, perkId }),
+    });
+  } catch {
+    return;
+  }
+  showToast(`Perk unlocked: ${state.perksMeta[result.perkId].name}!`);
+  await refreshMe();
+}
+
+// --- combat tab ---
+//
+// Combat 2.0: an ability-sequencer arena. The player picks up to 6 unlocked
+// abilities into a persistent loadout (editable any time outside a fight);
+// during a fight they fire automatically left-to-right, looping, each
+// taking its own castSeconds to "fill" before resolving. See server/store.js
+// resolvePlayerAbility()/tickCombat() for the simulation this renders.
+
+function renderCombatTab() {
+  const idleDiv = document.getElementById('combat-idle');
+  const activeDiv = document.getElementById('combat-active');
+
+  if (state.player.combat) {
+    idleDiv.classList.add('hidden');
+    activeDiv.classList.remove('hidden');
+    const c = state.player.combat;
+
+    document.getElementById('enemy-name').textContent = c.enemyName;
+    document.getElementById('player-hp-fill').style.width = `${(c.playerHp / c.playerMaxHp) * 100}%`;
+    document.getElementById('player-hp-label').textContent = `${c.playerHp} / ${c.playerMaxHp} HP`;
+    document.getElementById('enemy-hp-fill').style.width = `${(c.enemyHp / c.enemyMaxHp) * 100}%`;
+    document.getElementById('enemy-hp-label').textContent = `${c.enemyHp} / ${c.enemyMaxHp} HP`;
+    document.getElementById('player-status-line').textContent = [
+      c.dotOnPlayer ? `Afflicted: ${c.dotOnPlayer.type}` : '',
+      c.buff ? `Buffed: ${c.buff.type}` : '',
+      c.armorBuffActive ? 'Guard up' : '',
+      c.evasionActive ? 'Evading' : '',
+      c.comboReady ? 'Combo ready!' : '',
+      c.hasteReady ? 'Haste ready!' : '',
+    ]
+      .filter(Boolean)
+      .join(' | ');
+    document.getElementById('enemy-status-line').textContent = c.dotOnEnemy ? `Afflicted: ${c.dotOnEnemy.type}` : '';
+
+    const logDiv = document.getElementById('combat-log');
+    logDiv.innerHTML = [c.lastPlayerActionText, c.lastEnemyActionText].filter(Boolean).join('<br>');
+
+    renderLiveAbilitySlots(c);
+
+    const resultDiv = document.getElementById('combat-result');
+    const fleeBtn = document.getElementById('flee-btn');
+    const continueBtn = document.getElementById('combat-continue-btn');
+    if (c.result) {
+      resultDiv.classList.remove('hidden');
+      if (c.result === 'win') {
+        const lootLine = c.rewardLoot.length > 0 ? ` (found ${c.rewardLoot.map((l) => l.name).join(', ')})` : '';
+        resultDiv.textContent = `Victory! +${c.rewardGold} gold${lootLine}`;
+      } else {
+        resultDiv.textContent = 'Defeated...';
+      }
+      fleeBtn.classList.add('hidden');
+      continueBtn.classList.remove('hidden');
+    } else {
+      resultDiv.classList.add('hidden');
+      fleeBtn.classList.remove('hidden');
+      continueBtn.classList.add('hidden');
+    }
+
+    const potionsDiv = document.getElementById('combat-potions');
+    potionsDiv.innerHTML = '';
+    if (!c.result) {
+      const ownedPotions = state.player.inventory.filter((i) => state.itemsMeta[i.id] && state.itemsMeta[i.id].type === 'potion');
+      for (const potion of ownedPotions) {
+        const btn = document.createElement('button');
+        btn.className = 'potion-btn';
+        btn.textContent = `${state.itemsMeta[potion.id].name} (${potion.count})`;
+        btn.addEventListener('click', () => usePotion(potion.id));
+        potionsDiv.appendChild(btn);
+      }
+    }
+  } else {
+    idleDiv.classList.remove('hidden');
+    activeDiv.classList.add('hidden');
+    const loc = state.locations.find((l) => l.id === state.player.currentLocation);
+    document.getElementById('combat-location-info').textContent = `Location: ${loc ? loc.name : '--'}`;
+
+    const listDiv = document.getElementById('combat-enemy-list');
+    listDiv.innerHTML = '';
+    if (loc && loc.combat && loc.combat.length > 0) {
+      for (const enemyId of loc.combat) {
+        const meta = state.enemiesMeta[enemyId];
+        const btn = document.createElement('button');
+        btn.className = 'enemy-btn';
+        btn.innerHTML = `<strong>${meta.name}</strong><br>${meta.maxHp} HP`;
+        btn.addEventListener('click', () => startFight(enemyId));
+        listDiv.appendChild(btn);
+      }
+    } else {
+      listDiv.innerHTML = '<p>No enemies here. Explore to find a combat area.</p>';
+    }
+
+    renderLoadoutEditor();
+    renderAbilitySidebar();
+  }
+}
+
+// Sentinel for "Clear Slot" being the selected sidebar entry — distinct from
+// null (nothing selected at all), since the loadout API itself already uses
+// abilityId: null to mean "empty this slot".
+const CLEAR_SLOT_SENTINEL = '__clear__';
+
+// The persistent loadout, editable any time the player isn't mid-fight.
+// Selection flow mirrors the Gardening tab's seed-then-click-plots pattern:
+// pick an ability once in the sidebar (renderAbilitySidebar), then click any
+// number of slots to place it — the selection stays active so filling
+// several slots with the same ability doesn't require re-selecting each
+// time.
+function renderLoadoutEditor() {
+  const row = document.getElementById('loadout-slots');
+  row.innerHTML = '';
+  state.player.abilityLoadout.forEach((abilityId, index) => {
+    const slot = document.createElement('div');
+    const ability = abilityId ? state.player.abilities.find((a) => a.id === abilityId) : null;
+    slot.className = 'ability-slot' + (ability ? '' : ' empty');
+    slot.title = ability ? ability.description : 'Empty — select an ability from the panel on the right';
+    slot.innerHTML = ability
+      ? `<span class="ability-slot-name">${ability.name}</span><span>${ability.castSeconds}s</span>`
+      : '<span>Empty</span>';
+    slot.addEventListener('click', () => placeSelectedAbility(index));
+    row.appendChild(slot);
+  });
+
+  const statusEl = document.getElementById('ability-select-status');
+  if (state.selectedAbility === CLEAR_SLOT_SENTINEL) {
+    statusEl.textContent = 'Clearing slots — click a slot to empty it, or click "Clear Slot" again to stop.';
+  } else if (state.selectedAbility) {
+    const ability = state.player.abilities.find((a) => a.id === state.selectedAbility);
+    statusEl.textContent = `Placing ${ability.name} — click a slot to assign it, or click it again in the panel to stop.`;
+  } else {
+    statusEl.textContent = '';
+  }
+}
+
+// Scrollable side panel listing every ability (locked ones included, greyed
+// out, so players can see what's coming and plan toward it) with a full
+// description — this doubles as both the "what do abilities do" reference
+// and the source you select from to fill loadout slots.
+function renderAbilitySidebar() {
+  const container = document.getElementById('ability-sidebar-list');
+  container.innerHTML = '';
+
+  const clearCard = document.createElement('div');
+  clearCard.className = 'ability-card selectable' + (state.selectedAbility === CLEAR_SLOT_SENTINEL ? ' selected' : '');
+  clearCard.innerHTML = `<h3>Clear Slot</h3><div class="card-sub">Empty out a loadout slot.</div>`;
+  clearCard.addEventListener('click', () => toggleAbilitySelection(CLEAR_SLOT_SENTINEL));
+  container.appendChild(clearCard);
+
+  for (const ability of state.player.abilities) {
+    const card = document.createElement('div');
+    if (ability.unlocked) {
+      card.className = 'ability-card selectable' + (state.selectedAbility === ability.id ? ' selected' : '');
+      card.innerHTML = `<h3>${ability.name}</h3><div class="card-sub">${ability.description}</div><div class="card-sub">Cast: ${ability.castSeconds}s &mdash; ${ability.tags.join(', ')}</div>`;
+      card.addEventListener('click', () => toggleAbilitySelection(ability.id));
+    } else {
+      card.className = 'ability-card locked';
+      card.innerHTML = `<h3>${ability.name} 🔒</h3><div class="card-sub">${ability.description}</div><div class="card-sub">Unlocks at Combat level ${ability.unlockLevel}</div>`;
+    }
+    container.appendChild(card);
+  }
+}
+
+function toggleAbilitySelection(idOrSentinel) {
+  state.selectedAbility = state.selectedAbility === idOrSentinel ? null : idOrSentinel;
+  renderAbilitySidebar();
+  renderLoadoutEditor();
+}
+
+async function placeSelectedAbility(slotIndex) {
+  if (!state.selectedAbility) return;
+  const abilityId = state.selectedAbility === CLEAR_SLOT_SENTINEL ? null : state.selectedAbility;
+  try {
+    await api('/api/loadout/set', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, slotIndex, abilityId }),
+    });
+  } catch {
+    return;
+  }
+  await refreshMe();
+}
+
+// The live rotation during a fight — same 6 boxes as the editor, but
+// read-only, with the currently-executing slot highlighted. Its fill bar is
+// animated every frame in animate() (see drawAbilitySlotFill()), not here —
+// this just rebuilds the boxes/labels on each ~2s poll.
+function renderLiveAbilitySlots(c) {
+  const row = document.getElementById('ability-slots-live');
+  row.innerHTML = '';
+  c.loadout.forEach((ability, index) => {
+    const slot = document.createElement('div');
+    slot.className = 'ability-slot live' + (ability ? '' : ' empty') + (index === c.abilityCursor ? ' current' : '');
+    slot.id = `ability-slot-${index}`;
+    slot.innerHTML = ability
+      ? `<span class="ability-slot-name">${ability.name}</span><span>${ability.castSeconds}s</span><div class="ability-slot-fill" id="ability-slot-fill-${index}"></div>`
+      : '<span>Empty</span>';
+    row.appendChild(slot);
+  });
+}
+
+async function startFight(enemyId) {
+  try {
+    await api('/api/combat/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, enemyId }),
+    });
+  } catch {
+    return;
+  }
+  await refreshMe();
+}
+
+async function endCombat() {
+  try {
+    await api('/api/combat/end', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId }),
+    });
+  } catch {
+    return;
+  }
+  await refreshMe();
+}
+
+// --- gardening tab ---
+
+// Pick-a-seed-once-then-click-many-plots flow: state.selectedSeed stays set
+// across plantings (instead of the old design that reopened a per-plot
+// modal every time) so planting a full row is one seed selection + N plot
+// clicks instead of N modal round-trips.
+function renderGardeningTab() {
+  // auto-clear the selection if the player just ran out of that seed —
+  // state.selectedSeed holds a PLANT id (e.g. 'carrot'), but inventory is
+  // keyed by the SEED item id (e.g. 'carrot_seed'), so look it up via
+  // plantsMeta rather than comparing directly against inventory ids.
+  if (state.selectedSeed) {
+    const plant = state.plantsMeta[state.selectedSeed];
+    const owned = plant && state.player.inventory.find((i) => i.id === plant.seed);
+    if (!owned || owned.count <= 0) state.selectedSeed = null;
+  }
+
+  const pickerDiv = document.getElementById('garden-seed-picker');
+  pickerDiv.innerHTML = '';
+  for (const [plantId, plant] of Object.entries(state.plantsMeta)) {
+    const owned = state.player.inventory.find((i) => i.id === plant.seed);
+    const count = owned ? owned.count : 0;
+    const btn = document.createElement('button');
+    btn.className = 'plant-option-btn';
+    btn.classList.toggle('active', state.selectedSeed === plantId);
+    btn.disabled = count <= 0;
+    btn.textContent = `${plant.name} (${count} seeds)`;
+    btn.addEventListener('click', () => {
+      state.selectedSeed = state.selectedSeed === plantId ? null : plantId;
+      renderGardeningTab();
+    });
+    pickerDiv.appendChild(btn);
+  }
+  document.getElementById('garden-seed-status').textContent = state.selectedSeed
+    ? `Planting ${state.plantsMeta[state.selectedSeed].name} — click empty plots to plant, click the seed again to stop.`
+    : 'Select a seed above, then click empty plots to plant it.';
+
+  const container = document.getElementById('garden-plots');
+  container.innerHTML = '';
+  state.player.garden.plots.forEach((plot, index) => {
+    const tile = document.createElement('div');
+    tile.className = 'garden-plot-tile';
+    if (!plot) {
+      tile.title = state.selectedSeed ? `Plot ${index + 1}: empty — click to plant` : `Plot ${index + 1}: empty — select a seed first`;
+      tile.innerHTML = `<span class="plot-label">+</span>`;
+    } else {
+      const pct = Math.round(plot.progress * 100);
+      tile.classList.toggle('ready', plot.ready);
+      tile.title = plot.ready
+        ? `${plot.plantName}: ready to harvest — click to harvest`
+        : `${plot.plantName}: ${pct}% grown`;
+      tile.innerHTML = `<div class="plot-fill" style="height:${pct}%"></div><span class="plot-label">${plot.plantName[0]}</span>`;
+    }
+    tile.addEventListener('click', () => onGardenTileClick(index, plot));
+    container.appendChild(tile);
+  });
+}
+
+function onGardenTileClick(plotIndex, plot) {
+  if (!plot) {
+    if (!state.selectedSeed) {
+      showToast('Select a seed above first.');
+      return;
+    }
+    plantSeed(plotIndex, state.selectedSeed);
+  } else if (plot.ready) {
+    harvestPlot(plotIndex);
+  } else {
+    showToast(`${plot.plantName}: ${Math.round(plot.progress * 100)}% grown`);
+  }
+}
+
+async function plantSeed(plotIndex, plantId) {
+  try {
+    await api('/api/garden/plant', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, plotIndex, plantId }),
+    });
+  } catch {
+    return;
+  }
+  await refreshMe();
+}
+
+async function harvestPlot(plotIndex) {
+  let result;
+  try {
+    result = await api('/api/garden/harvest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, plotIndex }),
+    });
+  } catch {
+    return;
+  }
+  showToast(`Harvested ${state.itemsMeta[result.yield].name}!`);
+  await refreshMe();
+}
+
+// --- crafting tab ---
+
+function ownedCount(itemId) {
+  return state.player.inventory.find((i) => i.id === itemId)?.count || 0;
+}
+
+function renderCraftingTab() {
+  const container = document.getElementById('crafting-recipes');
+  container.innerHTML = '';
+  for (const recipe of state.recipesMeta) {
+    const canCraft = Object.entries(recipe.ingredients).every(([itemId, amount]) => ownedCount(itemId) >= amount);
+    const ingredientsLine = Object.entries(recipe.ingredients)
+      .map(([itemId, amount]) => `${amount}x ${state.itemsMeta[itemId].name} (have ${ownedCount(itemId)})`)
+      .join(', ');
+    const resultMeta = state.itemsMeta[recipe.result];
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `<h3>${recipe.resultAmount}x ${resultMeta.name}</h3><div class="card-sub">Needs: ${ingredientsLine}</div><button class="craft-btn" data-craft="${recipe.id}" ${canCraft ? '' : 'disabled'}>Craft</button>`;
+    container.appendChild(card);
+  }
+  container.querySelectorAll('button[data-craft]').forEach((btn) => {
+    btn.addEventListener('click', () => craftRecipe(btn.dataset.craft));
+  });
+}
+
+async function craftRecipe(recipeId) {
+  let result;
+  try {
+    result = await api('/api/craft', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, recipeId }),
+    });
+  } catch {
+    return;
+  }
+  showToast(`Crafted ${result.resultAmount}x ${state.itemsMeta[result.result].name}!`);
+  await refreshMe();
+}
+
+// --- alchemy tab ---
+
+function ownedIngredientIds() {
+  return state.player.inventory
+    .filter((i) => state.itemsMeta[i.id] && state.itemsMeta[i.id].type === 'ingredient' && i.count > 0)
+    .map((i) => i.id);
+}
+
+function renderAlchemyTab() {
+  const selA = document.getElementById('alchemy-ingredient-a');
+  const selB = document.getElementById('alchemy-ingredient-b');
+  const owned = ownedIngredientIds();
+
+  // Rebuild options only when the owned set actually changed, so an
+  // in-progress selection doesn't get reset out from under the player on
+  // every 2s poll.
+  const optionsKey = owned.slice().sort().join(',');
+  if (selA.dataset.optionsKey !== optionsKey) {
+    const buildOptions = () =>
+      owned.map((id) => `<option value="${id}">${state.itemsMeta[id].name} (have ${ownedCount(id)})</option>`).join('');
+    selA.innerHTML = buildOptions();
+    selB.innerHTML = buildOptions();
+    selA.dataset.optionsKey = optionsKey;
+    selB.dataset.optionsKey = optionsKey;
+    if (selB.options.length > 1) selB.selectedIndex = 1;
+  } else {
+    // still refresh the "(have N)" counts shown in each option's label
+    for (const opt of selA.options) opt.textContent = `${state.itemsMeta[opt.value].name} (have ${ownedCount(opt.value)})`;
+    for (const opt of selB.options) opt.textContent = `${state.itemsMeta[opt.value].name} (have ${ownedCount(opt.value)})`;
+  }
+
+  const btn = document.getElementById('alchemy-experiment-btn');
+  const haveTwoDistinct = owned.length >= 2 && selA.value && selB.value && selA.value !== selB.value;
+  btn.disabled = !haveTwoDistinct;
+
+  document.getElementById('alchemy-tried-count').textContent = `Failed combinations tried so far: ${state.player.alchemy.triedCount}`;
+
+  const container = document.getElementById('alchemy-known-recipes');
+  container.innerHTML = '';
+  if (state.player.alchemy.knownRecipes.length === 0) {
+    container.innerHTML = '<p>No recipes discovered yet &mdash; experiment above to find some.</p>';
+  }
+  for (const recipe of state.player.alchemy.knownRecipes) {
+    const canCraft = recipe.ingredients.every((id) => ownedCount(id) >= 1);
+    const ingredientsLine = recipe.ingredients.map((id) => `${state.itemsMeta[id].name} (have ${ownedCount(id)})`).join(', ');
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `<h3>${recipe.resultName}</h3><div class="card-sub">Needs: ${ingredientsLine}</div><button class="craft-btn" data-potion-craft="${recipe.id}" ${canCraft ? '' : 'disabled'}>Craft</button>`;
+    container.appendChild(card);
+  }
+  container.querySelectorAll('button[data-potion-craft]').forEach((btn) => {
+    btn.addEventListener('click', () => craftKnownPotion(btn.dataset.potionCraft));
+  });
+}
+
+async function runExperiment() {
+  const ingredientA = document.getElementById('alchemy-ingredient-a').value;
+  const ingredientB = document.getElementById('alchemy-ingredient-b').value;
+  if (!ingredientA || !ingredientB || ingredientA === ingredientB) return;
+  let result;
+  try {
+    result = await api('/api/alchemy/experiment', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, ingredientA, ingredientB }),
+    });
+  } catch {
+    return;
+  }
+  if (result.discovered) {
+    showToast(result.newDiscovery ? `Discovered: ${result.resultName}!` : `Brewed another ${result.resultName}.`);
+  } else if (result.alreadyTried) {
+    showToast("You've already tried that combination.");
+  } else {
+    showToast('The mixture fizzles. Nothing happens.');
+  }
+  await refreshMe();
+}
+
+async function craftKnownPotion(recipeId) {
+  let result;
+  try {
+    result = await api('/api/alchemy/craft', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, recipeId }),
+    });
+  } catch {
+    return;
+  }
+  showToast(`Brewed ${result.resultName}!`);
+  await refreshMe();
+}
+
+async function usePotion(itemId) {
+  let result;
+  try {
+    result = await api('/api/potion/use', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, itemId }),
+    });
+  } catch {
+    return;
+  }
+  showToast(`Used ${state.itemsMeta[itemId].name}!`);
+  await refreshMe();
+}
+
+// --- farming tab ---
+
+function renderFarmingTab() {
+  const buyList = document.getElementById('farm-buy-list');
+  buyList.innerHTML = '';
+  for (const [speciesId, species] of Object.entries(state.animalSpeciesMeta)) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `<h3>${species.name}</h3><div class="card-sub">${species.price} gold</div><button data-buy-animal="${speciesId}">Buy</button>`;
+    buyList.appendChild(card);
+  }
+  buyList.querySelectorAll('button[data-buy-animal]').forEach((btn) => {
+    btn.addEventListener('click', () => buyAnimal(btn.dataset.buyAnimal));
+  });
+
+  const animalsList = document.getElementById('farm-animals-list');
+  animalsList.innerHTML = '';
+  if (state.player.farm.animals.length === 0) {
+    animalsList.innerHTML = '<div class="card">No animals yet — buy one above.</div>';
+    return;
+  }
+  for (const animal of state.player.farm.animals) {
+    const pct = Math.round(animal.progress * 100);
+    const statusLine = !animal.mature
+      ? `Growing: ${pct}%`
+      : animal.ready
+        ? animal.oneTime
+          ? 'Ready to butcher!'
+          : `Ready to collect ${animal.producesItemName}!`
+        : `Next ${animal.producesItemName} in progress: ${pct}%`;
+    const btnLabel = animal.oneTime ? 'Butcher' : 'Collect';
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `<h3>${animal.speciesName}</h3><div class="card-sub">${statusLine}</div><button data-collect="${animal.id}" ${animal.ready ? '' : 'disabled'}>${btnLabel}</button>`;
+    animalsList.appendChild(card);
+  }
+  animalsList.querySelectorAll('button[data-collect]').forEach((btn) => {
+    btn.addEventListener('click', () => collectAnimal(btn.dataset.collect));
+  });
+}
+
+async function buyAnimal(speciesId) {
+  try {
+    await api('/api/farm/buy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, species: speciesId }),
+    });
+  } catch {
+    return;
+  }
+  showToast(`Bought a ${state.animalSpeciesMeta[speciesId].name}!`);
+  await refreshMe();
+}
+
+async function collectAnimal(animalId) {
+  let result;
+  try {
+    result = await api('/api/farm/collect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, animalId }),
+    });
+  } catch {
+    return;
+  }
+  showToast(result.removed ? `Butchered for ${state.itemsMeta[result.item].name}!` : `Collected ${state.itemsMeta[result.item].name}!`);
+  await refreshMe();
+}
+
+// --- buildings tab ---
+
+function renderBuildingsTab() {
+  const list = document.getElementById('buildings-list');
+  list.innerHTML = '';
+  for (const [type, config] of Object.entries(state.buildingsMeta)) {
+    const built = state.player.buildings[type];
+    const card = document.createElement('div');
+    card.className = 'card';
+    if (!built) {
+      const costLine = Object.entries(config.cost)
+        .map(([itemId, amount]) => `${amount}x ${state.itemsMeta[itemId].name} (have ${ownedCount(itemId)})`)
+        .join(', ');
+      const canBuild = Object.entries(config.cost).every(([itemId, amount]) => ownedCount(itemId) >= amount);
+      card.innerHTML = `<h3>${config.name}</h3><div class="card-sub">Produces ${state.itemsMeta[config.producesItem].name} every ${config.produceIntervalSeconds}s</div><div class="card-sub">Cost: ${costLine}</div><button data-build="${type}" ${canBuild ? '' : 'disabled'}>Build</button>`;
+    } else {
+      const pct = Math.round(built.progress * 100);
+      card.innerHTML = `<h3>${built.name}</h3><div class="card-sub">${built.pendingAmount > 0 ? `${built.pendingAmount}x ${built.producesItemName} ready` : `Next ${built.producesItemName} in progress: ${pct}%`}</div><button data-collect-building="${type}" ${built.pendingAmount > 0 ? '' : 'disabled'}>Collect</button>`;
+    }
+    list.appendChild(card);
+  }
+  list.querySelectorAll('button[data-build]').forEach((btn) => {
+    btn.addEventListener('click', () => buildBuildingUI(btn.dataset.build));
+  });
+  list.querySelectorAll('button[data-collect-building]').forEach((btn) => {
+    btn.addEventListener('click', () => collectBuildingUI(btn.dataset.collectBuilding));
+  });
+}
+
+async function buildBuildingUI(buildingType) {
+  try {
+    await api('/api/building/build', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, buildingType }),
+    });
+  } catch {
+    return;
+  }
+  showToast(`Built ${state.buildingsMeta[buildingType].name}!`);
+  await refreshMe();
+}
+
+async function collectBuildingUI(buildingType) {
+  let result;
+  try {
+    result = await api('/api/building/collect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, buildingType }),
+    });
+  } catch {
+    return;
+  }
+  showToast(`Collected ${result.amount}x ${state.itemsMeta[result.item].name}!`);
+  await refreshMe();
+}
+
+// --- NPCs / dialogue / quests tab ---
+
+function renderNpcsTab() {
+  const loc = state.locations.find((l) => l.id === state.player.currentLocation);
+  document.getElementById('npc-location-info').textContent = `Location: ${loc ? loc.name : '--'}`;
+  const list = document.getElementById('npc-list');
+  list.innerHTML = '';
+  const here = state.npcsMeta.filter((n) => n.locationId === state.player.currentLocation);
+  if (here.length === 0) {
+    list.innerHTML = '<div class="card">No one here to talk to.</div>';
+    return;
+  }
+  for (const npc of here) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `<h3>${npc.name}</h3><button data-talk="${npc.id}">Talk</button>`;
+    list.appendChild(card);
+  }
+  list.querySelectorAll('button[data-talk]').forEach((btn) => {
+    btn.addEventListener('click', () => openDialogue(btn.dataset.talk));
+  });
+}
+
+function openDialogue(npcId) {
+  const npc = state.npcsMeta.find((n) => n.id === npcId);
+  state.dialogue = { npcId, nodeId: npc.dialogueTreeId };
+  document.getElementById('dialogue-npc-name').textContent = npc.name;
+  document.getElementById('dialogue-modal').classList.remove('hidden');
+  renderDialogueNode();
+}
+
+function renderDialogueNode() {
+  const node = state.dialogueTreesMeta[state.dialogue.nodeId];
+  document.getElementById('dialogue-text').textContent = node.text;
+  const optionsDiv = document.getElementById('dialogue-options');
+  optionsDiv.innerHTML = '';
+  for (const opt of node.options) {
+    const btn = document.createElement('button');
+    btn.className = 'plant-option-btn';
+    btn.textContent = opt.text;
+    btn.addEventListener('click', () => {
+      if (opt.next) {
+        state.dialogue.nodeId = opt.next;
+        renderDialogueNode();
+      } else {
+        closeDialogue();
+      }
+    });
+    optionsDiv.appendChild(btn);
+  }
+  renderDialogueQuestPanel();
+}
+
+function renderDialogueQuestPanel() {
+  const npc = state.npcsMeta.find((n) => n.id === state.dialogue.npcId);
+  const panel = document.getElementById('dialogue-quest-panel');
+  if (!npc.questId) {
+    panel.classList.add('hidden');
+    return;
+  }
+  const quest = state.questsMeta[npc.questId];
+  const completed = state.player.quests.completed.includes(npc.questId);
+  const started = state.player.quests.started.find((q) => q.id === npc.questId);
+  panel.classList.remove('hidden');
+  if (completed) {
+    panel.innerHTML = `<div class="card-sub">Quest "${quest.name}" — completed.</div>`;
+  } else if (started) {
+    panel.innerHTML =
+      `<div class="card-sub"><strong>${quest.name}</strong>: ${quest.description}</div>` +
+      (started.objectiveMet ? `<button id="quest-turnin-btn">Turn In</button>` : `<div class="card-sub">Not ready yet.</div>`);
+    if (started.objectiveMet) {
+      document.getElementById('quest-turnin-btn').addEventListener('click', () => turnInQuestUI(npc.questId));
+    }
+  } else {
+    panel.innerHTML = `<div class="card-sub"><strong>${quest.name}</strong>: ${quest.description}</div><button id="quest-accept-btn">Accept Quest</button>`;
+    document.getElementById('quest-accept-btn').addEventListener('click', () => acceptQuestUI(npc.questId));
+  }
+}
+
+function closeDialogue() {
+  document.getElementById('dialogue-modal').classList.add('hidden');
+  state.dialogue = { npcId: null, nodeId: null };
+}
+
+async function acceptQuestUI(questId) {
+  try {
+    await api('/api/quest/accept', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, questId }),
+    });
+  } catch {
+    return;
+  }
+  await refreshMe();
+  if (!document.getElementById('dialogue-modal').classList.contains('hidden')) renderDialogueQuestPanel();
+}
+
+async function turnInQuestUI(questId) {
+  let result;
+  try {
+    result = await api('/api/quest/turn-in', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, questId }),
+    });
+  } catch {
+    return;
+  }
+  showToast(`Quest complete! +${result.reward.gold || 0} gold`);
+  await refreshMe();
+  if (!document.getElementById('dialogue-modal').classList.contains('hidden')) renderDialogueQuestPanel();
+}
+
+// --- tavern tab ---
+
+function renderTavernTab() {
+  const loc = state.locations.find((l) => l.id === state.player.currentLocation);
+  const atTavern = !!(loc && loc.tavern);
+  document.getElementById('tavern-not-here').classList.toggle('hidden', atTavern);
+  document.getElementById('tavern-chat-wrap').classList.toggle('hidden', !atTavern);
+  renderTavernMessages();
+}
+
+// Built with textContent, not innerHTML/template-string interpolation —
+// username and message text are player-controlled (chosen at login / typed
+// in chat), so inserting them as raw HTML would let one player run
+// arbitrary script in every other tavern viewer's browser (e.g. a username
+// or message containing `<img src=x onerror=...>`).
+function renderTavernMessages() {
+  const div = document.getElementById('tavern-messages');
+  div.innerHTML = '';
+  for (const m of state.tavernMessages) {
+    const line = document.createElement('div');
+    line.className = 'tavern-msg';
+    const nameEl = document.createElement('strong');
+    nameEl.textContent = `${m.username}:`;
+    line.appendChild(nameEl);
+    line.appendChild(document.createTextNode(' ' + m.text));
+    div.appendChild(line);
+  }
+  div.scrollTop = div.scrollHeight;
+}
+
+// --- statistics tab ---
+
+function renderStatsTab() {
+  const p = state.player;
+  const container = document.getElementById('stats-content');
+
+  const skillCards = Object.entries(p.skills)
+    .map(([id, s]) => {
+      const name = SKILL_DISPLAY_NAMES[id] || id.charAt(0).toUpperCase() + id.slice(1);
+      return `<div class="card"><h3>${name}</h3><div class="card-sub">Level ${s.level} — ${s.xp} total xp</div></div>`;
+    })
+    .join('');
+
+  const killEntries = Object.entries(p.killCounts);
+  const killLines = killEntries.length
+    ? killEntries.map(([enemyId, count]) => `<div class="stats-summary-line">${state.enemiesMeta[enemyId] ? state.enemiesMeta[enemyId].name : enemyId}: ${count}</div>`).join('')
+    : '<div class="stats-summary-line">No kills yet.</div>';
+
+  container.innerHTML = `
+    <h3>Skills</h3>
+    <div class="card-grid">${skillCards}</div>
+
+    <h3>Combat Record</h3>
+    <div class="stats-summary-line">Wins: ${p.combatRecord.wins} &nbsp; Losses: ${p.combatRecord.losses}</div>
+    ${killLines}
+
+    <h3>Progress</h3>
+    <div class="stats-summary-line">Gold: ${ownedCount('gold')}</div>
+    <div class="stats-summary-line">Locations discovered: ${p.discoveries.length} / ${state.locations.length}</div>
+    <div class="stats-summary-line">Quests completed: ${p.quests.completed.length}</div>
+    <div class="stats-summary-line">Animals owned: ${p.farm.animals.length}</div>
+    <div class="stats-summary-line">Buildings built: ${Object.keys(p.buildings).length}</div>
+    <div class="stats-summary-line">Equipped weapon: ${p.equipment.weapon ? p.equipment.weapon.name : 'None'}</div>
+    <div class="stats-summary-line">Equipped armor: ${p.equipment.armor ? p.equipment.armor.name : 'None'}</div>
+  `;
+}
+
+// --- shop tab ---
+
+function renderShopTab() {
+  const container = document.getElementById('shop-items');
+  container.innerHTML = '';
+  for (const entry of state.shopMeta.items) {
+    const meta = state.itemsMeta[entry.id];
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `<h3>${meta.name}</h3><div class="card-sub">${entry.price} gold</div><button class="shop-item-btn" data-buy="${entry.id}">Buy</button>`;
+    container.appendChild(card);
+  }
+  container.querySelectorAll('button[data-buy]').forEach((btn) => {
+    btn.addEventListener('click', () => buyShopItem(btn.dataset.buy));
+  });
+  renderSellList();
+}
+
+async function buyShopItem(itemId) {
+  try {
+    await api('/api/shop/buy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, itemId }),
+    });
+  } catch {
+    return;
+  }
+  showToast(`Bought ${state.itemsMeta[itemId].name}!`);
+  await refreshMe();
+}
+
+function renderSellList() {
+  const container = document.getElementById('shop-sell-list');
+  container.innerHTML = '';
+  const sellable = state.player.inventory.filter((i) => state.itemsMeta[i.id] && state.itemsMeta[i.id].sellPrice);
+  if (sellable.length === 0) {
+    container.innerHTML = '<p>Nothing to sell right now.</p>';
+    return;
+  }
+  for (const entry of sellable) {
+    const meta = state.itemsMeta[entry.id];
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `<h3>${meta.name}</h3><div class="card-sub">${meta.sellPrice} gold each &mdash; have ${entry.count}</div>
+      <button data-sell="${entry.id}" data-sell-amount="1">Sell 1</button>
+      <button data-sell="${entry.id}" data-sell-amount="${entry.count}">Sell All (${entry.count})</button>`;
+    container.appendChild(card);
+  }
+  container.querySelectorAll('button[data-sell]').forEach((btn) => {
+    btn.addEventListener('click', () => sellShopItem(btn.dataset.sell, Number(btn.dataset.sellAmount)));
+  });
+}
+
+async function sellShopItem(itemId, amount) {
+  let result;
+  try {
+    result = await api('/api/shop/sell', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, itemId, amount }),
+    });
+  } catch {
+    return;
+  }
+  showToast(`Sold ${result.amount}x ${state.itemsMeta[itemId].name} for ${result.goldEarned} gold!`);
+  await refreshMe();
+}
+
+async function buyLocationReveal() {
+  let result;
+  try {
+    result = await api('/api/shop/buy-location', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId }),
+    });
+  } catch {
+    return;
+  }
+  showToast(`Revealed: ${result.location.name}!`);
+  await refreshMe();
+}
+
+let socket;
+function connectSocket() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  socket = new WebSocket(`${proto}//${location.host}`);
+  socket.addEventListener('open', () => {
+    socket.send(JSON.stringify({ type: 'identify', playerId: state.playerId }));
+  });
+  socket.addEventListener('message', (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.type === 'players') {
+      state.others = msg.players.filter((p) => p.id !== state.playerId);
+      render();
+    } else if (msg.type === 'chat') {
+      if (state.player && msg.locationId === state.player.currentLocation) {
+        state.tavernMessages.push(msg.entry);
+        if (state.tavernMessages.length > 100) state.tavernMessages.shift();
+        renderTavernMessages();
+      }
+    }
+  });
+  socket.addEventListener('close', () => {
+    setTimeout(connectSocket, 2000);
+  });
+}
+
+function onCanvasClick(e) {
+  if (state.drawMode) return; // clicks while drawing are handled by mousedown/mousemove/mouseup instead
+  if (state.wasPanning) {
+    // this click is the tail end of a pan drag, not an intentional
+    // click-to-travel — suppress it once, then go back to normal
+    state.wasPanning = false;
+    return;
+  }
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  const clickX = (e.clientX - rect.left) * scaleX;
+  const clickY = (e.clientY - rect.top) * scaleY;
+  for (const marker of state.markers) {
+    const dx = clickX - marker.x;
+    const dy = clickY - marker.y;
+    if (Math.sqrt(dx * dx + dy * dy) <= marker.r + 4) {
+      travelTo(marker.locationId);
+      return;
+    }
+  }
+}
+
+function showToast(text) {
+  const el = document.getElementById('toast');
+  el.textContent = text;
+  setTimeout(() => {
+    if (el.textContent === text) el.textContent = '';
+  }, 4000);
+}
+
+// Split out from render() because this also needs to update live, every
+// animation frame, while the player is actively dragging a route — render()
+// itself only runs on data changes (poll/websocket), which is too infrequent
+// for a smooth "distance so far" readout during a drag.
+function renderExplorationPanel() {
+  const supplies = state.player.inventory.find((i) => i.id === 'supplies');
+  const suppliesCount = supplies ? supplies.count : 0;
+  const maxRange = state.player.maxExplorationRange;
+  document.getElementById('supplies-info').textContent =
+    `Supplies: ${suppliesCount} (max range: ${maxRange.toFixed(1)})`;
+
+  const exploreBtn = document.getElementById('explore-btn');
+  const drawHint = document.getElementById('draw-hint');
+  const drawStatus = document.getElementById('draw-status');
+  const drawControls = document.getElementById('draw-controls');
+  const confirmBtn = document.getElementById('confirm-btn');
+  const hasPendingPath = state.drawPath.length >= 2 && state.drawLength > 0;
+
+  if (state.player.expedition) {
+    exploreBtn.classList.remove('hidden');
+    exploreBtn.disabled = true;
+    // Use the same smooth, fixed-anchor fraction the map's sweep line uses
+    // (not the raw server-reported fraction, which only changes once per
+    // ~300ms poll) — otherwise this text visibly jumps in chunks every poll
+    // while the line animates every frame, and the two read as wildly
+    // different speeds even though they're tracking the same underlying
+    // progress.
+    const sync = state.expeditionSync;
+    const liveFraction = sync
+      ? Math.min(1, Math.max(0, (Date.now() - sync.startedAt) / 1000 / sync.durationSeconds))
+      : state.player.expedition.fraction;
+    exploreBtn.textContent = `Expedition underway (${Math.round(liveFraction * 100)}%)`;
+    drawHint.classList.add('hidden');
+    drawStatus.classList.add('hidden');
+    drawControls.classList.add('hidden');
+  } else if (state.drawMode) {
+    exploreBtn.classList.add('hidden');
+    drawHint.classList.toggle('hidden', hasPendingPath || state.isDrawing);
+    drawStatus.classList.remove('hidden');
+    const unitPerSupply = suppliesCount > 0 ? maxRange / suppliesCount : 0;
+    const suppliesCost = state.drawLength > 0 ? Math.max(1, Math.ceil(state.drawLength / unitPerSupply)) : 0;
+    drawStatus.textContent = `Route: ${state.drawLength.toFixed(1)} / ${maxRange.toFixed(1)}  —  Supplies to use: ${suppliesCost} / ${suppliesCount}`;
+    // Cancel must stay reachable the entire time draw mode is active (not
+    // just once a path exists) — without this, a player who clicks Explore
+    // and then doesn't draw anything has no visible way back out at all,
+    // since the Explore button itself is hidden for the whole time
+    // draw-mode is on. Confirm only makes sense once there's an actual path.
+    drawControls.classList.toggle('hidden', state.isDrawing);
+    confirmBtn.classList.toggle('hidden', !hasPendingPath);
+  } else {
+    exploreBtn.classList.remove('hidden');
+    exploreBtn.disabled = suppliesCount <= 0;
+    exploreBtn.textContent = suppliesCount <= 0 ? 'Need Supplies to Explore' : 'Explore';
+    drawHint.classList.add('hidden');
+    drawStatus.classList.add('hidden');
+    drawControls.classList.add('hidden');
+  }
+}
+
+function render() {
+  if (!state.player) return;
+
+  const gold = state.player.inventory.find((i) => i.id === 'gold');
+  document.getElementById('gold-display').textContent = `Gold: ${gold ? gold.count : 0}`;
+
+  // sidebar: current location
+  const currentLoc = state.locations.find((l) => l.id === state.player.currentLocation);
+  document.getElementById('current-location').textContent = `Location: ${currentLoc ? currentLoc.name : '--'}`;
+
+  renderExplorationPanel();
+  renderMiningTab();
+  renderCharacterTab();
+  updateSkillsTab();
+  renderInventoryTab();
+  renderEquipmentTab();
+  renderCombatTab();
+  renderGardeningTab();
+  renderFarmingTab();
+  renderCraftingTab();
+  renderAlchemyTab();
+  renderBuildingsTab();
+  renderNpcsTab();
+  renderTavernTab();
+  renderShopTab();
+  renderStatsTab();
+
+  // sidebar: other players
+  const list = document.getElementById('players-list');
+  list.innerHTML = '';
+  if (state.others.length === 0) {
+    const li = document.createElement('li');
+    li.textContent = 'No one else around.';
+    list.appendChild(li);
+  } else {
+    for (const other of state.others) {
+      const loc = state.locations.find((l) => l.id === other.locationId);
+      const li = document.createElement('li');
+      li.textContent = `${other.username} — ${loc ? loc.name : 'unknown'}`;
+      list.appendChild(li);
+    }
+  }
+}
+
+function drawMap() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#24382c';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  state.markers = [];
+
+  const discovered = state.locations.filter((l) => state.player.discoveries.includes(l.id));
+
+  for (const loc of discovered) {
+    const { x, y } = percentToPixel(loc.x, loc.y);
+    const isCurrent = loc.id === state.player.currentLocation;
+    const radius = 10;
+
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.fillStyle = isCurrent ? '#d8b04a' : loc.combat ? '#b3543f' : '#e8ddc7';
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#14110f';
+    ctx.stroke();
+
+    ctx.fillStyle = '#e8ddc7';
+    ctx.font = '14px Georgia, serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(loc.name, x, y - radius - 8);
+
+    state.markers.push({ x, y, r: radius, locationId: loc.id });
+  }
+
+  // other players, offset by index so multiple at the same spot don't fully overlap
+  const grouped = {};
+  for (const other of state.others) {
+    grouped[other.locationId] = grouped[other.locationId] || [];
+    grouped[other.locationId].push(other);
+  }
+  for (const [locationId, players] of Object.entries(grouped)) {
+    const loc = state.locations.find((l) => l.id === locationId);
+    if (!loc) continue;
+    const { x: baseX, y: baseY } = percentToPixel(loc.x, loc.y);
+    players.forEach((p, i) => {
+      const ox = baseX + 18 + (i % 3) * 14;
+      const oy = baseY + 14 + Math.floor(i / 3) * 14;
+      ctx.beginPath();
+      ctx.arc(ox, oy, 5, 0, Math.PI * 2);
+      ctx.fillStyle = '#7fae5a';
+      ctx.fill();
+      ctx.font = '11px Georgia, serif';
+      ctx.fillStyle = '#c9bfa7';
+      ctx.textAlign = 'left';
+      ctx.fillText(p.username, ox + 8, oy + 4);
+    });
+  }
+
+  drawExpedition();
+  drawInProgressPath();
+}
+
+// The full committed route, drawn faint, plus a brighter overlay that
+// sweeps along it as the expedition progresses — same "reveals locations
+// without pausing" idea as the mining clock, just along a path instead of
+// in a circle. Computed every frame straight from the expedition's fixed
+// startedAt/durationSeconds (set once in refreshMe(), not re-derived from
+// each poll) so it's a smooth, drift-free sweep regardless of poll timing.
+function drawExpedition() {
+  const sync = state.expeditionSync;
+  if (!sync) return;
+
+  const fraction = Math.min(1, Math.max(0, (Date.now() - sync.startedAt) / 1000 / sync.durationSeconds));
+
+  const pixelPath = sync.path.map((p) => percentToPixel(p.x, p.y));
+
+  ctx.beginPath();
+  ctx.moveTo(pixelPath[0].x, pixelPath[0].y);
+  for (const p of pixelPath.slice(1)) ctx.lineTo(p.x, p.y);
+  ctx.strokeStyle = 'rgba(216, 176, 74, 0.35)';
+  ctx.lineWidth = 3;
+  ctx.setLineDash([6, 6]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // targetLength/sync.totalLength are in percent-space units (matching
+  // sync.path's coordinates), so segment lengths must be measured in that
+  // same space too — measuring them in pixel-space instead (10-16x larger
+  // per unit) made the very first segment blow past the target almost
+  // immediately, stopping the visible sweep within its first few percent
+  // regardless of the true fraction. Pixel coordinates are only used for
+  // where to actually draw, not for measuring distance.
+  const targetLength = sync.totalLength * fraction;
+  let coveredLength = 0;
+  ctx.beginPath();
+  ctx.moveTo(pixelPath[0].x, pixelPath[0].y);
+  for (let i = 1; i < sync.path.length; i++) {
+    const aPct = sync.path[i - 1];
+    const bPct = sync.path[i];
+    const aPixel = pixelPath[i - 1];
+    const bPixel = pixelPath[i];
+    const segLength = Math.hypot(bPct.x - aPct.x, bPct.y - aPct.y);
+    if (coveredLength + segLength <= targetLength || sync.totalLength === 0) {
+      ctx.lineTo(bPixel.x, bPixel.y);
+      coveredLength += segLength;
+    } else {
+      const remaining = Math.max(0, targetLength - coveredLength);
+      const ratio = segLength > 0 ? remaining / segLength : 0;
+      ctx.lineTo(aPixel.x + (bPixel.x - aPixel.x) * ratio, aPixel.y + (bPixel.y - aPixel.y) * ratio);
+      break;
+    }
+  }
+  ctx.strokeStyle = '#ffd75e';
+  ctx.lineWidth = 3;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+}
+
+function drawInProgressPath() {
+  if (!state.drawMode || state.drawPath.length < 2) return;
+  const pixelPath = state.drawPath.map((p) => percentToPixel(p.x, p.y));
+  ctx.beginPath();
+  ctx.moveTo(pixelPath[0].x, pixelPath[0].y);
+  for (const p of pixelPath.slice(1)) ctx.lineTo(p.x, p.y);
+  ctx.strokeStyle = '#ffd75e';
+  ctx.lineWidth = 3;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+}
+
+// One item takes a few seconds — draw that as a clock-style pie fill
+// (starts at 12 o'clock, sweeps clockwise) so progress toward the next
+// item is visible in real time, not just on the ~2s server poll. Reused
+// for skill tasks (mining/woodcutting/fishing) and for combat attack timers.
+function drawClock(clockCtx, size, fraction) {
+  const cx = size / 2;
+  const cy = size / 2;
+  const r = size / 2 - 4;
+  clockCtx.clearRect(0, 0, size, size);
+
+  clockCtx.beginPath();
+  clockCtx.arc(cx, cy, r, 0, Math.PI * 2);
+  clockCtx.fillStyle = '#33291d';
+  clockCtx.fill();
+  clockCtx.strokeStyle = '#4a4030';
+  clockCtx.lineWidth = 2;
+  clockCtx.stroke();
+
+  if (fraction > 0) {
+    const start = -Math.PI / 2;
+    const end = start + fraction * Math.PI * 2;
+    clockCtx.beginPath();
+    clockCtx.moveTo(cx, cy);
+    clockCtx.arc(cx, cy, r, start, end);
+    clockCtx.closePath();
+    clockCtx.fillStyle = '#7fae5a';
+    clockCtx.fill();
+  }
+}
+
+// The arena: player dot fixed at center, enemy dot (red) positioned straight
+// up from center at a radius scaled from c.distance (0 = adjacent,
+// maxDistance = as far as Quick Step can push it). A dashed ring marks the
+// melee-range boundary so it's visually obvious when a melee ability would
+// whiff.
+function drawArena(c) {
+  const canvas = document.getElementById('arena-canvas');
+  if (!canvas) return;
+  const actx = canvas.getContext('2d');
+  const size = canvas.width;
+  const cx = size / 2;
+  const cy = size / 2;
+  const maxR = size / 2 - 20;
+  actx.clearRect(0, 0, size, size);
+
+  const meleeR = (c.meleeRange / c.maxDistance) * maxR;
+  actx.beginPath();
+  actx.arc(cx, cy, meleeR, 0, Math.PI * 2);
+  actx.strokeStyle = 'rgba(216, 176, 74, 0.35)';
+  actx.lineWidth = 1;
+  actx.setLineDash([4, 4]);
+  actx.stroke();
+  actx.setLineDash([]);
+
+  const enemyR = Math.min(maxR, (c.distance / c.maxDistance) * maxR);
+  const ex = cx;
+  const ey = cy - enemyR;
+
+  actx.beginPath();
+  actx.moveTo(cx, cy);
+  actx.lineTo(ex, ey);
+  actx.strokeStyle = 'rgba(216, 176, 74, 0.25)';
+  actx.lineWidth = 1;
+  actx.stroke();
+
+  actx.beginPath();
+  actx.arc(cx, cy, 10, 0, Math.PI * 2);
+  actx.fillStyle = '#d8b04a';
+  actx.fill();
+  actx.strokeStyle = '#fff3c9';
+  actx.lineWidth = 2;
+  actx.stroke();
+
+  actx.beginPath();
+  actx.arc(ex, ey, 12, 0, Math.PI * 2);
+  actx.fillStyle = '#c0392b';
+  actx.fill();
+  actx.strokeStyle = '#ffb3a1';
+  actx.lineWidth = 2;
+  actx.stroke();
+}
+
+// Animates the currently-executing ability slot's fill bar between polls,
+// same fixed-anchor extrapolation trick as the mining/gather clocks:
+// server sends currentAbilityStartedAt + currentAbilityCastSeconds once,
+// client recomputes the fraction fresh every frame from real elapsed time.
+function updateAbilitySlotFill(c) {
+  if (c.abilityCursor < 0 || c.abilityCursor > 5) return;
+  const fillEl = document.getElementById(`ability-slot-fill-${c.abilityCursor}`);
+  if (!fillEl || !c.currentAbilityStartedAt || !c.currentAbilityCastSeconds) return;
+  const elapsed = (Date.now() - c.currentAbilityStartedAt) / 1000;
+  const fraction = Math.min(1, Math.max(0, elapsed / c.currentAbilityCastSeconds));
+  fillEl.style.width = `${fraction * 100}%`;
+}
+
+function animate() {
+  // A single bad frame must never permanently kill the loop — without this,
+  // one exception here would silently freeze the whole map/clocks forever,
+  // which would look exactly like "nothing renders" with no error visible.
+  try {
+    if (state.player) {
+      for (const skillId of Object.keys(state.player.skills)) {
+        const sync = state.clockSync[skillId];
+        const clockCanvas = document.getElementById(`${skillId}-clock`);
+        if (!sync || !clockCanvas) continue;
+
+        let progress = sync.progressSeconds;
+        if (sync.active) {
+          progress += (Date.now() - sync.syncedAt) / 1000;
+          progress %= sync.cycleSeconds;
+        }
+        const fraction = sync.cycleSeconds > 0 ? progress / sync.cycleSeconds : 0;
+        drawClock(clockCanvas.getContext('2d'), clockCanvas.width, fraction);
+      }
+
+      if (state.player.combat && !state.player.combat.result) {
+        drawArena(state.player.combat);
+        updateAbilitySlotFill(state.player.combat);
+      }
+
+      drawMap();
+
+      if (state.drawMode || state.player.expedition) {
+        renderExplorationPanel();
+      }
+    }
+  } catch (err) {
+    console.error('[animate] frame error (recovered):', err);
+  }
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+
+// Dev/testing console commands — type dev.help() in devtools. Not gated
+// behind anything since this is a solo/local prototype; remove or lock
+// down before any public launch.
+window.dev = {
+  async give(itemId, amount = 1) {
+    const r = await api('/api/dev/give', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, itemId, amount }),
+    });
+    await refreshMe();
+    console.log(`[dev] ${itemId} -> ${r.count}`);
+    return r;
+  },
+  async discover(locationId) {
+    const r = await api('/api/dev/discover', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, locationId }),
+    });
+    await refreshMe();
+    console.log(`[dev] discovered ${locationId}`);
+    return r;
+  },
+  async setXp(skillId, xp) {
+    const r = await api('/api/dev/set-xp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, skillId, xp }),
+    });
+    await refreshMe();
+    console.log(`[dev] ${skillId} xp -> ${r.xp}`);
+    return r;
+  },
+  locations() {
+    console.table(
+      state.locations.map((l) => ({
+        id: l.id,
+        name: l.name,
+        skill: l.skill || '',
+        combat: l.combat ? l.combat.join(',') : '',
+        discovered: state.player.discoveries.includes(l.id),
+      }))
+    );
+  },
+  async reset() {
+    await api('/api/dev/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId }),
+    });
+    await refreshMe();
+    console.log('[dev] account reset to a fresh character (same login) — discoveries, inventory, equipment, garden, skills all cleared');
+  },
+  help() {
+    console.log(
+      `Dev commands:\n` +
+        `  dev.give(itemId, amount)   e.g. dev.give('gold', 100), dev.give('rusty_sword', 1)\n` +
+        `  dev.discover(locationId)   e.g. dev.discover('ironbrook_mine')\n` +
+        `  dev.setXp(skillId, xp)     e.g. dev.setXp('mining', 500)\n` +
+        `  dev.locations()            list all location ids/names/discovered status/skill/combat\n` +
+        `  dev.reset()                wipe THIS character back to fresh (discoveries/inventory/equipment/garden/skills) — for repeat-testing exploration etc.`
+    );
+  },
+};
+console.log('%cDev commands available — type dev.help() in this console.', 'color:#d8b04a;font-weight:bold;');
+
+if (state.playerId) {
+  fetch(`/api/me?playerId=${state.playerId}`)
+    .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))))
+    .then((player) => {
+      state.player = player;
+      enterGame();
+    })
+    .catch((err) => {
+      if (err instanceof TypeError) {
+        // network error (server unreachable) — keep the saved session, just warn
+        showError('Cannot reach the server. Is `npm start` still running?');
+        return;
+      }
+      // server reachable but this playerId is no longer valid
+      localStorage.removeItem('mmo_playerId');
+      state.playerId = null;
+    });
+}

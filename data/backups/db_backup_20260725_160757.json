@@ -1,0 +1,154 @@
+{
+  "players": {
+    "p_mrvdbu68xlui": {
+      "id": "p_mrvdbu68xlui",
+      "username": "smile",
+      "createdAt": 1784681571968,
+      "currentLocation": "wanderers_camp",
+      "discoveries": [
+        "wanderers_camp",
+        "vintermere_keep"
+      ],
+      "inventory": {
+        "supplies": 0,
+        "gold": 0,
+        "carrot_crop": 81,
+        "wheat_seed": 85,
+        "carrot_seed": 83,
+        "potato_seed": 69,
+        "moonleaf": 82,
+        "potato_crop": 63,
+        "sunpetal": 77,
+        "wheat_crop": 72
+      },
+      "skills": {
+        "mining": {
+          "xp": 0,
+          "progressSeconds": 0,
+          "taskStartedAt": null,
+          "lastTick": null,
+          "activeNode": null
+        },
+        "woodcutting": {
+          "xp": 0,
+          "progressSeconds": 0,
+          "taskStartedAt": null,
+          "lastTick": null
+        },
+        "fishing": {
+          "xp": 0,
+          "progressSeconds": 0,
+          "taskStartedAt": null,
+          "lastTick": null
+        },
+        "combat": {
+          "xp": 0
+        },
+        "hunting": {
+          "xp": 0,
+          "progressSeconds": 0,
+          "taskStartedAt": null,
+          "lastTick": null
+        },
+        "scavenging": {
+          "xp": 0,
+          "progressSeconds": 0,
+          "taskStartedAt": null,
+          "lastTick": null
+        },
+        "harvesting": {
+          "xp": 3672,
+          "progressSeconds": 1.6580000000000048,
+          "taskStartedAt": 1784939851751,
+          "lastTick": 1784957556681
+        }
+      },
+      "equipment": {
+        "weapon": null,
+        "armor": null
+      },
+      "combat": null,
+      "garden": {
+        "plots": [
+          {
+            "plantId": "wheat",
+            "plantedAt": 1784939839337
+          },
+          {
+            "plantId": "wheat",
+            "plantedAt": 1784939839535
+          },
+          {
+            "plantId": "wheat",
+            "plantedAt": 1784939839909
+          },
+          {
+            "plantId": "wheat",
+            "plantedAt": 1784939840155
+          },
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "expedition": null,
+      "farm": {
+        "animals": []
+      },
+      "buildings": {},
+      "quests": {
+        "started": [],
+        "completed": []
+      },
+      "killCounts": {},
+      "combatRecord": {
+        "wins": 0,
+        "losses": 0
+      },
+      "lastLookAroundAt": null,
+      "lastRareEvent": null,
+      "alchemy": {
+        "knownRecipes": [],
+        "triedCombos": []
+      },
+      "abilityLoadout": [
+        "punch",
+        "swing",
+        "swing",
+        "quick_step",
+        "swing",
+        "swing"
+      ],
+      "traits": {
+        "strength": 5,
+        "dexterity": 5,
+        "luck": 5,
+        "vigor": 5
+      },
+      "characterXp": 50,
+      "traitPointsAvailable": 0,
+      "perkPoints": 0,
+      "perks": []
+    }
+  },
+  "usernames": {
+    "smile": "p_mrvdbu68xlui"
+  }
+}
