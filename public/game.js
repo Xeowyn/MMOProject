@@ -47,6 +47,7 @@ const state = {
   isPanning: false,
   panStart: null, // { clientX, clientY, camX, camY }
   wasPanning: false, // suppresses the click-to-travel handler right after a pan drag
+  pinch: null, // { startDist, startZoom } while a two-finger touch gesture is active
 };
 
 const CAMERA_MAX_ZOOM = 20;
@@ -302,6 +303,15 @@ async function enterGame() {
   canvas.addEventListener('mousemove', onCanvasMouseMove);
   window.addEventListener('mouseup', onCanvasMouseUp);
   canvas.addEventListener('wheel', onCanvasWheel, { passive: false });
+  // touch: { passive: false } so preventDefault() can actually stop the page
+  // from scrolling/zooming while a finger is on the map. Unlike mouse events,
+  // touchend keeps firing on the element a touch started on even if the
+  // finger drifts elsewhere first, so (unlike mouseup) canvas itself is the
+  // right place to listen, not window.
+  canvas.addEventListener('touchstart', onCanvasTouchStart, { passive: false });
+  canvas.addEventListener('touchmove', onCanvasTouchMove, { passive: false });
+  canvas.addEventListener('touchend', onCanvasTouchEnd, { passive: false });
+  canvas.addEventListener('touchcancel', onCanvasTouchEnd, { passive: false });
   document.getElementById('zoom-in-btn').addEventListener('click', () => zoomCamera(1.5));
   document.getElementById('zoom-out-btn').addEventListener('click', () => zoomCamera(1 / 1.5));
   document.getElementById('center-btn').addEventListener('click', centerCameraOnPlayer);
@@ -535,31 +545,35 @@ function onCanvasWheel(e) {
   zoomCamera(e.deltaY < 0 ? 1.15 : 1 / 1.15);
 }
 
-function onCanvasMouseDown(e) {
+// clientX/clientY-based versions of the pointer-down/move/up logic, shared
+// between mouse events and single-finger touch events (a finger and a mouse
+// cursor are the same "one point moving across the canvas" input as far as
+// pan/draw/tap care — only how the coordinates are read differs).
+function handlePointerDown(clientX, clientY) {
   if (!state.drawMode) {
     state.isPanning = true;
     state.wasPanning = false;
-    state.panStart = { clientX: e.clientX, clientY: e.clientY, camX: state.camera.x, camY: state.camera.y };
+    state.panStart = { clientX, clientY, camX: state.camera.x, camY: state.camera.y };
     return;
   }
   const currentLoc = state.locations.find((l) => l.id === state.player.currentLocation);
   if (!currentLoc) {
-    console.warn('[explore] mousedown: could not find current location', state.player.currentLocation);
+    console.warn('[explore] pointerdown: could not find current location', state.player.currentLocation);
     return;
   }
-  console.log('[explore] mousedown — starting path at', currentLoc.name);
+  console.log('[explore] pointerdown — starting path at', currentLoc.name);
   state.isDrawing = true;
   state.drawPath = [{ x: currentLoc.x, y: currentLoc.y }];
   state.drawLength = 0;
   render();
 }
 
-function onCanvasMouseMove(e) {
+function handlePointerMove(clientX, clientY) {
   if (!state.drawMode) {
     if (!state.isPanning) return;
     const rect = canvas.getBoundingClientRect();
-    const dxPixel = e.clientX - state.panStart.clientX;
-    const dyPixel = e.clientY - state.panStart.clientY;
+    const dxPixel = clientX - state.panStart.clientX;
+    const dyPixel = clientY - state.panStart.clientY;
     if (Math.hypot(dxPixel, dyPixel) > 3) state.wasPanning = true;
     const viewSize = 100 / state.camera.zoom;
     const dxPercent = (dxPixel / rect.width) * viewSize;
@@ -573,8 +587,8 @@ function onCanvasMouseMove(e) {
   const rect = canvas.getBoundingClientRect();
   const scaleX = canvas.width / rect.width;
   const scaleY = canvas.height / rect.height;
-  const px = (e.clientX - rect.left) * scaleX;
-  const py = (e.clientY - rect.top) * scaleY;
+  const px = (clientX - rect.left) * scaleX;
+  const py = (clientY - rect.top) * scaleY;
   const point = pixelToPercent(px, py);
 
   const last = state.drawPath[state.drawPath.length - 1];
@@ -596,10 +610,10 @@ function onCanvasMouseMove(e) {
   state.drawLength += segLength;
 }
 
-// Releasing the mouse just stops the drag — the drawn route stays on
+// Releasing the pointer just stops the drag — the drawn route stays on
 // screen until the player explicitly confirms or cancels it, so there's
 // no window where the line silently disappears before anything happens.
-function onCanvasMouseUp() {
+function handlePointerUp() {
   if (state.isPanning) {
     state.isPanning = false;
   }
@@ -607,13 +621,83 @@ function onCanvasMouseUp() {
     return;
   }
   state.isDrawing = false;
-  console.log('[explore] mouseup — path points:', state.drawPath.length, 'length:', state.drawLength.toFixed(2));
+  console.log('[explore] pointerup — path points:', state.drawPath.length, 'length:', state.drawLength.toFixed(2));
   if (state.drawPath.length < 2 || state.drawLength <= 0) {
-    console.log('[explore] path too short, discarding (normal for a click with no drag)');
+    console.log('[explore] path too short, discarding (normal for a tap/click with no drag)');
     state.drawPath = [];
     state.drawLength = 0;
   }
   render();
+}
+
+function onCanvasMouseDown(e) {
+  handlePointerDown(e.clientX, e.clientY);
+}
+
+function onCanvasMouseMove(e) {
+  handlePointerMove(e.clientX, e.clientY);
+}
+
+function onCanvasMouseUp() {
+  handlePointerUp();
+}
+
+// --- touch support: single finger = pan/draw/tap (same as a mouse), two
+// fingers = pinch-to-zoom. preventDefault() throughout stops the page from
+// scrolling/zooming natively while the player is interacting with the map,
+// and (critically) suppresses the browser's own synthetic click it would
+// otherwise fire after touchend — without that suppression, a tap would
+// travel to a location twice, or start a draw path and then immediately
+// misfire a click on top of it.
+function touchDistance(t0, t1) {
+  return Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
+}
+
+function onCanvasTouchStart(e) {
+  e.preventDefault();
+  if (e.touches.length === 2) {
+    // switching to a pinch gesture always wins over an in-progress
+    // pan/draw from whatever the first finger was doing
+    state.isPanning = false;
+    state.isDrawing = false;
+    state.pinch = { startDist: touchDistance(e.touches[0], e.touches[1]), startZoom: state.camera.zoom };
+    return;
+  }
+  if (e.touches.length === 1) {
+    state.pinch = null;
+    const t = e.touches[0];
+    handlePointerDown(t.clientX, t.clientY);
+  }
+}
+
+function onCanvasTouchMove(e) {
+  e.preventDefault();
+  if (state.pinch && e.touches.length === 2) {
+    const dist = touchDistance(e.touches[0], e.touches[1]);
+    const ratio = dist / state.pinch.startDist;
+    state.camera.zoom = Math.min(CAMERA_MAX_ZOOM, Math.max(1, state.pinch.startZoom * ratio));
+    return;
+  }
+  if (e.touches.length === 1) {
+    const t = e.touches[0];
+    handlePointerMove(t.clientX, t.clientY);
+  }
+}
+
+function onCanvasTouchEnd(e) {
+  e.preventDefault();
+  if (e.touches.length > 0) return; // still at least one finger down (e.g. lifting one of two) — not done yet
+  const wasPinching = !!state.pinch;
+  state.pinch = null;
+  handlePointerUp();
+  // A genuine tap-to-travel: not the end of a pinch, and not the end of a
+  // real drag (handlePointerUp already turned a drag past the 3px
+  // threshold into state.wasPanning; handlePointerClick itself already
+  // skips this while in draw mode, matching the mouse 'click' behavior).
+  if (!wasPinching && !state.wasPanning) {
+    const t = e.changedTouches[0];
+    if (t) handlePointerClick(t.clientX, t.clientY);
+  }
 }
 
 function cancelDrawnPath() {
@@ -1862,8 +1946,11 @@ function connectSocket() {
   });
 }
 
-function onCanvasClick(e) {
-  if (state.drawMode) return; // clicks while drawing are handled by mousedown/mousemove/mouseup instead
+// clientX/clientY-based (not the raw event) so touch handlers can share this
+// exact logic — a tap is just a click with coordinates read from
+// changedTouches instead of the event itself.
+function handlePointerClick(clientX, clientY) {
+  if (state.drawMode) return; // clicks while drawing are handled by the down/move/up flow instead
   if (state.wasPanning) {
     // this click is the tail end of a pan drag, not an intentional
     // click-to-travel — suppress it once, then go back to normal
@@ -1873,8 +1960,8 @@ function onCanvasClick(e) {
   const rect = canvas.getBoundingClientRect();
   const scaleX = canvas.width / rect.width;
   const scaleY = canvas.height / rect.height;
-  const clickX = (e.clientX - rect.left) * scaleX;
-  const clickY = (e.clientY - rect.top) * scaleY;
+  const clickX = (clientX - rect.left) * scaleX;
+  const clickY = (clientY - rect.top) * scaleY;
   for (const marker of state.markers) {
     const dx = clickX - marker.x;
     const dy = clickY - marker.y;
@@ -1883,6 +1970,10 @@ function onCanvasClick(e) {
       return;
     }
   }
+}
+
+function onCanvasClick(e) {
+  handlePointerClick(e.clientX, e.clientY);
 }
 
 function showToast(text) {

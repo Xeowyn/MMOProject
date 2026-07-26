@@ -64,6 +64,9 @@ h1, h2, h3, .tab-btn, button {
 
 #login-form {
   display: flex;
+  flex-wrap: wrap; /* two inputs + a button don't fit one row on a phone-width
+                       screen — wrap instead of overflowing horizontally */
+  justify-content: center;
   gap: 10px;
 }
 
@@ -78,6 +81,7 @@ input {
   background: #1f1b17;
   color: #e8ddc7;
   width: 220px;
+  max-width: 100%;
   font-family: 'Spectral', Georgia, serif;
 }
 
@@ -269,6 +273,9 @@ main {
   background: #24382c;
   border: 2px solid #4a4030;
   cursor: grab;
+  touch-action: none; /* all panning/drawing/pinch-zoom is handled by our own
+                          touch listeners — without this, the browser's own
+                          native scroll/zoom gestures fight with them */
 }
 
 #map-canvas:active {
@@ -537,6 +544,8 @@ main {
   background: radial-gradient(circle, #241c14 0%, #1a140d 100%);
   border: 2px solid #4a4030;
   border-radius: 50%;
+  max-width: 100%;
+  height: auto;
 }
 
 .arena-combatant {
@@ -1141,4 +1150,54 @@ main {
 
 .perk-locked {
   opacity: 0.5;
+}
+
+/* --- mobile / narrow-viewport layout ---
+   Everything above already degrades gracefully on its own (card-grids use
+   auto-fill minmax so column count shrinks for free, the map/arena canvases
+   scale via max-width:100%). What doesn't shrink on its own is anything
+   built as a fixed-width flex row — those need to explicitly become a
+   stacked column below a phone-ish breakpoint instead. */
+@media (max-width: 760px) {
+  #tab-overworld {
+    flex-direction: column;
+  }
+
+  #map-wrap {
+    flex: 1 1 auto;
+    min-height: 0; /* lets it actually shrink inside the flex column instead of pushing the sidebar off */
+  }
+
+  #sidebar {
+    width: 100%;
+    max-height: 42vh;
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
+
+  #combat-idle {
+    flex-direction: column;
+  }
+
+  #ability-sidebar {
+    width: 100%;
+    max-height: 40vh;
+  }
+
+  .tab-btn, .tab-btn:disabled {
+    padding: 10px 14px;
+    font-size: 0.85em;
+  }
+
+  #tab-skills, #tab-combat, #tab-inventory, #tab-equipment, #tab-gardening, #tab-shop,
+  #tab-farming, #tab-crafting, #tab-buildings, #tab-npcs, #tab-tavern, #tab-stats,
+  #tab-mining, #tab-character {
+    padding: 14px;
+  }
+
+  #topbar {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 14px;
+  }
 }
