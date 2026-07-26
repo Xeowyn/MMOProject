@@ -28,10 +28,21 @@ you restart it, you'll get a **different** URL — re-share it with everyone.
 - Your own existing account has no password and doesn't need one — it'll log
   in exactly like it always has.
 
-## 3. Known rough edges (deliberate, not bugs)
-- **Mobile isn't polished.** The map-drawing exploration mechanic is
-  mouse-drag based, not touch-friendly. Fine to try on a phone, but tell
-  friends a laptop/desktop will feel much better.
+## 3. Mobile
+Fully supported now — tested with real touch-event simulation in a mobile
+viewport (390x844, iPhone-sized) before shipping, not just guessed at:
+- One-finger drag pans the map and draws an exploration route (same as
+  mouse-drag on desktop); a tap travels to a discovered location.
+- Two-finger pinch zooms the map in/out (the +/− buttons still work too).
+- The Overworld and Combat tabs (the two screens with a side-by-side desktop
+  layout) stack vertically on narrow screens instead of squeezing a 300px
+  panel next to nothing. Card-grid tabs (Shop, Crafting, Gardening, etc.)
+  already collapsed to fewer columns on their own.
+- Verified no horizontal overflow/clipping on login, character creation, the
+  map, Combat, Shop, or Gardening at phone width, and confirmed desktop layout
+  (row-based, mouse drag-to-pan) is completely unaffected by these changes.
+
+## 4. Known rough edges (deliberate, not bugs)
 - **Everyone shares one save file** (`data/db.json`) on your PC. That's by
   design for this test — there's no separate server, your machine *is* the
   server.
@@ -40,7 +51,7 @@ you restart it, you'll get a **different** URL — re-share it with everyone.
   memory for the full history if curious. Tonight's pass focused specifically
   on what a *remote* internet-facing test needed that wasn't addressed yet.
 
-## 4. If something goes wrong
+## 5. If something goes wrong
 - **"Cannot reach the server" banner in-game**: the Server window probably
   closed or crashed. Check that window for an error, restart it if needed.
 - **Friends suddenly can't connect / link stops working**: check the Tunnel
@@ -51,7 +62,7 @@ you restart it, you'll get a **different** URL — re-share it with everyone.
   without going down (this was deliberately stress-tested), but if the whole
   Server window does die, just re-run `start-playtest.bat`.
 
-## 5. Safety nets now in place
+## 6. Safety nets now in place
 - The project is now a **git repository** (`git log` in the project folder
   shows the history) — if a future change ever breaks something, it can be
   rolled back instead of lost.
