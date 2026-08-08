@@ -60,11 +60,16 @@ const PERKS = {
 // --- mining nodes (Melvor-Idle-style skill grid) ---
 // Mining is decoupled from the overworld map entirely — once a node's
 // linked location has been discovered, it's minable from the Mining tab
-// regardless of where the player currently is (see tickMining()/
-// startMiningNode()). Nodes are ordered so lesser ores sit near the
-// starting location (Wanderer's Camp, 50/50) and rarer ores farther out —
-// see the distance comment on each entry.
+// regardless of where the player currently is (see tickResourceTask()/
+// startResourceTask() in the unified resource-node engine below). Nodes are
+// ordered so lesser ores sit near the starting location (Wanderer's Camp,
+// 50/50) and rarer ores farther out — see the distance comment on each entry.
 const MINING_NODES = {
+  // always unlocked (linked to the starting location, which every player
+  // discovers on character creation) — see RESOURCE_NODES/discoverLocation.
+  // Deliberately the weakest node in the registry so the real ore veins
+  // discovered further out stay worth traveling for.
+  stone: { name: 'Loose Rocks', item: 'stone', locationId: 'wanderers_camp', tier: 1, cycleSeconds: 2, xpPerItem: 2 },
   copper: { name: 'Copper Vein', item: 'copper_ore', locationId: 'wyrmwood_hold', tier: 1, cycleSeconds: 2.5, xpPerItem: 4 }, // dist ~10.7
   tin: { name: 'Tin Vein', item: 'tin_ore', locationId: 'moonshade_reach', tier: 1, cycleSeconds: 2.5, xpPerItem: 4 }, // dist ~13.3
   coal: { name: 'Coal Seam', item: 'coal', locationId: 'duskhollow_crossing', tier: 2, cycleSeconds: 3.5, xpPerItem: 8 }, // dist ~13.9
@@ -74,13 +79,20 @@ const MINING_NODES = {
   mithril: { name: 'Mithril Vein', item: 'mithril_ore', locationId: 'ruined_mine', tier: 4, cycleSeconds: 5.5, xpPerItem: 20 }, // dist ~38.8
 };
 
-// Each skill produces one item per cycle instead of continuous xp/sec —
-// cycleSeconds is how long one item takes, xpPerItem is granted on completion.
-// Mining is NOT here — it moved to its own node-grid system, see
-// MINING_NODES/tickMining()/startMiningNode() below.
-const TASK_CONFIG = {
-  woodcutting: { item: 'wood', cycleSeconds: 4, xpPerItem: 5 },
-  fishing: { item: 'fish', cycleSeconds: 5, xpPerItem: 6 },
+// Woodcutting/fishing use the exact same node-grid shape as MINING_NODES —
+// one item per cycle, guaranteed on completion (cycleSeconds/xpPerItem) —
+// unlocked by discovery and workable from anywhere once unlocked, same as
+// mining. Each skill's camp node is tied to the starting location (always
+// discovered) so the skill is usable from the moment a character is
+// created; every other node needs its location discovered first and always
+// yields an item exclusive to that node — see RESOURCE_NODES below.
+const WOODCUTTING_NODES = {
+  camp_grove: { name: 'Camp Grove', item: 'wood', locationId: 'wanderers_camp', tier: 1, cycleSeconds: 4, xpPerItem: 5 },
+  gladewind_grove: { name: 'Gladewind Grove', item: 'oak_wood', locationId: 'gladewind_grove', tier: 2, cycleSeconds: 5, xpPerItem: 9 },
+};
+const FISHING_NODES = {
+  camp_pond: { name: 'Camp Pond', item: 'fish', locationId: 'wanderers_camp', tier: 1, cycleSeconds: 5, xpPerItem: 6 },
+  grimwater_bridge: { name: 'Grimwater Bridge', item: 'trout', locationId: 'grimwater_bridge', tier: 2, cycleSeconds: 6, xpPerItem: 10 },
 };
 
 // sellPrice: gold paid by sellItem() when the player sells one unit back to
@@ -98,8 +110,12 @@ const ITEMS = {
   gold_ore: { name: 'Gold Ore', sellPrice: 7 },
   mithril_ore: { name: 'Mithril Ore', sellPrice: 12 },
   supplies: { name: 'Supplies', sellPrice: 3 },
+  stone: { name: 'Stone', sellPrice: 1 },
   wood: { name: 'Wood', sellPrice: 2 },
+  oak_wood: { name: 'Oak Wood', sellPrice: 4 },
   fish: { name: 'Fish', sellPrice: 2 },
+  trout: { name: 'Trout', sellPrice: 4 },
+  thick_hide: { name: 'Thick Hide', sellPrice: 6 },
   gold: { name: 'Gold' },
   // weapons — damage is a [min,max] roll per hit, attackSpeed is seconds between attacks
   rusty_sword: { name: 'Rusty Sword', type: 'weapon', damage: [4, 7], critChance: 0.05, attackSpeed: 2.0, sellPrice: 25 },
@@ -150,6 +166,7 @@ const ITEMS = {
   orc_tusk: { name: 'Orc Tusk', sellPrice: 14 },
   wraith_essence: { name: 'Wraith Essence', sellPrice: 16 },
   troll_hide: { name: 'Troll Hide', sellPrice: 25 },
+  archer_quiver: { name: "Archer's Quiver", sellPrice: 10 },
   // alchemy potions — result items of POTION_RECIPES, consumed via
   // usePotion() during combat only (see potionEffect.kind)
   healing_potion: { name: 'Healing Potion', type: 'potion', potionEffect: { kind: 'heal', amount: 30 }, sellPrice: 18 },
@@ -176,12 +193,16 @@ const ITEMS = {
 
 // Fixed per-creature attacks/effects (not derived from equipment, unlike the
 // player) — goldReward/xpReward are [min,max] rolled on a win.
+// aiType drives how an enemy spends its one action per combat round (see
+// enemyTakeTurn()): 'melee_aggressive' always closes to range then attacks
+// every turn it can (differentiated per-enemy via approachSpeed/damage/hp);
+// 'skirmisher' closes in, attacks, then hops back out to re-approach next
+// turn instead of standing and trading; 'ranged_kiter' tries to hold at
+// preferredRange, backing off if the player gets too close and closing in
+// if they're too far, only shooting once actually in that band. approachSpeed
+// is now distance units closed (or, for a kiter repositioning, opened) per
+// ROUND rather than per second — see the tick-engine rewrite below.
 const ENEMIES = {
-  // range/approachSpeed: all three are melee-only for now — range is how
-  // close they need to be to land a hit, approachSpeed (distance units/sec)
-  // is how fast they close in after being pushed back by Quick Step. Varies
-  // per enemy so kiting feels different against each (the zombie is easy to
-  // outrun, the wolf is not).
   giant_rat: {
     name: 'Giant Rat',
     maxHp: 20,
@@ -194,6 +215,7 @@ const ENEMIES = {
     lootTable: [{ item: 'rat_tail', chance: 0.25 }],
     range: MELEE_RANGE,
     approachSpeed: 45,
+    aiType: 'melee_aggressive',
   },
   wolf: {
     name: 'Wolf',
@@ -207,6 +229,7 @@ const ENEMIES = {
     lootTable: [{ item: 'wolf_fang', chance: 0.25 }],
     range: MELEE_RANGE,
     approachSpeed: 55,
+    aiType: 'melee_aggressive',
   },
   bog_zombie: {
     name: 'Bog Zombie',
@@ -220,6 +243,7 @@ const ENEMIES = {
     lootTable: [{ item: 'zombie_ichor', chance: 0.25 }],
     range: MELEE_RANGE,
     approachSpeed: 20,
+    aiType: 'melee_aggressive',
   },
   // Added so the ~40 previously-empty locations have varied, tier-appropriate
   // fights instead of reusing just these original 3 everywhere — tiers
@@ -238,6 +262,7 @@ const ENEMIES = {
     lootTable: [{ item: 'bandit_dagger', chance: 0.2 }],
     range: MELEE_RANGE,
     approachSpeed: 40,
+    aiType: 'melee_aggressive',
   },
   forest_spider: {
     // tier 2 — fast, poisonous
@@ -252,6 +277,25 @@ const ENEMIES = {
     lootTable: [{ item: 'spider_silk', chance: 0.25 }],
     range: MELEE_RANGE,
     approachSpeed: 60,
+    aiType: 'melee_aggressive',
+  },
+  // tier 2 — the first ranged enemy: holds at range and shoots rather than
+  // closing to melee, backing off if the player pushes in (Quick Step, or
+  // just standing near it). Demonstrates the ranged_kiter archetype.
+  forest_archer: {
+    name: 'Forest Archer',
+    maxHp: 26,
+    damage: [3, 6],
+    critChance: 0.1,
+    attackSpeed: 1.6,
+    effect: null,
+    goldReward: [5, 10],
+    xpReward: 10,
+    lootTable: [{ item: 'archer_quiver', chance: 0.25 }],
+    range: MAX_DISTANCE, // shots always reach once in its preferred band — see aiType logic, not a melee-style range gate
+    approachSpeed: 20,
+    aiType: 'ranged_kiter',
+    preferredRange: 55,
   },
   orc_raider: {
     // tier 3 — a real step up in raw damage
@@ -266,9 +310,12 @@ const ENEMIES = {
     lootTable: [{ item: 'orc_tusk', chance: 0.25 }],
     range: MELEE_RANGE,
     approachSpeed: 35,
+    aiType: 'melee_aggressive',
   },
   marsh_wraith: {
-    // tier 3 — a ghostly poisoner, favors a high crit chance over raw damage
+    // tier 3 — a ghostly poisoner, favors a high crit chance over raw
+    // damage. skirmisher: bites then phases back out instead of standing
+    // and trading, matching its existing "hard to pin down" flavor.
     name: 'Marsh Wraith',
     maxHp: 45,
     damage: [4, 8],
@@ -280,6 +327,8 @@ const ENEMIES = {
     lootTable: [{ item: 'wraith_essence', chance: 0.25 }],
     range: MELEE_RANGE,
     approachSpeed: 25,
+    aiType: 'skirmisher',
+    retreatDistance: 35,
   },
   stone_troll: {
     // tier 4 — the toughest fight in the game right now, a real "boss" feel
@@ -296,8 +345,28 @@ const ENEMIES = {
     lootTable: [{ item: 'troll_hide', chance: 0.3 }],
     range: MELEE_RANGE,
     approachSpeed: 15,
+    aiType: 'melee_aggressive',
   },
 };
+
+// Angle offsets (degrees, 0 = straight up from the player) assigned to each
+// enemy in a fight at combat start, indexed by [groupSize][slotIndex] — kept
+// as a small fixed table rather than a generic spacing formula since group
+// size is capped at 3. Spread across the top arc so every enemy visually
+// faces the player without anyone directly behind another, and since each
+// enemy only ever moves radially (toward/away along its own fixed angle,
+// never around the circle), two enemies can never collide with each other
+// or the player as long as their angles differ — which this table guarantees.
+const COMBAT_GROUP_ANGLES = {
+  1: [0],
+  2: [-38, 38],
+  3: [-55, 0, 55],
+};
+const MAX_ENCOUNTER_GROUP_SIZE = 3;
+// Enemies hover just outside this distance once fully closed in — keeps them
+// visually distinct from the player dot at the arena center instead of
+// stacking on top of it.
+const MIN_ENEMY_DISTANCE = 12;
 
 const PLANTS = {
   wheat: { name: 'Wheat', seed: 'wheat_seed', growSeconds: 60, yield: 'wheat_crop' },
@@ -374,8 +443,19 @@ const LOCATION_REVEAL_PRICE = 30;
 const PLAYER_BASE_HP = 50;
 const PLAYER_HP_PER_LEVEL = 5;
 
+// Combat runs in discrete rounds (ticks): each round, the player either
+// resolves their current loadout ability or spends the round still charging
+// it (see baseCastRounds below), then every living enemy takes one AI-driven
+// action. tickIntervalSeconds is how much real time one round takes to play
+// out — purely a pacing/watchability knob (see COMBAT_SPEED_PRESETS), not a
+// balance lever; it doesn't change how many rounds a fight takes, just how
+// fast those rounds tick by on screen. Persisted per-player as a preference
+// (player.combatSpeed) so it carries between fights, adjustable mid-fight.
+const COMBAT_SPEED_PRESETS = { slow: 2.2, normal: 1.1, fast: 0.4 };
+const DEFAULT_COMBAT_SPEED = 'normal';
+
 // Player abilities go in 6 loadout slots and execute left-to-right, looping
-// back to slot 0 — see resolvePlayerAbility()/advanceCursor(). unlockLevel
+// back to slot 0 — see resolvePlayerTurn()/advanceCursor(). unlockLevel
 // gates them behind the player's Combat skill level (see levelFromXp()),
 // giving a "learn more throughout the game" progression without needing any
 // separate unlock system (shop/quest) for v1.
@@ -447,6 +527,16 @@ const ABILITIES = {
 
 const DEFAULT_ABILITY_LOADOUT = ['punch', 'swing', 'swing', 'quick_step', 'swing', 'swing'];
 
+// How many combat rounds an ability occupies the player's turn for before it
+// resolves — a direct reinterpretation of the old continuous-time
+// castSeconds as a discrete tick count (Punch ~1 round, Power Strike ~3),
+// preserving the original "heavier ability = enemies get more free turns
+// while you commit to it" tradeoff inside the round-based engine. See
+// resolvePlayerTurn().
+function baseCastRounds(abilityId) {
+  return Math.max(1, Math.round(ABILITIES[abilityId].castSeconds));
+}
+
 // Given to brand new players so the expedition mechanic is testable before
 // a real supplies source (shop / garden) exists.
 const STARTER_SUPPLIES = 8;
@@ -458,39 +548,105 @@ const OVERLAP_THRESHOLD = 3.5; // how close the drawn path must pass to a locati
 const EXPEDITION_SPEED = 1.5; // percent-units of path covered per second — slow, deliberate travel, not a blip
 const MIN_EXPEDITION_DURATION = 8; // seconds — even the shortest possible trip should take a real, watchable while
 
-// Gather tasks — Hunting/Scavenging/Harvesting. Structurally identical to
-// TASK_CONFIG skills (cycle-based, clock UI, xp on success) EXCEPT: usable
-// from anywhere (not tied to a specific location, unlike mining/woodcutting/
-// fishing) and each completed cycle only has a *chance* of yielding
-// anything, resolved in tickGatherTasks() rather than the guaranteed-yield
-// math tickSkills() uses for TASK_CONFIG skills.
-const GATHER_TASKS = {
-  hunting: {
+// Gather tasks — Hunting/Scavenging/Harvesting. Now node-grid based, same
+// unlock-by-discovery/workable-from-anywhere shape as mining/woodcutting/
+// fishing (see RESOURCE_NODES below), EXCEPT each completed cycle only has a
+// *chance* of yielding anything, resolved in tickChanceNode() rather than
+// the guaranteed-yield math tickDeterministicNode() uses. Each skill's camp
+// node is intentionally the weaker/cheaper pool — the better items (rarer
+// alchemy ingredients, iron ore, etc) only ever drop from the discovery-
+// gated node, never from camp, so there's always a reason to go find it.
+const HUNTING_NODES = {
+  camp_hunt: {
+    name: 'Camp Woods',
+    locationId: 'wanderers_camp',
+    tier: 1,
     cycleSeconds: 6,
     encounterChance: 0.15, // chance per cycle of a hostile animal instead of a find
     successChance: 0.3,
-    xpPerSuccess: 10,
+    attemptXp: 3, // granted every completed cycle regardless of outcome, see below
+    xpPerSuccess: 10, // on top of attemptXp, only when the cycle actually finds something
     resultItem: 'raw_meat',
     huntableEnemies: ['giant_rat', 'wolf', 'bog_zombie'],
   },
-  scavenging: {
+  highcrest_forest: {
+    name: 'Highcrest Forest',
+    locationId: 'highcrest_forest',
+    tier: 2,
+    cycleSeconds: 7,
+    encounterChance: 0.18,
+    successChance: 0.3,
+    attemptXp: 4,
+    xpPerSuccess: 14,
+    resultItem: 'thick_hide',
+    huntableEnemies: ['wolf', 'bog_zombie'],
+  },
+};
+const SCAVENGING_NODES = {
+  camp_scavenge: {
+    name: 'Camp Outskirts',
+    locationId: 'wanderers_camp',
+    tier: 1,
     cycleSeconds: 4,
     successChance: 0.3,
+    attemptXp: 2,
     xpPerSuccess: 6,
-    resultPool: ['supplies', 'gold', 'wood', 'iron_ore', 'fish', 'redcap_cap', 'bog_root'],
+    resultPool: ['supplies', 'gold', 'wood'],
   },
-  harvesting: {
+  ashfall_ruins: {
+    name: 'Ashfall Ruins',
+    locationId: 'ashfall_ruins',
+    tier: 2,
     cycleSeconds: 5,
     successChance: 0.3,
+    attemptXp: 3,
+    xpPerSuccess: 9,
+    resultPool: ['iron_ore', 'fish', 'redcap_cap', 'bog_root'],
+  },
+};
+const HARVESTING_NODES = {
+  camp_harvest: {
+    name: 'Camp Garden Plot',
+    locationId: 'wanderers_camp',
+    tier: 1,
+    cycleSeconds: 5,
+    successChance: 0.3,
+    attemptXp: 2,
     xpPerSuccess: 6,
-    resultPool: ['wheat_seed', 'carrot_seed', 'potato_seed', 'wheat_crop', 'carrot_crop', 'potato_crop', 'sunpetal', 'moonleaf'],
+    resultPool: ['wheat_seed', 'carrot_seed', 'potato_seed', 'wheat_crop', 'carrot_crop', 'potato_crop'],
+  },
+  duskhollow_marsh: {
+    name: 'Duskhollow Marsh',
+    locationId: 'duskhollow_marsh',
+    tier: 2,
+    cycleSeconds: 6,
+    successChance: 0.3,
+    attemptXp: 3,
+    xpPerSuccess: 9,
+    resultPool: ['sunpetal', 'moonleaf'],
   },
 };
 
+// Every resource-gathering skill's node registry in one place, keyed by
+// skillId — the single source of truth tickResourceTask()/startResourceTask()/
+// publicResourceNodes() all read from. DETERMINISTIC_TASKS marks which ones
+// use the guaranteed-yield-per-cycle model (mining/woodcutting/fishing) vs
+// the chance-per-cycle model (hunting/scavenging/harvesting) — every skill's
+// nodes are one kind or the other, never mixed within a skill.
+const RESOURCE_NODES = {
+  mining: MINING_NODES,
+  woodcutting: WOODCUTTING_NODES,
+  fishing: FISHING_NODES,
+  hunting: HUNTING_NODES,
+  scavenging: SCAVENGING_NODES,
+  harvesting: HARVESTING_NODES,
+};
+const DETERMINISTIC_TASKS = new Set(['mining', 'woodcutting', 'fishing']);
+
 // Extremely rare (0.01%), checked on every completed gather-task cycle
-// regardless of which of the three tasks it was, ahead of that task's own
-// roll — a jackpot layer shared across all gather tasks rather than
-// per-task, so it stays meaningfully rare no matter which task is running.
+// regardless of which task or node it was, ahead of that task's own roll —
+// a jackpot layer shared across all gather tasks rather than per-task, so
+// it stays meaningfully rare no matter which task is running.
 const RARE_GATHER_EVENT_CHANCE = 0.0001;
 
 const LOCATIONS = [
@@ -499,15 +655,15 @@ const LOCATIONS = [
   { id: 'grimwater_bridge', name: 'Grimwater Bridge', x: 64, y: 58.8, skill: 'fishing' },
   { id: 'moonshade_reach', name: 'Moonshade Reach', x: 49.4, y: 63.3 },
   { id: 'duskhollow_crossing', name: 'Duskhollow Crossing', x: 40.5, y: 60.1 },
-  { id: 'ashfall_ruins', name: 'Ashfall Ruins', x: 32.3, y: 54.9, combat: ['bog_zombie'] },
+  { id: 'ashfall_ruins', name: 'Ashfall Ruins', x: 32.3, y: 54.9, combat: ['bog_zombie'], skill: 'scavenging' },
   { id: 'copperhall_village', name: 'Copperhall Village', x: 36.4, y: 46.4 },
-  { id: 'duskhollow_marsh', name: 'Duskhollow Marsh', x: 39.2, y: 42.7 },
+  { id: 'duskhollow_marsh', name: 'Duskhollow Marsh', x: 39.2, y: 42.7, skill: 'harvesting' },
   { id: 'wyrmwood_hold', name: 'Wyrmwood Hold', x: 48.6, y: 39.4 },
   { id: 'thornwatch_hall', name: 'Thornwatch Hall', x: 60, y: 36.6 },
   { id: 'amberfield_vale', name: 'Amberfield Vale', x: 61.8, y: 43.8, combat: ['giant_rat', 'bandit'], loot: { item: 'gold', amount: 8 } },
   { id: 'sunspire_camp', name: 'Sunspire Camp', x: 81, y: 52.3 },
-  { id: 'highcrest_forest', name: 'Highcrest Forest', x: 74.2, y: 66.7, combat: ['bog_zombie'] },
-  { id: 'tidewater_grove', name: 'Tidewater Grove', x: 65, y: 68, combat: ['wolf', 'forest_spider'], loot: { item: 'fish', amount: 4 } },
+  { id: 'highcrest_forest', name: 'Highcrest Forest', x: 74.2, y: 66.7, combat: ['bog_zombie'], skill: 'hunting' },
+  { id: 'tidewater_grove', name: 'Tidewater Grove', x: 65, y: 68, combat: ['wolf', 'forest_spider', 'forest_archer'], loot: { item: 'fish', amount: 4 } },
   { id: 'vintermere_keep', name: 'Vintermere Keep', x: 48.5, y: 73.6 },
   { id: 'vintermere_hollow', name: 'Vintermere Hollow', x: 33.3, y: 68.2, combat: ['forest_spider'], loot: { item: 'wood', amount: 5 } },
   { id: 'ashgate_ruins', name: 'Ashgate Ruins', x: 32.8, y: 64.8, combat: ['wolf'], loot: { item: 'gold', amount: 12 } },
@@ -943,8 +1099,44 @@ function loadDb() {
 
 let db = loadDb();
 
-function save() {
+// save() used to writeFileSync the ENTIRE db (every player, not just one)
+// synchronously on every call — and publicPlayer() (called by GET /api/me,
+// which every connected client polls every 300ms-2s) calls save()
+// unconditionally on every single poll. That's a full-file disk write, on
+// Node's single thread (blocking every other in-flight request for its
+// duration), that scales with player count x poll frequency rather than
+// with how often anything actually changed. Debouncing coalesces however
+// many save() calls land within SAVE_DEBOUNCE_MS — across ALL players, not
+// per-player — into a single write, so disk cost stays roughly flat as more
+// players connect instead of growing linearly with them.
+const SAVE_DEBOUNCE_MS = 1000;
+let saveTimer = null;
+let dirty = false;
+
+function flushSave() {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  if (!dirty) return;
+  dirty = false;
   fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+}
+
+function save() {
+  dirty = true;
+  if (saveTimer) return;
+  saveTimer = setTimeout(flushSave, SAVE_DEBOUNCE_MS);
+}
+
+// Make sure a pending debounced save isn't lost on a clean shutdown
+// (nodemon restart, Ctrl+C, deploy) — up to SAVE_DEBOUNCE_MS of the most
+// recent progress would otherwise never reach disk.
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => {
+    flushSave();
+    process.exit(0);
+  });
 }
 
 function getLocation(id) {
@@ -1005,11 +1197,11 @@ function newPlayer(username, traits, passwordRecord) {
     garden: { plots: new Array(GARDEN_PLOT_COUNT).fill(null) },
     skills: {
       mining: { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null },
-      woodcutting: { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null },
-      fishing: { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null },
-      hunting: { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null },
-      scavenging: { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null },
-      harvesting: { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null },
+      woodcutting: { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null },
+      fishing: { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null },
+      hunting: { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null },
+      scavenging: { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null },
+      harvesting: { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null },
       combat: { xp: 0 },
     },
     farm: { animals: [] },
@@ -1020,6 +1212,7 @@ function newPlayer(username, traits, passwordRecord) {
     lastRareEvent: null,
     alchemy: { knownRecipes: [], triedCombos: [] },
     abilityLoadout: [...DEFAULT_ABILITY_LOADOUT],
+    combatSpeed: DEFAULT_COMBAT_SPEED,
     traits: traits || { strength: TRAIT_BASE, dexterity: TRAIT_BASE, luck: TRAIT_BASE, vigor: TRAIT_BASE },
     characterXp: 0,
     traitPointsAvailable: 0,
@@ -1107,6 +1300,20 @@ function ensurePlayerShape(player) {
     player.combat = null;
     changed = true;
   }
+  // Same class of migration, same tradeoff: the tick-based multi-enemy
+  // combat rewrite changed a fight's shape from singular enemyId/enemyHp to
+  // c.enemies[] — any account with an unresolved fight open at that moment
+  // is stuck on the old shape, which the new engine can't read. Reset it
+  // (loses that one stale fight) rather than trying to migrate mid-fight
+  // state into a structurally different engine.
+  if (player.combat && !Array.isArray(player.combat.enemies)) {
+    player.combat = null;
+    changed = true;
+  }
+  if (!player.combatSpeed || !COMBAT_SPEED_PRESETS[player.combatSpeed]) {
+    player.combatSpeed = DEFAULT_COMBAT_SPEED;
+    changed = true;
+  }
   if (!player.garden) {
     player.garden = { plots: new Array(GARDEN_PLOT_COUNT).fill(null) };
     changed = true;
@@ -1116,23 +1323,23 @@ function ensurePlayerShape(player) {
     changed = true;
   }
   if (!player.skills.woodcutting) {
-    player.skills.woodcutting = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null };
+    player.skills.woodcutting = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null };
     changed = true;
   }
   if (!player.skills.fishing) {
-    player.skills.fishing = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null };
+    player.skills.fishing = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null };
     changed = true;
   }
   if (!player.skills.hunting) {
-    player.skills.hunting = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null };
+    player.skills.hunting = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null };
     changed = true;
   }
   if (!player.skills.scavenging) {
-    player.skills.scavenging = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null };
+    player.skills.scavenging = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null };
     changed = true;
   }
   if (!player.skills.harvesting) {
-    player.skills.harvesting = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null };
+    player.skills.harvesting = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null };
     changed = true;
   }
   if (!player.skills.combat) {
@@ -1193,9 +1400,15 @@ function ensurePlayerShape(player) {
     player.perks = [];
     changed = true;
   }
-  if (player.skills.mining && player.skills.mining.activeNode === undefined) {
-    player.skills.mining.activeNode = null;
-    changed = true;
+  // Every resource skill is node-grid based now (was mining-only) — any
+  // account whose skill entry predates that for a given skill (created
+  // before woodcutting/fishing/hunting/scavenging/harvesting moved to nodes)
+  // is missing activeNode entirely.
+  for (const skillId of Object.keys(RESOURCE_NODES)) {
+    if (player.skills[skillId] && player.skills[skillId].activeNode === undefined) {
+      player.skills[skillId].activeNode = null;
+      changed = true;
+    }
   }
   if (player.passwordHash === undefined) {
     player.passwordHash = null;
@@ -1245,62 +1458,151 @@ function getPlayer(id) {
 // its required location — starting a task only checked location once, at
 // the moment of clicking Start, so traveling away afterward let it keep
 // accruing forever with nothing to stop it.
-// Maps a TASK_CONFIG skillId to the matching getPlayerModifiers() speed-mult
-// field (woodsman/angler's patience perks) — mining has its own analogous
-// lookup in tickMining() since it isn't in TASK_CONFIG at all.
-const SPEED_MULT_FIELD = { woodcutting: 'woodcuttingSpeedMult', fishing: 'fishingSpeedMult' };
+// Maps a deterministic-node skillId (RESOURCE_NODES/DETERMINISTIC_TASKS) to
+// the matching getPlayerModifiers() speed-mult field (prospector/woodsman/
+// angler's patience perks).
+const SPEED_MULT_FIELD = { mining: 'miningSpeedMult', woodcutting: 'woodcuttingSpeedMult', fishing: 'fishingSpeedMult' };
 const MIN_CYCLE_SECONDS = 0.5; // floor so a stacked speed bonus can never hit 0/negative cycle time
 
-function tickSkills(player) {
-  const loc = getLocation(player.currentLocation);
-  for (const [skillId, skill] of Object.entries(player.skills)) {
-    const config = TASK_CONFIG[skillId];
-    if (!skill.taskStartedAt || !config) continue;
+// --- Fishing minigame ---
+// Idle fishing (the plain cycle clock every deterministic node task already
+// has, via tickDeterministicNode below) is unaffected and always keeps
+// producing its node's item on its own — this only ever ADDS a bonus on top
+// for a player who's actually watching. Every bit of the timing/animation
+// happens client-side (same fixed-anchor extrapolation idiom the mining
+// clock/ability-fill/expedition sweep already use), so per-frame rendering
+// costs the server nothing; the only network cost is one POST when the
+// player actually clicks Catch, exactly like any other player-triggered
+// action (craft/equip/buy).
+const FISHING_BITE_WINDOW_MS = 600;
+const FISHING_CATCH_GRACE_MS = 200; // slack for the catch request's own network trip after the client saw the window
+const FISHING_BONUS_AMOUNT = 1;
+const FISHING_BONUS_XP = 4;
 
-    if (!loc || loc.skill !== skillId) {
-      skill.taskStartedAt = null;
-      skill.lastTick = null;
-      continue;
-    }
-
-    const now = Date.now();
-    const from = skill.lastTick || skill.taskStartedAt;
-    const elapsedSeconds = (now - from) / 1000;
-    if (elapsedSeconds > 0) {
-      const speedField = SPEED_MULT_FIELD[skillId];
-      const speedMult = speedField ? getPlayerModifiers(player)[speedField] : 0;
-      const effectiveCycleSeconds = Math.max(MIN_CYCLE_SECONDS, config.cycleSeconds * (1 - speedMult));
-      const totalSeconds = (skill.progressSeconds || 0) + elapsedSeconds;
-      const itemsCompleted = Math.floor(totalSeconds / effectiveCycleSeconds);
-      skill.progressSeconds = totalSeconds % effectiveCycleSeconds;
-      if (itemsCompleted > 0) {
-        player.inventory[config.item] = (player.inventory[config.item] || 0) + itemsCompleted;
-        skill.xp += itemsCompleted * config.xpPerItem;
-      }
-      skill.lastTick = now;
-    }
+// Tiny deterministic PRNG seeded from a string — NOT Math.random(). The bite
+// window has to come out identically whether it's being read for a status
+// poll or re-derived later to validate a catch attempt, with zero extra
+// state persisted in between; a string-seeded hash makes both calls agree.
+function hashSeed(str) {
+  let h = 1779033703 ^ str.length;
+  for (let i = 0; i < str.length; i++) {
+    h = Math.imul(h ^ str.charCodeAt(i), 3432918353);
+    h = (h << 13) | (h >>> 19);
   }
+  return () => {
+    h = Math.imul(h ^ (h >>> 16), 2246822507);
+    h = Math.imul(h ^ (h >>> 13), 3266489909);
+    h ^= h >>> 16;
+    return (h >>> 0) / 4294967296;
+  };
 }
 
-// Mining's own node-grid tick — locationless (unlike tickSkills, no travel
-// required once a node is unlocked), keyed off skill.activeNode rather than
-// the player's currentLocation. See MINING_NODES/startMiningNode().
-function tickMining(player) {
-  const skill = player.skills.mining;
+// Returns the CURRENT fishing cycle's bite window as {biteAt (absolute ms
+// epoch), windowMs, cycleIndex}, or null while fishing isn't active. Purely
+// a function of already-saved state (skill.taskStartedAt) plus wall-clock
+// time — nothing new is written to the player record just by calling this,
+// so a status poll and a later catch attempt can each call it independently
+// and always land on the same window for whichever cycle "now" falls in.
+// Reads cycleSeconds from whichever node is currently active (camp vs a
+// discovery-gated node) rather than a single fixed value, same as the
+// passive tick — a faster/slower node just moves the whole window with it.
+function getFishingBite(player) {
+  const skill = player.skills.fishing;
+  if (!skill || !skill.taskStartedAt || !skill.activeNode) return null;
+  const node = FISHING_NODES[skill.activeNode];
+  if (!node) return null;
+  const speedMult = getPlayerModifiers(player).fishingSpeedMult;
+  const effectiveCycleSeconds = Math.max(MIN_CYCLE_SECONDS, node.cycleSeconds * (1 - speedMult));
+  const elapsedSeconds = (Date.now() - skill.taskStartedAt) / 1000;
+  const cycleIndex = Math.floor(elapsedSeconds / effectiveCycleSeconds);
+  const cycleStartMs = skill.taskStartedAt + cycleIndex * effectiveCycleSeconds * 1000;
+  const cycleMs = effectiveCycleSeconds * 1000;
+  // Clamp the window itself to a third of the cycle — defends against a
+  // stacked speed bonus someday shrinking effectiveCycleSeconds enough that
+  // a fixed 600ms window wouldn't fit (not reachable with current perks,
+  // whose fishing-speed bonuses are small, but cheap to make impossible
+  // rather than merely unlikely).
+  const windowMs = Math.min(FISHING_BITE_WINDOW_MS, cycleMs / 3);
+  // keep the window off the very start/end of the cycle so it's never
+  // clipped by the passive item-yield boundary
+  const usableMs = Math.max(0, cycleMs - windowMs * 2);
+  const rand = hashSeed(`${player.id}:${skill.taskStartedAt}:${cycleIndex}`);
+  const offsetMs = windowMs + rand() * usableMs;
+  return { biteAt: Math.round(cycleStartMs + offsetMs), windowMs, cycleIndex };
+}
+
+// Player-triggered: click Catch during the bite window for a bonus catch +
+// xp on top of whatever the passive clock already yields — the bonus item
+// is always whichever item the currently active node produces (camp's
+// plain fish, or a discovered node's better fish), never a fixed item, so
+// the minigame never outperforms picking a better node. At most one
+// resolved attempt per cycle (skill.lastCatchCycle), hit or miss, so rapid
+// button-mashing can't be used to brute-force the timing check. No location
+// check needed any more — fishing nodes are workable from anywhere once
+// unlocked, same as every other resource task.
+function attemptFishingCatch(playerId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const skill = player.skills.fishing;
+  if (!skill || !skill.taskStartedAt || !skill.activeNode) return { error: 'not_fishing' };
+  const node = FISHING_NODES[skill.activeNode];
+  if (!node) return { error: 'not_fishing' };
+
+  const bite = getFishingBite(player);
+  if (!bite) return { error: 'not_fishing' };
+  if (skill.lastCatchCycle === bite.cycleIndex) {
+    return { success: false, reason: 'already_attempted' };
+  }
+  skill.lastCatchCycle = bite.cycleIndex;
+
+  const now = Date.now();
+  const withinWindow = now >= bite.biteAt && now <= bite.biteAt + bite.windowMs + FISHING_CATCH_GRACE_MS;
+  if (!withinWindow) {
+    save();
+    return { success: false, reason: 'missed' };
+  }
+
+  player.inventory[node.item] = (player.inventory[node.item] || 0) + FISHING_BONUS_AMOUNT;
+  skill.xp += FISHING_BONUS_XP;
+  save();
+  return { success: true, item: node.item, itemName: ITEMS[node.item].name, amount: FISHING_BONUS_AMOUNT, xp: FISHING_BONUS_XP };
+}
+
+// --- unified resource-node engine ---
+// Drives all 6 gather-type skills (mining/woodcutting/fishing/hunting/
+// scavenging/harvesting) off RESOURCE_NODES. Every node is workable from
+// anywhere once its location is discovered (skill.activeNode, not
+// player.currentLocation, is the source of truth) — the camp node for each
+// skill is always unlocked since the starting location is always
+// discovered. DETERMINISTIC_TASKS picks which of the two tick/resolve
+// strategies below applies; a skill's nodes are always one kind or the
+// other, never mixed.
+
+function tickResourceTask(player, skillId) {
+  const skill = player.skills[skillId];
   if (!skill || !skill.taskStartedAt || !skill.activeNode) return;
-  const node = MINING_NODES[skill.activeNode];
+  const node = RESOURCE_NODES[skillId][skill.activeNode];
   if (!node || !player.discoveries.includes(node.locationId)) {
     skill.taskStartedAt = null;
     skill.lastTick = null;
     return;
   }
+  if (DETERMINISTIC_TASKS.has(skillId)) {
+    tickDeterministicNode(player, skillId, skill, node);
+  } else {
+    tickChanceNode(player, skillId, skill, node);
+  }
+}
 
+// mining/woodcutting/fishing: one guaranteed item every cycleSeconds.
+function tickDeterministicNode(player, skillId, skill, node) {
   const now = Date.now();
   const from = skill.lastTick || skill.taskStartedAt;
   const elapsedSeconds = (now - from) / 1000;
   if (elapsedSeconds <= 0) return;
 
-  const speedMult = getPlayerModifiers(player).miningSpeedMult;
+  const speedField = SPEED_MULT_FIELD[skillId];
+  const speedMult = speedField ? getPlayerModifiers(player)[speedField] : 0;
   const effectiveCycleSeconds = Math.max(MIN_CYCLE_SECONDS, node.cycleSeconds * (1 - speedMult));
   const totalSeconds = (skill.progressSeconds || 0) + elapsedSeconds;
   const itemsCompleted = Math.floor(totalSeconds / effectiveCycleSeconds);
@@ -1312,153 +1614,171 @@ function tickMining(player) {
   skill.lastTick = now;
 }
 
-// Starts mining a node the player has unlocked (its linked location has been
-// discovered) — usable from anywhere, same "own tab, no travel needed" idea
-// as the gather tasks, just deterministic-yield like mining always was.
-// Switching to a different node (or re-clicking the active one to stop) both
-// go through this + stopTask('mining') on the client.
-function startMiningNode(playerId, nodeId) {
-  const player = getPlayer(playerId);
-  if (!player) return { error: 'not_found' };
-  const node = MINING_NODES[nodeId];
-  if (!node) return { error: 'unknown_node' };
-  if (!player.discoveries.includes(node.locationId)) return { error: 'not_unlocked' };
-  if (player.combat && !player.combat.result) return { error: 'busy_fighting' };
-  if (player.expedition) return { error: 'busy_exploring' };
-
-  stopAllSkillTasks(player); // only one task at a time
-  player.skills.mining.activeNode = nodeId;
-  player.skills.mining.taskStartedAt = Date.now();
-  player.skills.mining.lastTick = Date.now();
-  save();
-  return { ok: true };
-}
-
-// Every node, locked or not — the Mining tab shows the whole grid so
-// players can see what's still out there to discover, same idea as the
-// ability sidebar showing locked abilities.
-function publicMiningNodes(player) {
-  const skill = player.skills.mining;
-  return Object.entries(MINING_NODES).map(([id, node]) => {
-    const unlocked = player.discoveries.includes(node.locationId);
-    const loc = getLocation(node.locationId);
-    return {
-      id,
-      name: node.name,
-      item: node.item,
-      itemName: ITEMS[node.item].name,
-      tier: node.tier,
-      cycleSeconds: node.cycleSeconds,
-      xpPerItem: node.xpPerItem,
-      unlocked,
-      locationName: loc ? loc.name : node.locationId,
-      active: unlocked && skill.activeNode === id && !!skill.taskStartedAt,
-      progressSeconds: skill.activeNode === id ? skill.progressSeconds || 0 : 0,
-    };
-  });
-}
-
-// Resolves elapsed time on a gather task (hunting/scavenging/harvesting)
-// into whole completed cycles, then rolls each one independently instead of
-// granting a guaranteed yield like tickSkills does — see GATHER_TASKS/
-// RARE_GATHER_EVENT_CHANCE for the odds. A hunting cycle can trigger an
-// ambush (see resolveGatherCycle/beginAmbushCombat), which immediately stops
-// the task — combat is a hard block on every other task in this codebase,
-// same as it is for mining/expeditions, so a mid-hunt ambush is no
-// different. Cycles are capped per tick (same idea as tickCombat's guard
-// cap) so a very long AFK gap can't turn into an unbounded loop; any
-// still-unprocessed whole cycles just carry over as extra progressSeconds
-// and get resolved on the next tick.
+// Resolves elapsed time on a chance-based node (hunting/scavenging/
+// harvesting) into whole completed cycles, then rolls each one
+// independently instead of granting a guaranteed yield — see
+// RARE_GATHER_EVENT_CHANCE for the shared jackpot odds. A hunting cycle can
+// trigger an ambush (see resolveGatherCycleForNode/beginAmbushCombat),
+// which immediately stops the task — combat is a hard block on every other
+// task in this codebase, same as it is for mining/expeditions. Cycles are
+// capped per tick (same idea as tickCombat's guard cap) so a very long AFK
+// gap can't turn into an unbounded loop; any still-unprocessed whole cycles
+// just carry over as extra progressSeconds and get resolved on the next tick.
 const GATHER_TICK_CAP = 500;
 
-function tickGatherTasks(player) {
-  for (const [skillId, config] of Object.entries(GATHER_TASKS)) {
-    const skill = player.skills[skillId];
-    if (!skill || !skill.taskStartedAt) continue;
+function tickChanceNode(player, skillId, skill, node) {
+  if (player.combat && !player.combat.result) {
+    // something else (an earlier ambush this same tick, or any other path
+    // into combat) already put the player in a fight — stop gathering
+    skill.taskStartedAt = null;
+    skill.lastTick = null;
+    return;
+  }
 
-    if (player.combat && !player.combat.result) {
-      // something else (an earlier ambush this same tick, or any other path
-      // into combat) already put the player in a fight — stop gathering
-      skill.taskStartedAt = null;
-      skill.lastTick = null;
-      continue;
-    }
+  const now = Date.now();
+  const from = skill.lastTick || skill.taskStartedAt;
+  // Clamp (not skip-on-<=0): after a GATHER_TICK_CAP-limited tick,
+  // progressSeconds can hold far more than one cycle's worth of
+  // still-unprocessed backlog. Bailing out whenever elapsedSeconds isn't
+  // strictly positive (e.g. two ticks landing in the same millisecond —
+  // unreachable over real network polling, but trivially hit by any tight
+  // synchronous loop calling publicPlayer() repeatedly) would stall that
+  // backlog from ever draining further, even though there's still real
+  // progress to process. Only skip entirely when there's truly nothing to do.
+  const elapsedSeconds = Math.max(0, (now - from) / 1000);
+  const totalSeconds = (skill.progressSeconds || 0) + elapsedSeconds;
+  const cyclesCompleted = Math.floor(totalSeconds / node.cycleSeconds);
+  if (cyclesCompleted <= 0) {
+    // Must persist totalSeconds here, not just advance lastTick — otherwise
+    // every sub-cycle tick discards the elapsed time it just measured, so
+    // cyclesCompleted can never climb past 0 and the task never completes.
+    skill.progressSeconds = totalSeconds;
+    skill.lastTick = now;
+    return;
+  }
 
-    const now = Date.now();
-    const from = skill.lastTick || skill.taskStartedAt;
-    // Clamp (not skip-on-<=0): after a GATHER_TICK_CAP-limited tick,
-    // progressSeconds can hold far more than one cycle's worth of
-    // still-unprocessed backlog. Bailing out whenever elapsedSeconds isn't
-    // strictly positive (e.g. two ticks landing in the same millisecond —
-    // unreachable over real network polling, but trivially hit by any
-    // tight synchronous loop calling publicPlayer() repeatedly) would stall
-    // that backlog from ever draining further, even though there's still
-    // real progress to process. Only skip entirely when there's truly
-    // nothing to do.
-    const elapsedSeconds = Math.max(0, (now - from) / 1000);
-    const totalSeconds = (skill.progressSeconds || 0) + elapsedSeconds;
-    const cyclesCompleted = Math.floor(totalSeconds / config.cycleSeconds);
-    if (cyclesCompleted <= 0) {
-      skill.lastTick = now;
-      continue;
+  let processed = 0;
+  let interrupted = false;
+  for (; processed < cyclesCompleted && processed < GATHER_TICK_CAP; processed++) {
+    const outcome = resolveGatherCycleForNode(player, skillId, node);
+    if (outcome === 'combat') {
+      processed += 1;
+      interrupted = true;
+      break;
     }
+  }
 
-    let processed = 0;
-    let interrupted = false;
-    for (; processed < cyclesCompleted && processed < GATHER_TICK_CAP; processed++) {
-      const outcome = resolveGatherCycle(player, skillId, config);
-      if (outcome === 'combat') {
-        processed += 1;
-        interrupted = true;
-        break;
-      }
-    }
-
-    if (interrupted) {
-      skill.taskStartedAt = null;
-      skill.lastTick = null;
-      skill.progressSeconds = 0;
-    } else {
-      skill.progressSeconds = totalSeconds - processed * config.cycleSeconds;
-      skill.lastTick = now;
-    }
+  if (interrupted) {
+    skill.taskStartedAt = null;
+    skill.lastTick = null;
+    skill.progressSeconds = 0;
+  } else {
+    skill.progressSeconds = totalSeconds - processed * node.cycleSeconds;
+    skill.lastTick = now;
   }
 }
 
-function resolveGatherCycle(player, skillId, config) {
+function resolveGatherCycleForNode(player, skillId, node) {
+  // Every completed cycle grants a small flat xp regardless of outcome —
+  // previously xp only came from xpPerSuccess (a 30% roll), so 55-70% of
+  // completed cycles gave literally nothing, which read as "the circle
+  // fills and nothing happens." Matches how mining/woodcutting/fishing
+  // always grant xp per completed cycle; the chance-based item/loot stays
+  // exactly as designed, only xp is now guaranteed per attempt.
+  player.skills[skillId].xp += node.attemptXp;
+
   if (Math.random() < RARE_GATHER_EVENT_CHANCE) {
     resolveRareGatherEvent(player);
     return 'rare';
   }
 
-  // luck trait + Treasure Hunter perk — added on top of the task's own
+  // luck trait + Treasure Hunter perk — added on top of the node's own
   // successChance, never touches encounterChance (an ambush isn't a
   // "success" to boost away)
   const successBonus = getPlayerModifiers(player).gatherSuccessBonus;
 
   if (skillId === 'hunting') {
     const roll = Math.random();
-    if (roll < config.encounterChance) {
-      const enemyId = config.huntableEnemies[Math.floor(Math.random() * config.huntableEnemies.length)];
+    if (roll < node.encounterChance) {
+      const enemyId = node.huntableEnemies[Math.floor(Math.random() * node.huntableEnemies.length)];
       beginAmbushCombat(player, enemyId);
       return 'combat';
     }
-    if (roll < config.encounterChance + config.successChance + successBonus) {
-      player.inventory[config.resultItem] = (player.inventory[config.resultItem] || 0) + 1;
-      player.skills.hunting.xp += config.xpPerSuccess;
+    if (roll < node.encounterChance + node.successChance + successBonus) {
+      player.inventory[node.resultItem] = (player.inventory[node.resultItem] || 0) + 1;
+      player.skills.hunting.xp += node.xpPerSuccess;
       return 'success';
     }
     return 'nothing';
   }
 
   // scavenging / harvesting — flat successChance, one random item from the pool
-  if (Math.random() < config.successChance + successBonus) {
-    const itemId = config.resultPool[Math.floor(Math.random() * config.resultPool.length)];
+  if (Math.random() < node.successChance + successBonus) {
+    const itemId = node.resultPool[Math.floor(Math.random() * node.resultPool.length)];
     player.inventory[itemId] = (player.inventory[itemId] || 0) + 1;
-    player.skills[skillId].xp += config.xpPerSuccess;
+    player.skills[skillId].xp += node.xpPerSuccess;
     return 'success';
   }
   return 'nothing';
+}
+
+// Starts working a node the player has unlocked (its linked location has
+// been discovered) — usable from anywhere, no travel needed once unlocked.
+// Switching to a different node (or re-clicking the active one to stop)
+// both go through this + stopTask(skillId) on the client. Replaces the old
+// separate startTask()/startMiningNode() — every resource skill now goes
+// through the same node picker.
+function startResourceTask(playerId, skillId, nodeId) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  const registry = RESOURCE_NODES[skillId];
+  if (!registry) return { error: 'unknown_skill' };
+  const node = registry[nodeId];
+  if (!node) return { error: 'unknown_node' };
+  if (!player.discoveries.includes(node.locationId)) return { error: 'not_unlocked' };
+  if (player.combat && !player.combat.result) return { error: 'busy_fighting' };
+  if (player.expedition) return { error: 'busy_exploring' };
+
+  stopAllSkillTasks(player); // only one task at a time
+  player.skills[skillId].activeNode = nodeId;
+  player.skills[skillId].taskStartedAt = Date.now();
+  player.skills[skillId].lastTick = Date.now();
+  save();
+  return { ok: true };
+}
+
+// Every node for a skill, locked or not — the Mining/Fishing tabs and the
+// Woodcutting/Hunting/Scavenging/Harvesting skill cards all show the full
+// node list so players can see what's still out there to discover, same
+// idea as the ability sidebar showing locked abilities.
+function publicResourceNodes(player, skillId) {
+  const skill = player.skills[skillId];
+  const registry = RESOURCE_NODES[skillId];
+  const deterministic = DETERMINISTIC_TASKS.has(skillId);
+  return Object.entries(registry).map(([id, node]) => {
+    const unlocked = player.discoveries.includes(node.locationId);
+    const loc = getLocation(node.locationId);
+    const base = {
+      id,
+      name: node.name,
+      tier: node.tier,
+      cycleSeconds: node.cycleSeconds,
+      unlocked,
+      locationName: loc ? loc.name : node.locationId,
+      active: unlocked && skill.activeNode === id && !!skill.taskStartedAt,
+      progressSeconds: skill.activeNode === id ? skill.progressSeconds || 0 : 0,
+    };
+    if (deterministic) {
+      return { ...base, item: node.item, itemName: ITEMS[node.item].name, xpPerItem: node.xpPerItem };
+    }
+    const resultItemIds = node.resultItem ? [node.resultItem] : node.resultPool;
+    return {
+      ...base,
+      resultItemNames: resultItemIds.map((itemId) => ITEMS[itemId].name),
+      attemptXp: node.attemptXp,
+      xpPerSuccess: node.xpPerSuccess,
+    };
+  });
 }
 
 // Shared combat-instance constructor used by both startCombat() (the player
@@ -1469,22 +1789,39 @@ function resolveGatherCycle(player, skillId, config) {
 // live, since loadout edits are blocked during combat (see setLoadoutSlot) —
 // this keeps mid-fight state simple and immune to any future relaxation of
 // that rule.
-function beginCombatInstance(player, enemyId, ambush) {
-  const enemy = ENEMIES[enemyId];
+// enemyIds: an array (1-3) — see rollEncounterGroup(). Each gets its own
+// fixed angle slot (COMBAT_GROUP_ANGLES) assigned once here and never
+// changed again, so no two enemies (or the player, fixed at the center) can
+// ever occupy the same position — every enemy only ever moves radially along
+// its own angle afterward (see enemyTakeTurn()).
+function beginCombatInstance(player, enemyIds, ambush) {
   const now = Date.now();
   const maxHp = playerMaxHp(player);
+  const angles = COMBAT_GROUP_ANGLES[enemyIds.length] || COMBAT_GROUP_ANGLES[1];
+  const enemies = enemyIds.map((enemyId, i) => {
+    const enemy = ENEMIES[enemyId];
+    // MIN_ENEMY_DISTANCE, not 0 — a melee enemy starts "engaged" (already in
+    // range to attack) but never literally on top of the player, or every
+    // melee enemy in a group would collapse onto the same point regardless
+    // of angle (distance 0 means every angle maps to the same coordinate).
+    const startDistance = enemy.aiType === 'ranged_kiter' ? enemy.preferredRange : MIN_ENEMY_DISTANCE;
+    return {
+      uid: `e${i}`,
+      enemyId,
+      hp: enemy.maxHp,
+      maxHp: enemy.maxHp,
+      distance: startDistance,
+      angle: angles[i],
+      dot: null,
+    };
+  });
   player.combat = {
-    enemyId,
+    enemies,
     playerHp: maxHp,
     playerMaxHp: maxHp,
-    enemyHp: enemy.maxHp,
-    enemyMaxHp: enemy.maxHp,
-    distance: 0,
-    lastDistanceUpdate: now,
     loadout: [...player.abilityLoadout],
     abilityCursor: -1,
-    nextEnemyAttackAt: now + enemy.attackSpeed * 1000,
-    dotOnEnemy: null,
+    castRoundsRemaining: 0,
     dotOnPlayer: null,
     buff: null,
     armorBuff: null,
@@ -1493,6 +1830,9 @@ function beginCombatInstance(player, enemyId, ambush) {
     evasionUntil: 0,
     lastPlayerActionText: '',
     lastEnemyActionText: '',
+    tickIntervalSeconds: COMBAT_SPEED_PRESETS[player.combatSpeed] || COMBAT_SPEED_PRESETS[DEFAULT_COMBAT_SPEED],
+    nextTickAt: now + (COMBAT_SPEED_PRESETS[player.combatSpeed] || COMBAT_SPEED_PRESETS[DEFAULT_COMBAT_SPEED]) * 1000,
+    round: 0,
     startedAt: now,
     result: null,
     rewardGold: 0,
@@ -1500,11 +1840,33 @@ function beginCombatInstance(player, enemyId, ambush) {
     ambush,
   };
   advanceCursor(player.combat);
-  scheduleNextAbility(player, player.combat, now);
 }
 
+// Single-enemy convenience wrapper — a hunting ambush is always one
+// surprise attacker, not a coordinated group, so it doesn't go through
+// rollEncounterGroup().
 function beginAmbushCombat(player, enemyId) {
-  beginCombatInstance(player, enemyId, true);
+  beginCombatInstance(player, [enemyId], true);
+}
+
+// Most fights are solo; occasionally (see weights below) 1-2 companions join
+// from the same location's enemy pool, picked independently so a group can
+// repeat a type (e.g. two wolves) or mix types. chosenEnemyId is always
+// included so the player's explicit pick from the enemy list is honored.
+function rollEncounterGroup(loc, chosenEnemyId) {
+  const pool = loc.combat;
+  const roll = Math.random();
+  let size = 1;
+  if (pool.length > 1) {
+    if (roll < 0.15) size = 3;
+    else if (roll < 0.45) size = 2;
+  }
+  size = Math.min(size, MAX_ENCOUNTER_GROUP_SIZE);
+  const group = [chosenEnemyId];
+  while (group.length < size) {
+    group.push(pool[randInt(0, pool.length - 1)]);
+  }
+  return group;
 }
 
 // The 0.01% jackpot, shared across all three gather tasks: either the rare
@@ -1531,9 +1893,9 @@ function resolveRareGatherEvent(player) {
 // starting any new task (a different skill, an expedition, or combat) stops
 // whatever else was running instead of letting them stack.
 function stopAllSkillTasks(player) {
-  tickSkills(player);
-  tickMining(player);
-  tickGatherTasks(player);
+  for (const skillId of Object.keys(RESOURCE_NODES)) {
+    tickResourceTask(player, skillId);
+  }
   for (const skill of Object.values(player.skills)) {
     if (skill.taskStartedAt) {
       skill.taskStartedAt = null;
@@ -1746,135 +2108,147 @@ function advanceCursor(c) {
       return;
     }
   }
-  // no abilities anywhere in the loadout — leave cursor as-is, resolvePlayerAbility no-ops forever until the fight ends
+  // no abilities anywhere in the loadout — leave cursor as-is, resolvePlayerTurn no-ops forever until the fight ends
 }
 
-// Schedules when the ability now under the cursor finishes casting.
-// Adrenaline Rush's pendingHasteBuff and a Potion of Swiftness's speed buff
-// both shorten THIS upcoming cast (not the one that set them) — consumed
-// here, at the moment the timer is actually set, same idea as the potion
-// damage buff being consumed at the moment damage is computed.
-function scheduleNextAbility(player, c, now) {
-  const abilityId = c.loadout[c.abilityCursor];
-  let castSeconds = abilityId ? ABILITIES[abilityId].castSeconds : 1;
-  if (c.pendingHasteBuff) {
-    castSeconds *= c.pendingHasteBuff.multiplier;
-    c.pendingHasteBuff = null;
+// Nearest living enemy — the default (and only, no manual-targeting UI yet)
+// target for the player's offensive abilities. Simplest sane default; easy
+// to layer manual target-selection on top of later without touching the
+// engine below, since every offensive ability already goes through this.
+function pickTarget(c) {
+  let best = null;
+  for (const e of c.enemies) {
+    if (e.hp <= 0) continue;
+    if (!best || e.distance < best.distance) best = e;
   }
-  const speedBuff = getActiveCombatBuff(c);
-  if (speedBuff && speedBuff.type === 'speed') castSeconds *= speedBuff.multiplier;
-  castSeconds *= getPlayerModifiers(player).castSpeedMult; // dexterity + Swift Strikes/Adrenal Focus perks
-  c.currentAbilityStartedAt = now;
-  c.currentAbilityCastSeconds = castSeconds;
-  c.nextAbilityAt = now + castSeconds * 1000;
+  return best;
 }
 
-// Resolves whatever ability is currently under the cursor, then advances to
-// the next slot and schedules it. Melee-tagged abilities only take effect if
-// c.distance is within MELEE_RANGE — otherwise they "whiff" (cast time is
-// still spent, cursor still advances, but no effect), which is the real cost
-// of queuing a melee ability while the enemy has been pushed back.
-function resolvePlayerAbility(player, c, enemy, equip, now) {
+function livingEnemies(c) {
+  return c.enemies.filter((e) => e.hp > 0);
+}
+
+// Resolves the player's turn for one round: either continues charging the
+// ability under the cursor (see castRoundsRemaining/baseCastRounds — a
+// direct reinterpretation of the old continuous-time castSeconds as a
+// discrete tick count, so Power Strike still costs noticeably more "enemies
+// get free turns while you commit" than Punch) or, once fully charged,
+// applies its effect and advances to the next loadout slot. Melee-tagged
+// abilities only take effect if the target is within MELEE_RANGE —
+// otherwise they "whiff" (the charge was still spent, cursor still
+// advances, but no effect), same cost-of-commitment idea as before.
+function resolvePlayerTurn(player, c, equip, now) {
   const abilityId = c.loadout[c.abilityCursor];
-  const ability = abilityId ? ABILITIES[abilityId] : null;
+  if (!abilityId) return; // empty loadout slot under the cursor — nothing to do this round
 
-  if (ability) {
-    const isMelee = ability.tags.includes('melee');
-    const inRange = c.distance <= MELEE_RANGE;
-    let comboMultiplier = 1;
-    if (isMelee && c.pendingMeleeComboBuff) {
-      comboMultiplier = c.pendingMeleeComboBuff.multiplier;
-      c.pendingMeleeComboBuff = null;
+  if (c.castRoundsRemaining > 0) {
+    c.castRoundsRemaining -= 1;
+    c.lastPlayerActionText = `Charging ${ABILITIES[abilityId].name}...`;
+    return;
+  }
+
+  const ability = ABILITIES[abilityId];
+  const isMelee = ability.tags.includes('melee');
+  const target = pickTarget(c);
+  const inRange = !!target && target.distance <= MELEE_RANGE;
+  let comboMultiplier = 1;
+  if (isMelee && c.pendingMeleeComboBuff) {
+    comboMultiplier = c.pendingMeleeComboBuff.multiplier;
+    c.pendingMeleeComboBuff = null;
+  }
+  const potionBuff = getActiveCombatBuff(c);
+  const potionDmgMultiplier = potionBuff && potionBuff.type === 'damage' ? potionBuff.multiplier : 1;
+  // strength + Brute Force/Brutal Force perks only apply to melee-tagged abilities
+  const strMultiplier = isMelee ? getPlayerModifiers(player).meleeDamageMult : 1;
+  const totalMultiplier = comboMultiplier * potionDmgMultiplier * strMultiplier;
+
+  if (abilityId === 'swing') {
+    if (target && inRange) {
+      let dmg = Math.round(randInt(equip.damage[0], equip.damage[1]) * totalMultiplier);
+      if (Math.random() < equip.critChance) dmg *= 2;
+      target.hp = Math.max(0, target.hp - dmg);
+      c.lastPlayerActionText = `Swing hits ${ENEMIES[target.enemyId].name} for ${dmg}`;
+      if (equip.effect && Math.random() < equip.effect.chance) {
+        target.dot = { type: equip.effect.type, dps: equip.effect.dps, roundsLeft: equip.effect.duration };
+      }
+    } else {
+      c.lastPlayerActionText = 'Swing misses — too far away!';
     }
-    const potionBuff = getActiveCombatBuff(c);
-    const potionDmgMultiplier = potionBuff && potionBuff.type === 'damage' ? potionBuff.multiplier : 1;
-    // strength + Brute Force/Brutal Force perks only apply to melee-tagged abilities
-    const strMultiplier = isMelee ? getPlayerModifiers(player).meleeDamageMult : 1;
-    const totalMultiplier = comboMultiplier * potionDmgMultiplier * strMultiplier;
-
-    if (abilityId === 'swing') {
-      if (inRange) {
-        let dmg = Math.round(randInt(equip.damage[0], equip.damage[1]) * totalMultiplier);
-        if (Math.random() < equip.critChance) dmg *= 2;
-        c.enemyHp = Math.max(0, c.enemyHp - dmg);
-        c.lastPlayerActionText = `Swing hits for ${dmg}`;
-        if (equip.effect && Math.random() < equip.effect.chance) {
-          c.dotOnEnemy = { type: equip.effect.type, dps: equip.effect.dps, ticksLeft: equip.effect.duration, nextTickAt: now + 1000 };
-        }
-      } else {
-        c.lastPlayerActionText = 'Swing misses — too far away!';
-      }
-    } else if (abilityId === 'punch') {
-      if (inRange) {
-        const dmg = Math.round(randInt(2, 4) * totalMultiplier);
-        c.enemyHp = Math.max(0, c.enemyHp - dmg);
-        c.pendingMeleeComboBuff = { multiplier: 1.5 };
-        c.lastPlayerActionText = `Punch hits for ${dmg} — next melee ability is primed`;
-      } else {
-        c.lastPlayerActionText = 'Punch misses — too far away!';
-      }
-    } else if (abilityId === 'power_strike') {
-      if (inRange) {
-        let dmg = Math.round(randInt(equip.damage[0], equip.damage[1]) * 1.8 * totalMultiplier);
-        if (Math.random() < equip.critChance) dmg *= 2;
-        c.enemyHp = Math.max(0, c.enemyHp - dmg);
-        c.lastPlayerActionText = `Power Strike hits for ${dmg}!`;
-      } else {
-        c.lastPlayerActionText = 'Power Strike misses — too far away!';
-      }
-    } else if (abilityId === 'poison_jab') {
-      if (inRange) {
-        const dmg = Math.round(randInt(1, 3) * totalMultiplier);
-        c.enemyHp = Math.max(0, c.enemyHp - dmg);
-        c.dotOnEnemy = { type: 'poison', dps: 3, ticksLeft: 4, nextTickAt: now + 1000 };
-        c.lastPlayerActionText = `Poison Jab hits for ${dmg} and poisons the enemy`;
-      } else {
-        c.lastPlayerActionText = 'Poison Jab misses — too far away!';
-      }
-    } else if (abilityId === 'throw_dagger') {
+  } else if (abilityId === 'punch') {
+    if (target && inRange) {
+      const dmg = Math.round(randInt(2, 4) * totalMultiplier);
+      target.hp = Math.max(0, target.hp - dmg);
+      c.pendingMeleeComboBuff = { multiplier: 1.5 };
+      c.lastPlayerActionText = `Punch hits ${ENEMIES[target.enemyId].name} for ${dmg} — next melee ability is primed`;
+    } else {
+      c.lastPlayerActionText = 'Punch misses — too far away!';
+    }
+  } else if (abilityId === 'power_strike') {
+    if (target && inRange) {
+      let dmg = Math.round(randInt(equip.damage[0], equip.damage[1]) * 1.8 * totalMultiplier);
+      if (Math.random() < equip.critChance) dmg *= 2;
+      target.hp = Math.max(0, target.hp - dmg);
+      c.lastPlayerActionText = `Power Strike hits ${ENEMIES[target.enemyId].name} for ${dmg}!`;
+    } else {
+      c.lastPlayerActionText = 'Power Strike misses — too far away!';
+    }
+  } else if (abilityId === 'poison_jab') {
+    if (target && inRange) {
+      const dmg = Math.round(randInt(1, 3) * totalMultiplier);
+      target.hp = Math.max(0, target.hp - dmg);
+      target.dot = { type: 'poison', dps: 3, roundsLeft: 4 };
+      c.lastPlayerActionText = `Poison Jab hits ${ENEMIES[target.enemyId].name} for ${dmg} and poisons it`;
+    } else {
+      c.lastPlayerActionText = 'Poison Jab misses — too far away!';
+    }
+  } else if (abilityId === 'throw_dagger') {
+    if (target) {
       let dmg = Math.round(randInt(3, 6) * potionDmgMultiplier);
       if (Math.random() < 0.05) dmg *= 2;
-      c.enemyHp = Math.max(0, c.enemyHp - dmg);
-      c.lastPlayerActionText = `Throw Dagger hits for ${dmg}`;
-    } else if (abilityId === 'quick_step') {
-      c.distance = Math.min(MAX_DISTANCE, c.distance + QUICK_STEP_RETREAT);
-      c.evasionUntil = now + 1200;
-      c.lastPlayerActionText = 'Quick Step — you put distance between you and the enemy';
-    } else if (abilityId === 'guard_up') {
-      c.armorBuff = { amount: 5, expiresAt: now + 4000 };
-      c.lastPlayerActionText = 'Guard Up — your defense is bolstered';
-    } else if (abilityId === 'second_wind') {
-      c.playerHp = Math.min(c.playerMaxHp, c.playerHp + 15);
-      c.lastPlayerActionText = 'Second Wind — you recover some health';
-    } else if (abilityId === 'adrenaline_rush') {
-      c.pendingHasteBuff = { multiplier: 0.5 };
-      c.lastPlayerActionText = 'Adrenaline Rush — your next ability will be faster';
+      target.hp = Math.max(0, target.hp - dmg);
+      c.lastPlayerActionText = `Throw Dagger hits ${ENEMIES[target.enemyId].name} for ${dmg}`;
     }
+  } else if (abilityId === 'quick_step') {
+    for (const e of livingEnemies(c)) e.distance = Math.min(MAX_DISTANCE, e.distance + QUICK_STEP_RETREAT);
+    c.evasionUntil = now + 1200;
+    c.lastPlayerActionText = 'Quick Step — you put distance between yourself and every enemy';
+  } else if (abilityId === 'guard_up') {
+    c.armorBuff = { amount: 5, expiresAt: now + 4000 };
+    c.lastPlayerActionText = 'Guard Up — your defense is bolstered';
+  } else if (abilityId === 'second_wind') {
+    c.playerHp = Math.min(c.playerMaxHp, c.playerHp + 15);
+    c.lastPlayerActionText = 'Second Wind — you recover some health';
+  } else if (abilityId === 'adrenaline_rush') {
+    c.pendingHasteBuff = { multiplier: 0.5 };
+    c.lastPlayerActionText = 'Adrenaline Rush — your next ability will be faster';
   }
 
   advanceCursor(c);
-  scheduleNextAbility(player, c, now);
+  const nextAbilityId = c.loadout[c.abilityCursor];
+  let rounds = nextAbilityId ? baseCastRounds(nextAbilityId) : 1;
+  if (c.pendingHasteBuff) {
+    rounds *= c.pendingHasteBuff.multiplier;
+    c.pendingHasteBuff = null;
+  }
+  const speedBuff = getActiveCombatBuff(c);
+  if (speedBuff && speedBuff.type === 'speed') rounds *= speedBuff.multiplier;
+  rounds *= getPlayerModifiers(player).castSpeedMult; // dexterity + Swift Strikes/Adrenal Focus perks
+  c.castRoundsRemaining = Math.max(0, Math.round(rounds) - 1);
 }
 
-// If the enemy hasn't closed the distance yet (see the lazy approach-speed
-// update in tickCombat), the attack simply doesn't land and gets
-// rescheduled — no damage, no dot roll. Quick Step's evasionUntil window
-// gives a real chance to fully dodge an attack that DOES land in range; a
-// dexterity-based dodgeChance (getPlayerModifiers) is checked separately and
-// applies at all times, not just during that window.
-function resolveEnemyAttack(player, c, enemy, equip, now) {
-  if (c.distance > enemy.range) {
-    c.nextEnemyAttackAt = now + enemy.attackSpeed * 1000;
-    return;
-  }
+// One enemy's attack, targeting the player — shared by every aiType once
+// it's decided to attack rather than reposition this turn. Quick Step's
+// evasionUntil window (now anchored to round timestamps rather than a
+// continuous clock) gives a real chance to fully dodge; a dexterity-based
+// dodgeChance applies at all times on top of it.
+function resolveEnemyAttackOn(player, c, target, equip, now) {
+  const enemy = ENEMIES[target.enemyId];
   if (c.evasionUntil && now < c.evasionUntil && Math.random() < EVASION_DODGE_CHANCE) {
     c.lastEnemyActionText = `${enemy.name} attacks — dodged!`;
-    c.nextEnemyAttackAt = now + enemy.attackSpeed * 1000;
     return;
   }
   if (Math.random() < getPlayerModifiers(player).dodgeChance) {
     c.lastEnemyActionText = `${enemy.name} attacks — you dodge!`;
-    c.nextEnemyAttackAt = now + enemy.attackSpeed * 1000;
     return;
   }
   let dmg = randInt(enemy.damage[0], enemy.damage[1]);
@@ -1885,81 +2259,133 @@ function resolveEnemyAttack(player, c, enemy, equip, now) {
   c.playerHp = Math.max(0, c.playerHp - dmg);
   c.lastEnemyActionText = `${enemy.name} hits you for ${dmg}`;
   if (enemy.effect && Math.random() < enemy.effect.chance) {
-    c.dotOnPlayer = { type: enemy.effect.type, dps: enemy.effect.dps, ticksLeft: enemy.effect.duration, nextTickAt: now + 1000 };
+    c.dotOnPlayer = { type: enemy.effect.type, dps: enemy.effect.dps, roundsLeft: enemy.effect.duration };
   }
-  c.nextEnemyAttackAt = now + enemy.attackSpeed * 1000;
 }
+
+// One living enemy's full action for the round — move or attack, chosen by
+// its aiType (see the ENEMIES comment above for what each archetype does).
+function enemyTakeTurn(player, c, target, equip, now) {
+  const enemy = ENEMIES[target.enemyId];
+  const ai = enemy.aiType || 'melee_aggressive';
+
+  if (ai === 'ranged_kiter') {
+    const pref = enemy.preferredRange;
+    if (target.distance < pref - 12) {
+      target.distance = Math.min(MAX_DISTANCE, target.distance + enemy.approachSpeed);
+      c.lastEnemyActionText = `${enemy.name} backs away`;
+    } else if (target.distance > pref + 12) {
+      target.distance = Math.max(MIN_ENEMY_DISTANCE, target.distance - enemy.approachSpeed);
+      c.lastEnemyActionText = `${enemy.name} closes in`;
+    } else {
+      resolveEnemyAttackOn(player, c, target, equip, now);
+    }
+    return;
+  }
+
+  if (ai === 'skirmisher') {
+    if (target.distance > enemy.range) {
+      target.distance = Math.max(MIN_ENEMY_DISTANCE, target.distance - enemy.approachSpeed);
+      c.lastEnemyActionText = `${enemy.name} closes in`;
+    } else {
+      resolveEnemyAttackOn(player, c, target, equip, now);
+      target.distance = Math.min(MAX_DISTANCE, target.distance + (enemy.retreatDistance || 30));
+    }
+    return;
+  }
+
+  // melee_aggressive (default): close the distance, attack every turn it's in range
+  if (target.distance > enemy.range) {
+    target.distance = Math.max(MIN_ENEMY_DISTANCE, target.distance - enemy.approachSpeed);
+    c.lastEnemyActionText = `${enemy.name} closes in`;
+  } else {
+    resolveEnemyAttackOn(player, c, target, equip, now);
+  }
+}
+
+// One full combat round: the player acts (or continues charging) once, then
+// every still-living enemy takes its one action, then DOT resolves once per
+// afflicted target. dps/roundsLeft on a DOT are damage-per-round and
+// rounds-remaining now, not real-time-scaled — deliberately decoupled from
+// tickIntervalSeconds so a faster combat speed doesn't make poison hit
+// harder, just play out faster on screen.
+function resolveRound(player, c, equip, now) {
+  resolvePlayerTurn(player, c, equip, now);
+
+  for (const e of c.enemies) {
+    if (e.hp <= 0 || c.playerHp <= 0) continue;
+    enemyTakeTurn(player, c, e, equip, now);
+  }
+
+  for (const e of c.enemies) {
+    if (e.hp <= 0 || !e.dot) continue;
+    e.hp = Math.max(0, e.hp - e.dot.dps);
+    e.dot.roundsLeft -= 1;
+    if (e.dot.roundsLeft <= 0) e.dot = null;
+  }
+  if (c.dotOnPlayer) {
+    c.playerHp = Math.max(0, c.playerHp - c.dotOnPlayer.dps);
+    c.dotOnPlayer.roundsLeft -= 1;
+    if (c.dotOnPlayer.roundsLeft <= 0) c.dotOnPlayer = null;
+  }
+
+  c.round += 1;
+}
+
+// All enemies dead -> win (rewards summed across every enemy in the group);
+// player dead -> loss. Called after every resolved round.
+function checkCombatEnd(player, c) {
+  if (c.result) return;
+  if (c.enemies.every((e) => e.hp <= 0)) {
+    c.result = 'win';
+    let totalGold = 0;
+    c.rewardLoot = [];
+    const lootChanceBonus = getPlayerModifiers(player).lootChanceBonus;
+    for (const e of c.enemies) {
+      const enemy = ENEMIES[e.enemyId];
+      totalGold += randInt(enemy.goldReward[0], enemy.goldReward[1]);
+      player.skills.combat.xp += enemy.xpReward;
+      for (const drop of enemy.lootTable || []) {
+        if (Math.random() < drop.chance + lootChanceBonus) {
+          player.inventory[drop.item] = (player.inventory[drop.item] || 0) + 1;
+          c.rewardLoot.push(drop.item);
+        }
+      }
+      player.killCounts[e.enemyId] = (player.killCounts[e.enemyId] || 0) + 1;
+    }
+    player.inventory.gold = (player.inventory.gold || 0) + totalGold;
+    c.rewardGold = totalGold;
+    player.combatRecord.wins += 1;
+  } else if (c.playerHp <= 0) {
+    c.result = 'loss';
+    player.combatRecord.losses += 1;
+  }
+}
+
+// Elapsed-real-time-driven round loop — same lazy "catch up on however many
+// units have passed since last checked" idiom as tickSkills/tickGatherTasks,
+// just with "one unit" now being a full combat round instead of a resource
+// cycle. c.nextTickAt advances by exactly tickIntervalSeconds each round
+// (anchored to the previous scheduled time, not wall-clock "now"), so
+// rounds stay evenly paced under catch-up rather than drifting — same
+// fixed-anchor idea used for expedition/mining timing elsewhere. Capped per
+// call (mirrors GATHER_TICK_CAP) so a long-idle gap can't spin forever
+// synchronously; any leftover backlog just continues on the next call.
+const COMBAT_ROUND_CAP = 500;
 
 function tickCombat(player) {
   const c = player.combat;
   if (!c || c.result) return;
-  const enemy = ENEMIES[c.enemyId];
   const equip = getEquippedStats(player);
-
-  // Lazy elapsed-time distance-closing (same idiom as tickSkills/
-  // tickExpedition) — advanced up to each event's own timestamp as the walk
-  // below progresses, then one final time to "now" so distance is accurate
-  // even between events.
-  function advanceDistanceTo(t) {
-    const elapsedSeconds = Math.max(0, (t - c.lastDistanceUpdate) / 1000);
-    if (elapsedSeconds > 0) {
-      c.distance = Math.max(0, c.distance - enemy.approachSpeed * elapsedSeconds);
-      c.lastDistanceUpdate = t;
-    }
-  }
-
   const now = Date.now();
-  let guard = 0;
-  while (guard++ < 2000) {
-    if (c.playerHp <= 0 || c.enemyHp <= 0) break;
-    const candidates = [
-      { t: c.nextAbilityAt, type: 'ability' },
-      { t: c.nextEnemyAttackAt, type: 'enemyAttack' },
-    ];
-    if (c.dotOnEnemy) candidates.push({ t: c.dotOnEnemy.nextTickAt, type: 'dotEnemy' });
-    if (c.dotOnPlayer) candidates.push({ t: c.dotOnPlayer.nextTickAt, type: 'dotPlayer' });
-    candidates.sort((a, b) => a.t - b.t);
-    const next = candidates[0];
-    if (next.t > now) break;
-    advanceDistanceTo(next.t);
 
-    if (next.type === 'ability') {
-      resolvePlayerAbility(player, c, enemy, equip, next.t);
-    } else if (next.type === 'enemyAttack') {
-      resolveEnemyAttack(player, c, enemy, equip, next.t);
-    } else if (next.type === 'dotEnemy') {
-      c.enemyHp = Math.max(0, c.enemyHp - c.dotOnEnemy.dps);
-      c.dotOnEnemy.ticksLeft -= 1;
-      c.dotOnEnemy.nextTickAt = next.t + 1000;
-      if (c.dotOnEnemy.ticksLeft <= 0) c.dotOnEnemy = null;
-    } else if (next.type === 'dotPlayer') {
-      c.playerHp = Math.max(0, c.playerHp - c.dotOnPlayer.dps);
-      c.dotOnPlayer.ticksLeft -= 1;
-      c.dotOnPlayer.nextTickAt = next.t + 1000;
-      if (c.dotOnPlayer.ticksLeft <= 0) c.dotOnPlayer = null;
-    }
-  }
-  advanceDistanceTo(now);
-
-  if (c.enemyHp <= 0 && !c.result) {
-    c.result = 'win';
-    const gold = randInt(enemy.goldReward[0], enemy.goldReward[1]);
-    player.inventory.gold = (player.inventory.gold || 0) + gold;
-    player.skills.combat.xp += enemy.xpReward;
-    c.rewardGold = gold;
-    c.rewardLoot = [];
-    const lootChanceBonus = getPlayerModifiers(player).lootChanceBonus;
-    for (const drop of enemy.lootTable || []) {
-      if (Math.random() < drop.chance + lootChanceBonus) {
-        player.inventory[drop.item] = (player.inventory[drop.item] || 0) + 1;
-        c.rewardLoot.push(drop.item);
-      }
-    }
-    player.killCounts[c.enemyId] = (player.killCounts[c.enemyId] || 0) + 1;
-    player.combatRecord.wins += 1;
-  } else if (c.playerHp <= 0 && !c.result) {
-    c.result = 'loss';
-    player.combatRecord.losses += 1;
+  let rounds = 0;
+  while (rounds < COMBAT_ROUND_CAP && !c.result && c.nextTickAt <= now) {
+    const roundNow = c.nextTickAt;
+    resolveRound(player, c, equip, roundNow);
+    checkCombatEnd(player, c);
+    c.nextTickAt = roundNow + c.tickIntervalSeconds * 1000;
+    rounds++;
   }
 }
 
@@ -1996,15 +2422,7 @@ function xpProgress(xp) {
   return { level, xpIntoLevel: remaining, xpToNextLevel: xpCostForLevel(level) };
 }
 
-const GATHER_ITEM_NAMES = {
-  hunting: 'Raw Meat (chance)',
-  scavenging: 'Random Finds (chance)',
-  harvesting: 'Seeds & Crops (chance)',
-};
-
 function publicSkill(skillId, skill) {
-  const config = TASK_CONFIG[skillId];
-  const gatherConfig = GATHER_TASKS[skillId];
   const { level, xpIntoLevel, xpToNextLevel } = xpProgress(skill.xp);
   const base = {
     xp: skill.xp,
@@ -2012,37 +2430,16 @@ function publicSkill(skillId, skill) {
     xpIntoLevel,
     xpToNextLevel,
   };
-  if (gatherConfig) {
-    // usable from anywhere (locationless: true) and each cycle only has a
-    // chance of a yield, unlike TASK_CONFIG's guaranteed-per-cycle items
-    return {
-      ...base,
-      active: !!skill.taskStartedAt,
-      itemName: GATHER_ITEM_NAMES[skillId],
-      cycleSeconds: gatherConfig.cycleSeconds,
-      progressSeconds: skill.progressSeconds || 0,
-      locationless: true,
-    };
-  }
-  if (skillId === 'mining') {
-    // its own node-grid system (see MINING_NODES/publicMiningNodes) — this
-    // entry is just level/xp/active for anything reading player.skills
-    // generically (e.g. the Statistics tab); the Mining tab uses
-    // player.miningNodes instead.
-    return { ...base, active: !!skill.taskStartedAt };
-  }
-  if (!config) {
-    // e.g. combat — leveled by xp like any skill, but not a passive cycle task
+  if (!RESOURCE_NODES[skillId]) {
+    // e.g. combat — leveled by xp like any skill, but not a node-based task
     return { ...base, active: false };
   }
-  return {
-    ...base,
-    active: !!skill.taskStartedAt,
-    item: config.item,
-    itemName: ITEMS[config.item].name,
-    cycleSeconds: config.cycleSeconds,
-    progressSeconds: skill.progressSeconds || 0,
-  };
+  // Every resource skill (mining/woodcutting/fishing/hunting/scavenging/
+  // harvesting) is node-grid based now — this entry is just level/xp/active
+  // for anything reading player.skills generically (e.g. the Statistics
+  // tab); the real per-node detail (which item, locked/unlocked, progress)
+  // comes from player.<skillId>Nodes — see publicResourceNodes()/publicPlayer().
+  return { ...base, active: !!skill.taskStartedAt };
 }
 
 function questObjectiveMet(player, quest) {
@@ -2054,15 +2451,25 @@ function questObjectiveMet(player, quest) {
 }
 
 function publicPlayer(player) {
-  tickSkills(player);
-  tickMining(player);
-  tickGatherTasks(player);
+  for (const skillId of Object.keys(RESOURCE_NODES)) {
+    tickResourceTask(player, skillId);
+  }
   tickExpedition(player);
   tickCombat(player);
   save();
   const skills = {};
   for (const [id, skill] of Object.entries(player.skills)) {
     skills[id] = publicSkill(id, skill);
+  }
+  // Fishing-only bonus-catch minigame timing, merged in here (not inside
+  // publicSkill()) since it needs the full player object for
+  // getPlayerModifiers()/player.id, not just the one skill entry.
+  if (skills.fishing && skills.fishing.active) {
+    const bite = getFishingBite(player);
+    if (bite) {
+      skills.fishing.biteAt = bite.biteAt;
+      skills.fishing.biteWindowMs = bite.windowMs;
+    }
   }
   const inventory = Object.entries(player.inventory).map(([itemId, count]) => ({
     id: itemId,
@@ -2091,30 +2498,36 @@ function publicPlayer(player) {
   let combat = null;
   if (player.combat) {
     const c = player.combat;
-    const enemy = ENEMIES[c.enemyId];
     const activeBuff = getActiveCombatBuff(c);
     const armorBuffActive = getActiveArmorBuff(c);
     combat = {
-      enemyId: c.enemyId,
-      enemyName: enemy.name,
+      enemies: c.enemies.map((e) => {
+        const enemy = ENEMIES[e.enemyId];
+        return {
+          uid: e.uid,
+          enemyId: e.enemyId,
+          name: enemy.name,
+          hp: e.hp,
+          maxHp: e.maxHp,
+          distance: e.distance,
+          angle: e.angle,
+          alive: e.hp > 0,
+          dot: e.dot ? { type: e.dot.type } : null,
+        };
+      }),
       playerHp: c.playerHp,
       playerMaxHp: c.playerMaxHp,
-      enemyHp: c.enemyHp,
-      enemyMaxHp: c.enemyMaxHp,
-      distance: c.distance,
       maxDistance: MAX_DISTANCE,
       meleeRange: MELEE_RANGE,
-      enemyRange: enemy.range,
-      loadout: c.loadout.map((id) => (id ? { id, name: ABILITIES[id].name, castSeconds: ABILITIES[id].castSeconds } : null)),
+      loadout: c.loadout.map((id) => (id ? { id, name: ABILITIES[id].name } : null)),
       abilityCursor: c.abilityCursor,
-      currentAbilityStartedAt: c.currentAbilityStartedAt,
-      currentAbilityCastSeconds: c.currentAbilityCastSeconds,
+      castRoundsRemaining: c.castRoundsRemaining,
+      tickIntervalSeconds: c.tickIntervalSeconds,
+      nextTickAt: c.nextTickAt,
+      round: c.round,
       result: c.result,
       rewardGold: c.rewardGold || 0,
       rewardLoot: (c.rewardLoot || []).map((itemId) => ({ id: itemId, name: ITEMS[itemId].name })),
-      enemyAttackSpeed: enemy.attackSpeed,
-      nextEnemyAttackAt: c.nextEnemyAttackAt,
-      dotOnEnemy: c.dotOnEnemy ? { type: c.dotOnEnemy.type } : null,
       dotOnPlayer: c.dotOnPlayer ? { type: c.dotOnPlayer.type } : null,
       buff: activeBuff ? { type: activeBuff.type } : null,
       armorBuffActive: !!armorBuffActive,
@@ -2232,12 +2645,13 @@ function publicPlayer(player) {
       triedCount: player.alchemy.triedCombos.length,
     },
     abilityLoadout: player.abilityLoadout,
+    combatSpeed: player.combatSpeed,
     abilities: Object.entries(ABILITIES).map(([id, a]) => ({
       id,
       name: a.name,
       description: a.description,
       tags: a.tags,
-      castSeconds: a.castSeconds,
+      castRounds: baseCastRounds(id), // rounds this ability occupies the player's turn for once queued — see resolvePlayerTurn()
       unlockLevel: a.unlockLevel,
       unlocked: a.unlockLevel <= levelFromXp(player.skills.combat.xp),
     })),
@@ -2255,7 +2669,12 @@ function publicPlayer(player) {
       unlocked: player.perks.includes(id),
       levelMet: levelFromXp(player.characterXp) >= perk.requiresLevel,
     })),
-    miningNodes: publicMiningNodes(player),
+    miningNodes: publicResourceNodes(player, 'mining'),
+    woodcuttingNodes: publicResourceNodes(player, 'woodcutting'),
+    fishingNodes: publicResourceNodes(player, 'fishing'),
+    huntingNodes: publicResourceNodes(player, 'hunting'),
+    scavengingNodes: publicResourceNodes(player, 'scavenging'),
+    harvestingNodes: publicResourceNodes(player, 'harvesting'),
   };
 }
 
@@ -2324,37 +2743,12 @@ function travel(playerId, locationId) {
   return { currentLocation: locationId };
 }
 
-function startTask(playerId, skillId) {
-  const player = getPlayer(playerId);
-  if (!player) return { error: 'not_found' };
-  const skill = player.skills[skillId];
-  if (!skill) return { error: 'unknown_skill' };
-  // gather tasks (hunting/scavenging/harvesting) are usable from anywhere —
-  // only TASK_CONFIG skills (mining/woodcutting/fishing) require standing at
-  // their specific location
-  if (!GATHER_TASKS[skillId]) {
-    const loc = getLocation(player.currentLocation);
-    if (!loc || loc.skill !== skillId) return { error: 'wrong_location' };
-  }
-  if (player.combat && !player.combat.result) return { error: 'busy_fighting' };
-  if (player.expedition) return { error: 'busy_exploring' };
-
-  // only one skill task at a time — starting this one stops any other
-  stopAllSkillTasks(player);
-
-  skill.taskStartedAt = Date.now();
-  skill.lastTick = Date.now();
-  save();
-  return { ok: true };
-}
-
 function stopTask(playerId, skillId) {
   const player = getPlayer(playerId);
   if (!player) return { error: 'not_found' };
   const skill = player.skills[skillId];
   if (!skill) return { error: 'unknown_skill' };
-  if (skillId === 'mining') tickMining(player);
-  else tickSkills(player);
+  tickResourceTask(player, skillId);
   skill.taskStartedAt = null;
   skill.lastTick = null;
   save();
@@ -2412,7 +2806,8 @@ function startCombat(playerId, enemyId) {
   if (!player.abilityLoadout.some(Boolean)) return { error: 'no_abilities_equipped' };
 
   stopAllSkillTasks(player); // only one task at a time — starting a fight stops any active skill
-  beginCombatInstance(player, enemyId, false);
+  const group = rollEncounterGroup(loc, enemyId);
+  beginCombatInstance(player, group, false);
   save();
   return { ok: true };
 }
@@ -2424,6 +2819,23 @@ function endCombat(playerId) {
   if (!player) return { error: 'not_found' };
   if (!player.combat) return { error: 'no_combat' };
   player.combat = null;
+  save();
+  return { ok: true };
+}
+
+// Persisted preference (carries between fights) that also takes effect
+// immediately on a fight already in progress — resets the round timer's
+// anchor to "now" at the new pace rather than trying to rescale whatever
+// time was already remaining until the next round.
+function setCombatSpeed(playerId, speed) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  if (!COMBAT_SPEED_PRESETS[speed]) return { error: 'invalid_speed' };
+  player.combatSpeed = speed;
+  if (player.combat && !player.combat.result) {
+    player.combat.tickIntervalSeconds = COMBAT_SPEED_PRESETS[speed];
+    player.combat.nextTickAt = Date.now() + COMBAT_SPEED_PRESETS[speed] * 1000;
+  }
   save();
   return { ok: true };
 }
@@ -2633,7 +3045,9 @@ function usePotion(playerId, itemId) {
   } else if (effect.kind === 'buff_speed') {
     c.buff = { type: 'speed', multiplier: effect.multiplier, expiresAt: Date.now() + effect.durationSeconds * 1000 };
   } else if (effect.kind === 'poison_enemy') {
-    c.dotOnEnemy = { type: 'venom', dps: effect.dps, ticksLeft: effect.duration, nextTickAt: Date.now() + 1000 };
+    const target = pickTarget(c);
+    if (!target) return { error: 'no_target' };
+    target.dot = { type: 'venom', dps: effect.dps, roundsLeft: effect.duration };
   }
 
   player.inventory[itemId] -= 1;
@@ -2864,13 +3278,9 @@ function devResetPlayer(playerId) {
   player.combat = null;
   player.garden = { plots: new Array(GARDEN_PLOT_COUNT).fill(null) };
   for (const skillId of Object.keys(player.skills)) {
-    if (skillId === 'mining') {
-      player.skills.mining = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null };
-    } else {
-      player.skills[skillId] = TASK_CONFIG[skillId] || GATHER_TASKS[skillId]
-        ? { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null }
-        : { xp: 0 };
-    }
+    player.skills[skillId] = RESOURCE_NODES[skillId]
+      ? { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null }
+      : { xp: 0 };
   }
   player.farm = { animals: [] };
   player.buildings = {};
@@ -2904,7 +3314,7 @@ module.exports = {
   SHOP_ITEMS,
   LOCATION_REVEAL_PRICE,
   PERKS,
-  MINING_NODES,
+  RESOURCE_NODES,
   TRAIT_KEYS,
   TRAIT_BASE,
   TRAIT_MIN,
@@ -2917,13 +3327,14 @@ module.exports = {
   publicPlayer,
   startExpedition,
   travel,
-  startTask,
   stopTask,
-  startMiningNode,
+  attemptFishingCatch,
+  startResourceTask,
   equipItem,
   unequipItem,
   startCombat,
   endCombat,
+  setCombatSpeed,
   setLoadoutSlot,
   plantSeed,
   harvestPlot,

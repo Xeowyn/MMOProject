@@ -42,6 +42,7 @@
   <nav id="tab-nav">
     <button class="tab-btn active" data-tab="overworld"><span class="tab-icon">🗺️</span>Overworld</button>
     <button class="tab-btn" data-tab="mining"><span class="tab-icon">⛏️</span>Mining</button>
+    <button class="tab-btn" data-tab="fishing"><span class="tab-icon">🎣</span>Fishing</button>
     <button class="tab-btn" data-tab="skills"><span class="tab-icon">📈</span>Skills</button>
     <button class="tab-btn" data-tab="character"><span class="tab-icon">🧬</span>Character</button>
     <button class="tab-btn" data-tab="combat"><span class="tab-icon">⚔️</span>Combat</button>
@@ -85,6 +86,7 @@
 
         <section class="panel">
           <h2>Gather</h2>
+          <p class="card-sub">Every spot you've unlocked for each task, worked from wherever you are &mdash; no travel needed. Discovering a location on the map unlocks its tile below. Click a tile to work it; click the active tile again to stop.</p>
           <div class="task-row">
             <canvas id="hunting-clock" class="task-clock" width="56" height="56"></canvas>
             <div class="task-info">
@@ -92,7 +94,7 @@
               <div id="hunting-label" class="skill-label"></div>
             </div>
           </div>
-          <button id="hunting-btn"></button>
+          <div id="hunting-grid" class="mining-grid mining-grid-compact"></div>
 
           <div class="task-row" style="margin-top: 14px;">
             <canvas id="scavenging-clock" class="task-clock" width="56" height="56"></canvas>
@@ -101,7 +103,7 @@
               <div id="scavenging-label" class="skill-label"></div>
             </div>
           </div>
-          <button id="scavenging-btn"></button>
+          <div id="scavenging-grid" class="mining-grid mining-grid-compact"></div>
 
           <div class="task-row" style="margin-top: 14px;">
             <canvas id="harvesting-clock" class="task-clock" width="56" height="56"></canvas>
@@ -110,7 +112,7 @@
               <div id="harvesting-label" class="skill-label"></div>
             </div>
           </div>
-          <button id="harvesting-btn"></button>
+          <div id="harvesting-grid" class="mining-grid mining-grid-compact"></div>
         </section>
 
         <section class="panel">
@@ -136,6 +138,28 @@
       </div>
 
       <div id="mining-grid" class="mining-grid"></div>
+    </div>
+
+    <div id="tab-fishing" class="tab-panel hidden">
+      <h2>Fishing</h2>
+      <p class="card-sub">Every fishing spot you've unlocked, in one place &mdash; no travel needed. Discovering a spot's location on the Overworld map unlocks it here. Click a spot to fish it; click the active spot again to stop.</p>
+
+      <div id="fishing-active-panel" class="skill-card hidden">
+        <h3 id="fishing-active-name"></h3>
+        <div class="task-row">
+          <canvas id="fishing-clock" class="task-clock" width="70" height="70"></canvas>
+          <div class="task-info">
+            <div class="bar-wrap"><div id="fishing-bar-fill" class="bar-fill"></div></div>
+            <div id="fishing-label" class="skill-label"></div>
+          </div>
+        </div>
+        <div class="fishing-minigame">
+          <button id="fishing-catch-btn" class="catch-btn" disabled>🎣 Catch!</button>
+          <div class="fishing-hint">Optional: click the instant a fish bites for a bonus catch. Ignore it and fishing still works exactly like any other task.</div>
+        </div>
+      </div>
+
+      <div id="fishing-grid" class="mining-grid"></div>
     </div>
 
     <div id="tab-skills" class="tab-panel hidden">
@@ -164,6 +188,7 @@
       <div id="combat-idle">
         <div id="combat-idle-main">
           <div id="combat-location-info">Location: --</div>
+          <div id="combat-speed-controls-idle" class="speed-controls"></div>
           <div id="combat-enemy-list"></div>
 
           <h3>Ability Loadout</h3>
@@ -179,6 +204,8 @@
       </div>
 
       <div id="combat-active" class="hidden">
+        <div id="combat-speed-controls" class="speed-controls"></div>
+
         <div id="arena-wrap">
           <canvas id="arena-canvas" width="360" height="360"></canvas>
         </div>
@@ -188,11 +215,8 @@
           <div class="hp-bar-wrap"><div id="player-hp-fill" class="hp-bar-fill"></div></div>
           <div id="player-status-line" class="effect-label"></div>
         </div>
-        <div class="arena-combatant">
-          <div class="arena-combatant-header"><span id="enemy-name">Enemy</span><span id="enemy-hp-label"></span></div>
-          <div class="hp-bar-wrap"><div id="enemy-hp-fill" class="hp-bar-fill enemy"></div></div>
-          <div id="enemy-status-line" class="effect-label"></div>
-        </div>
+
+        <div id="enemy-list"></div>
 
         <div id="combat-log"></div>
 

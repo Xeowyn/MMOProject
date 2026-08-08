@@ -7,6 +7,14 @@ const SKILL_DISPLAY_NAMES = {
   harvesting: 'Harvesting',
 };
 
+// Every resource-gathering skill is node-grid based (server: RESOURCE_NODES/
+// DETERMINISTIC_TASKS in server/store.js) — mining/woodcutting/fishing yield
+// one guaranteed item per cycle, hunting/scavenging/harvesting only have a
+// chance each cycle. Drives the generic renderNodeSkill()/clockSync loop
+// below so every one of the 6 gets the same node-tile picker UI.
+const RESOURCE_SKILL_IDS = ['mining', 'woodcutting', 'fishing', 'hunting', 'scavenging', 'harvesting'];
+const DETERMINISTIC_SKILL_IDS = new Set(['mining', 'woodcutting', 'fishing']);
+
 const state = {
   playerId: localStorage.getItem('mmo_playerId') || null,
   token: localStorage.getItem('mmo_token') || null,
@@ -269,11 +277,10 @@ async function enterGame() {
   await refreshMe();
   scheduleNextPoll();
 
-  // gather tasks live on the Overworld tab, not the generic Skills-tab
-  // builder (buildSkillsTab() skips them), so their buttons are wired here
-  document.getElementById('hunting-btn').addEventListener('click', () => toggleTask('hunting'));
-  document.getElementById('scavenging-btn').addEventListener('click', () => toggleTask('scavenging'));
-  document.getElementById('harvesting-btn').addEventListener('click', () => toggleTask('harvesting'));
+  // Fishing tab is static HTML (not built dynamically like the old
+  // per-skill Skills-tab cards were), so its one-off Catch button is wired
+  // here rather than inside a build function.
+  document.getElementById('fishing-catch-btn').addEventListener('click', attemptFishingCatch);
   document.getElementById('explore-btn').addEventListener('click', toggleDrawMode);
   document.getElementById('confirm-btn').addEventListener('click', confirmDrawnPath);
   document.getElementById('cancel-btn').addEventListener('click', cancelDrawnPath);
@@ -369,7 +376,8 @@ async function refreshMe() {
   // anything — surface that transition distinctly from a fight the player
   // chose to start (which they already know about, having just clicked it).
   if (!wasInCombat && state.player.combat && state.player.combat.ambush) {
-    showToast(`Ambushed! A ${state.player.combat.enemyName} attacks while you were hunting!`);
+    const attacker = state.player.combat.enemies[0];
+    showToast(`Ambushed! A ${attacker ? attacker.name : 'creature'} attacks while you were hunting!`);
   }
 
   if (
@@ -381,23 +389,16 @@ async function refreshMe() {
   }
 
   const now = Date.now();
-  for (const [skillId, skill] of Object.entries(state.player.skills)) {
-    if (skill.cycleSeconds === undefined) continue;
-    state.clockSync[skillId] = {
-      progressSeconds: skill.progressSeconds,
-      cycleSeconds: skill.cycleSeconds,
-      active: skill.active,
-      syncedAt: now,
-    };
+  // Every resource skill's clock lives in its node list (player.<skillId>Nodes,
+  // one active node at a time), not on the skill entry itself — sync the
+  // same shape for all 6 so animate() can drive each `${skillId}-clock`
+  // canvas with the identical fixed-anchor extrapolation trick.
+  for (const skillId of RESOURCE_SKILL_IDS) {
+    const activeNode = state.player[`${skillId}Nodes`].find((n) => n.active);
+    state.clockSync[skillId] = activeNode
+      ? { progressSeconds: activeNode.progressSeconds, cycleSeconds: activeNode.cycleSeconds, active: true, syncedAt: now }
+      : { progressSeconds: 0, cycleSeconds: 1, active: false, syncedAt: now };
   }
-  // Mining's clock isn't a player.skills entry (it lives in miningNodes,
-  // one active node at a time) — sync the same shape separately so
-  // animate() can drive #mining-clock with the identical extrapolation
-  // trick every other skill clock uses.
-  const activeNode = state.player.miningNodes.find((n) => n.active);
-  state.clockSync.mining = activeNode
-    ? { progressSeconds: activeNode.progressSeconds, cycleSeconds: activeNode.cycleSeconds, active: true, syncedAt: now }
-    : { progressSeconds: 0, cycleSeconds: 1, active: false, syncedAt: now };
 
   // Anchor the sweep to the expedition's fixed startedAt/durationSeconds
   // ONCE, the moment it's first seen — never re-derive it from a later
@@ -748,134 +749,168 @@ async function travelTo(locationId) {
 }
 
 // --- skills tab ---
+// Only Woodcutting lives here — Mining and Fishing each got promoted to
+// their own top-level tab (more room for the node grid), and Hunting/
+// Scavenging/Harvesting live in the Overworld sidebar's Gather panel.
+// Combat has no card here — it's leveled by xp like any skill but isn't a
+// node-based task, and its UI lives entirely in the Combat tab.
 
 function buildSkillsTab() {
   const container = document.getElementById('skills-container');
-  container.innerHTML = '';
-  for (const [skillId, skill] of Object.entries(state.player.skills)) {
-    if (skill.cycleSeconds === undefined) continue; // not a cycle/task skill (e.g. combat)
-    if (skill.locationless) continue; // gather tasks (hunting/scavenging/harvesting) live on the Overworld tab instead
-    const displayName = SKILL_DISPLAY_NAMES[skillId] || skillId;
-    const card = document.createElement('div');
-    card.className = 'skill-card';
-    card.innerHTML = `
-      <h3>${displayName}</h3>
+  container.innerHTML = `
+    <div class="skill-card">
+      <h3>Woodcutting</h3>
       <div class="task-row">
-        <canvas id="${skillId}-clock" class="task-clock" width="70" height="70"></canvas>
+        <canvas id="woodcutting-clock" class="task-clock" width="70" height="70"></canvas>
         <div class="task-info">
-          <div class="bar-wrap"><div id="${skillId}-bar-fill" class="bar-fill"></div></div>
-          <div id="${skillId}-label" class="skill-label"></div>
+          <div class="bar-wrap"><div id="woodcutting-bar-fill" class="bar-fill"></div></div>
+          <div id="woodcutting-label" class="skill-label"></div>
         </div>
       </div>
-      <button id="${skillId}-btn"></button>
-    `;
-    container.appendChild(card);
-    document.getElementById(`${skillId}-btn`).addEventListener('click', () => toggleTask(skillId));
-  }
+      <div id="woodcutting-grid" class="mining-grid mining-grid-compact"></div>
+    </div>
+  `;
 }
 
-async function toggleTask(skillId) {
-  const skill = state.player.skills[skillId];
-  const endpoint = skill.active ? '/api/task/stop' : '/api/task/start';
+// The minigame is purely a client-side-rendered bonus on top of the passive
+// clock (see animate()'s bite-window check, which enables/disables this
+// button) — clicking sends exactly one lightweight request, same shape as
+// any other player-triggered action (craft/equip/buy). The server is the
+// sole authority on whether the click landed in the real window (see
+// getFishingBite()/attemptFishingCatch() in server/store.js); this never
+// trusts the client's own clock for anything but when to let the player try.
+async function attemptFishingCatch() {
+  let result;
   try {
-    await api(endpoint, {
+    result = await api('/api/fishing/catch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, skillId }),
+      body: JSON.stringify({ playerId: state.playerId }),
     });
   } catch {
     return;
   }
+  if (result.success) {
+    showToast(`Bonus catch! +${result.amount} ${result.itemName}, +${result.xp} xp`);
+  } else if (result.reason === 'missed') {
+    showToast('Missed the bite!');
+  } else if (result.reason === 'already_attempted') {
+    showToast('Already tried this bite — wait for the next one.');
+  }
   await refreshMe();
 }
 
-function updateSkillsTab() {
-  const currentLoc = state.locations.find((l) => l.id === state.player.currentLocation);
-  for (const [skillId, skill] of Object.entries(state.player.skills)) {
-    if (skill.cycleSeconds === undefined) continue;
-    const barFill = document.getElementById(`${skillId}-bar-fill`);
-    if (!barFill) continue;
-    const label = document.getElementById(`${skillId}-label`);
-    const btn = document.getElementById(`${skillId}-btn`);
-
-    barFill.style.width = `${(skill.xpIntoLevel / skill.xpToNextLevel) * 100}%`;
-    label.textContent = `Lvl ${skill.level} — ${skill.xpIntoLevel} / ${skill.xpToNextLevel} xp — yields ${skill.itemName}`;
-
-    const atLoc = skill.locationless || (currentLoc && currentLoc.skill === skillId);
-    const skillLoc = state.locations.find((l) => l.skill === skillId);
-    btn.disabled = !atLoc;
-    const displayName = SKILL_DISPLAY_NAMES[skillId] || skillId;
-    btn.textContent = !atLoc
-      ? `Travel to ${skillLoc ? skillLoc.name : 'the right location'}`
-      : skill.active
-        ? `Stop ${displayName}`
-        : `Start ${displayName}`;
-  }
-}
-
-// --- mining tab (Melvor-Idle-style node grid) ---
-// Unlike woodcutting/fishing (TASK_CONFIG, tied to a physical location),
-// mining nodes unlock via discovery and are minable from here regardless of
-// where the player currently is — see MINING_NODES/tickMining() in
-// server/store.js. Tiles reuse the same visual language as the garden's
-// plot grid (.garden-plot-tile) rather than inventing a new pattern.
-
-function renderMiningTab() {
-  const nodes = state.player.miningNodes;
+// --- unified node-skill engine (Melvor-Idle-style node grid) ---
+// Drives all 6 resource skills (mining/woodcutting/fishing/hunting/
+// scavenging/harvesting) off player.<skillId>Nodes — see RESOURCE_NODES/
+// publicResourceNodes() in server/store.js. Every node is workable from
+// wherever the player currently is once its location has been discovered;
+// each skill's starting-camp node is always unlocked. Tiles reuse the same
+// visual language as the garden's plot grid (.garden-plot-tile) rather than
+// inventing a new pattern. Mining/Fishing each get a full dedicated tab with
+// a big "currently working X" header panel; Woodcutting (Skills tab) and
+// Hunting/Scavenging/Harvesting (Overworld sidebar) use the compact form —
+// just the clock/bar/label and grid, no separate header panel — since they
+// share space with other UI. opts: { gridId, barFillId, labelId,
+// activePanelId?, activeNameId? }
+function renderNodeSkill(skillId, opts) {
+  const nodes = state.player[`${skillId}Nodes`];
+  const skill = state.player.skills[skillId];
+  const deterministic = DETERMINISTIC_SKILL_IDS.has(skillId);
   const activeNode = nodes.find((n) => n.active);
 
-  const panel = document.getElementById('mining-active-panel');
-  if (activeNode) {
-    const miningSkill = state.player.skills.mining;
-    panel.classList.remove('hidden');
-    document.getElementById('mining-active-name').textContent = `Mining: ${activeNode.name}`;
-    document.getElementById('mining-bar-fill').style.width = `${(miningSkill.xpIntoLevel / miningSkill.xpToNextLevel) * 100}%`;
-    document.getElementById('mining-label').textContent =
-      `Lvl ${miningSkill.level} — ${miningSkill.xpIntoLevel} / ${miningSkill.xpToNextLevel} xp — yields ${activeNode.itemName} every ${activeNode.cycleSeconds}s`;
-  } else {
-    panel.classList.add('hidden');
+  if (opts.activePanelId) {
+    const panel = document.getElementById(opts.activePanelId);
+    if (activeNode) {
+      panel.classList.remove('hidden');
+      document.getElementById(opts.activeNameId).textContent = `${SKILL_DISPLAY_NAMES[skillId]}: ${activeNode.name}`;
+    } else {
+      panel.classList.add('hidden');
+    }
   }
 
-  const grid = document.getElementById('mining-grid');
+  const barFill = document.getElementById(opts.barFillId);
+  const label = document.getElementById(opts.labelId);
+  if (barFill && label) {
+    barFill.style.width = `${(skill.xpIntoLevel / skill.xpToNextLevel) * 100}%`;
+    let status;
+    if (!activeNode) {
+      status = 'idle — select a spot below';
+    } else if (deterministic) {
+      status = `yields ${activeNode.itemName} every ${activeNode.cycleSeconds}s`;
+    } else {
+      status = `working — chance of ${activeNode.resultItemNames.join(' / ')} every ${activeNode.cycleSeconds}s`;
+    }
+    label.textContent = `Lvl ${skill.level} — ${skill.xpIntoLevel} / ${skill.xpToNextLevel} xp — ${status}`;
+  }
+
+  const grid = document.getElementById(opts.gridId);
+  if (!grid) return;
   grid.innerHTML = '';
   for (const node of nodes) {
-    const tile = document.createElement('div');
-    tile.className = 'mining-node-tile';
-    if (!node.unlocked) {
-      tile.classList.add('locked');
-      tile.title = `${node.name}: locked — discover ${node.locationName} on the Overworld map to unlock.`;
-      tile.innerHTML = `<span class="mining-node-icon">🔒</span><span class="mining-node-label">${node.name}</span>`;
-    } else {
-      tile.classList.toggle('active', node.active);
-      tile.title = node.active
-        ? `${node.name}: mining now — click to stop`
-        : `${node.name}: click to mine (yields ${node.itemName})`;
-      tile.innerHTML = `<span class="mining-node-icon">⛏️</span><span class="mining-node-label">${node.name}</span><span class="mining-node-sub">${node.itemName}</span>`;
-      tile.addEventListener('click', () => onMiningTileClick(node));
-    }
-    grid.appendChild(tile);
+    grid.appendChild(renderNodeTile(skillId, node, deterministic));
   }
 }
 
-async function onMiningTileClick(node) {
+function renderNodeTile(skillId, node, deterministic) {
+  const tile = document.createElement('div');
+  tile.className = 'mining-node-tile';
+  if (!node.unlocked) {
+    tile.classList.add('locked');
+    tile.title = `${node.name}: locked — discover ${node.locationName} on the Overworld map to unlock.`;
+    tile.innerHTML = `<span class="mining-node-icon">🔒</span><span class="mining-node-label">${node.name}</span>`;
+    return tile;
+  }
+  const yieldLabel = deterministic ? node.itemName : node.resultItemNames.join(' / ');
+  tile.classList.toggle('active', node.active);
+  tile.title = node.active
+    ? `${node.name}: working now — click to stop`
+    : `${node.name}: click to start (yields ${yieldLabel})`;
+  tile.innerHTML = `<span class="mining-node-icon">${deterministic ? '⛏️' : '🎯'}</span><span class="mining-node-label">${node.name}</span><span class="mining-node-sub">${yieldLabel}</span>`;
+  tile.addEventListener('click', () => onNodeTileClick(skillId, node));
+  return tile;
+}
+
+async function onNodeTileClick(skillId, node) {
   try {
     if (node.active) {
       await api('/api/task/stop', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerId: state.playerId, skillId: 'mining' }),
+        body: JSON.stringify({ playerId: state.playerId, skillId }),
       });
     } else {
-      await api('/api/mining/start', {
+      await api('/api/task/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerId: state.playerId, nodeId: node.id }),
+        body: JSON.stringify({ playerId: state.playerId, skillId, nodeId: node.id }),
       });
     }
   } catch {
     return;
   }
   await refreshMe();
+}
+
+function renderAllNodeSkills() {
+  renderNodeSkill('mining', {
+    activePanelId: 'mining-active-panel',
+    activeNameId: 'mining-active-name',
+    barFillId: 'mining-bar-fill',
+    labelId: 'mining-label',
+    gridId: 'mining-grid',
+  });
+  renderNodeSkill('fishing', {
+    activePanelId: 'fishing-active-panel',
+    activeNameId: 'fishing-active-name',
+    barFillId: 'fishing-bar-fill',
+    labelId: 'fishing-label',
+    gridId: 'fishing-grid',
+  });
+  renderNodeSkill('woodcutting', { barFillId: 'woodcutting-bar-fill', labelId: 'woodcutting-label', gridId: 'woodcutting-grid' });
+  renderNodeSkill('hunting', { barFillId: 'hunting-bar-fill', labelId: 'hunting-label', gridId: 'hunting-grid' });
+  renderNodeSkill('scavenging', { barFillId: 'scavenging-bar-fill', labelId: 'scavenging-label', gridId: 'scavenging-grid' });
+  renderNodeSkill('harvesting', { barFillId: 'harvesting-bar-fill', labelId: 'harvesting-label', gridId: 'harvesting-grid' });
 }
 
 // --- inventory tab ---
@@ -1055,11 +1090,67 @@ async function unlockPerkUI(perkId) {
 
 // --- combat tab ---
 //
-// Combat 2.0: an ability-sequencer arena. The player picks up to 6 unlocked
-// abilities into a persistent loadout (editable any time outside a fight);
-// during a fight they fire automatically left-to-right, looping, each
-// taking its own castSeconds to "fill" before resolving. See server/store.js
-// resolvePlayerAbility()/tickCombat() for the simulation this renders.
+// Combat 2.0: a tick-based, multi-enemy ability-sequencer arena. The player
+// picks up to 6 unlocked abilities into a persistent loadout (editable any
+// time outside a fight); during a fight, each combat round the player
+// resolves (or continues charging, for heavier multi-round abilities) their
+// current loadout ability, then every living enemy takes one AI-driven
+// action of its own. See server/store.js resolvePlayerTurn()/
+// enemyTakeTurn()/tickCombat() for the simulation this renders.
+
+// Player-adjustable pacing — how fast combat rounds tick by. A persisted
+// preference (state.player.combatSpeed, carries between fights) that also
+// applies live to a fight in progress. Rendered in both the idle screen
+// (so it can be set before a fight starts) and the active-fight screen.
+const COMBAT_SPEEDS = [
+  { id: 'slow', label: 'Slow' },
+  { id: 'normal', label: 'Normal' },
+  { id: 'fast', label: 'Fast' },
+];
+
+function renderSpeedControls(containerId) {
+  const container = document.getElementById(containerId);
+  container.innerHTML = '<span>Combat speed:</span>';
+  for (const speed of COMBAT_SPEEDS) {
+    const btn = document.createElement('button');
+    btn.className = 'speed-btn' + (state.player.combatSpeed === speed.id ? ' active' : '');
+    btn.textContent = speed.label;
+    btn.addEventListener('click', () => setCombatSpeed(speed.id));
+    container.appendChild(btn);
+  }
+}
+
+async function setCombatSpeed(speed) {
+  try {
+    await api('/api/combat/speed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, speed }),
+    });
+  } catch {
+    return;
+  }
+  await refreshMe();
+}
+
+// One card per enemy in the fight — HP bar, distance-from-player (mirrors
+// the arena canvas so players who prefer exact numbers over the visual
+// don't need it), and any affliction. Dead enemies stay visible but dimmed
+// rather than disappearing, so a multi-enemy fight's outcome reads clearly.
+function renderEnemyList(c) {
+  const listDiv = document.getElementById('enemy-list');
+  listDiv.innerHTML = '';
+  for (const e of c.enemies) {
+    const card = document.createElement('div');
+    card.className = 'enemy-card' + (e.alive ? '' : ' dead');
+    card.innerHTML = `
+      <div class="arena-combatant-header"><span>${e.name}</span><span>${e.hp} / ${e.maxHp} HP</span></div>
+      <div class="hp-bar-wrap"><div class="hp-bar-fill enemy" style="width:${(e.hp / e.maxHp) * 100}%"></div></div>
+      <div class="effect-label">${e.alive ? (e.dot ? `Afflicted: ${e.dot.type}` : '') : 'Defeated'}</div>
+    `;
+    listDiv.appendChild(card);
+  }
+}
 
 function renderCombatTab() {
   const idleDiv = document.getElementById('combat-idle');
@@ -1070,11 +1161,9 @@ function renderCombatTab() {
     activeDiv.classList.remove('hidden');
     const c = state.player.combat;
 
-    document.getElementById('enemy-name').textContent = c.enemyName;
+    renderSpeedControls('combat-speed-controls');
     document.getElementById('player-hp-fill').style.width = `${(c.playerHp / c.playerMaxHp) * 100}%`;
     document.getElementById('player-hp-label').textContent = `${c.playerHp} / ${c.playerMaxHp} HP`;
-    document.getElementById('enemy-hp-fill').style.width = `${(c.enemyHp / c.enemyMaxHp) * 100}%`;
-    document.getElementById('enemy-hp-label').textContent = `${c.enemyHp} / ${c.enemyMaxHp} HP`;
     document.getElementById('player-status-line').textContent = [
       c.dotOnPlayer ? `Afflicted: ${c.dotOnPlayer.type}` : '',
       c.buff ? `Buffed: ${c.buff.type}` : '',
@@ -1085,7 +1174,8 @@ function renderCombatTab() {
     ]
       .filter(Boolean)
       .join(' | ');
-    document.getElementById('enemy-status-line').textContent = c.dotOnEnemy ? `Afflicted: ${c.dotOnEnemy.type}` : '';
+
+    renderEnemyList(c);
 
     const logDiv = document.getElementById('combat-log');
     logDiv.innerHTML = [c.lastPlayerActionText, c.lastEnemyActionText].filter(Boolean).join('<br>');
@@ -1128,6 +1218,7 @@ function renderCombatTab() {
     activeDiv.classList.add('hidden');
     const loc = state.locations.find((l) => l.id === state.player.currentLocation);
     document.getElementById('combat-location-info').textContent = `Location: ${loc ? loc.name : '--'}`;
+    renderSpeedControls('combat-speed-controls-idle');
 
     const listDiv = document.getElementById('combat-enemy-list');
     listDiv.innerHTML = '';
@@ -1140,6 +1231,10 @@ function renderCombatTab() {
         btn.addEventListener('click', () => startFight(enemyId));
         listDiv.appendChild(btn);
       }
+      const hint = document.createElement('p');
+      hint.className = 'card-sub';
+      hint.textContent = 'Sometimes 2-3 enemies from this area will join the fight together.';
+      listDiv.appendChild(hint);
     } else {
       listDiv.innerHTML = '<p>No enemies here. Explore to find a combat area.</p>';
     }
@@ -1169,7 +1264,7 @@ function renderLoadoutEditor() {
     slot.className = 'ability-slot' + (ability ? '' : ' empty');
     slot.title = ability ? ability.description : 'Empty — select an ability from the panel on the right';
     slot.innerHTML = ability
-      ? `<span class="ability-slot-name">${ability.name}</span><span>${ability.castSeconds}s</span>`
+      ? `<span class="ability-slot-name">${ability.name}</span><span>${ability.castRounds}${ability.castRounds === 1 ? ' round' : ' rounds'}</span>`
       : '<span>Empty</span>';
     slot.addEventListener('click', () => placeSelectedAbility(index));
     row.appendChild(slot);
@@ -1204,7 +1299,7 @@ function renderAbilitySidebar() {
     const card = document.createElement('div');
     if (ability.unlocked) {
       card.className = 'ability-card selectable' + (state.selectedAbility === ability.id ? ' selected' : '');
-      card.innerHTML = `<h3>${ability.name}</h3><div class="card-sub">${ability.description}</div><div class="card-sub">Cast: ${ability.castSeconds}s &mdash; ${ability.tags.join(', ')}</div>`;
+      card.innerHTML = `<h3>${ability.name}</h3><div class="card-sub">${ability.description}</div><div class="card-sub">Takes ${ability.castRounds} ${ability.castRounds === 1 ? 'round' : 'rounds'} to cast &mdash; ${ability.tags.join(', ')}</div>`;
       card.addEventListener('click', () => toggleAbilitySelection(ability.id));
     } else {
       card.className = 'ability-card locked';
@@ -1244,10 +1339,12 @@ function renderLiveAbilitySlots(c) {
   row.innerHTML = '';
   c.loadout.forEach((ability, index) => {
     const slot = document.createElement('div');
-    slot.className = 'ability-slot live' + (ability ? '' : ' empty') + (index === c.abilityCursor ? ' current' : '');
+    const isCurrent = index === c.abilityCursor;
+    slot.className = 'ability-slot live' + (ability ? '' : ' empty') + (isCurrent ? ' current' : '');
     slot.id = `ability-slot-${index}`;
+    const statusText = isCurrent && c.castRoundsRemaining > 0 ? `charging (${c.castRoundsRemaining} left)` : isCurrent ? 'next up' : '';
     slot.innerHTML = ability
-      ? `<span class="ability-slot-name">${ability.name}</span><span>${ability.castSeconds}s</span><div class="ability-slot-fill" id="ability-slot-fill-${index}"></div>`
+      ? `<span class="ability-slot-name">${ability.name}</span><span>${statusText}</span><div class="ability-slot-fill" id="ability-slot-fill-${index}"></div>`
       : '<span>Empty</span>';
     row.appendChild(slot);
   });
@@ -2054,9 +2151,8 @@ function render() {
   document.getElementById('current-location').textContent = `Location: ${currentLoc ? currentLoc.name : '--'}`;
 
   renderExplorationPanel();
-  renderMiningTab();
+  renderAllNodeSkills();
   renderCharacterTab();
-  updateSkillsTab();
   renderInventoryTab();
   renderEquipmentTab();
   renderCombatTab();
@@ -2245,11 +2341,16 @@ function drawClock(clockCtx, size, fraction) {
   }
 }
 
-// The arena: player dot fixed at center, enemy dot (red) positioned straight
-// up from center at a radius scaled from c.distance (0 = adjacent,
-// maxDistance = as far as Quick Step can push it). A dashed ring marks the
-// melee-range boundary so it's visually obvious when a melee ability would
-// whiff.
+// The arena: player dot fixed at center; each enemy is positioned at its own
+// fixed angle (assigned once at fight start, never changed — see
+// COMBAT_GROUP_ANGLES server-side) and a radius scaled from its own
+// distance, so multiple enemies spread around the top arc instead of
+// stacking on the player or each other. angle 0 = straight up, matching the
+// original single-enemy layout; positive angles sweep clockwise. A dashed
+// ring marks the melee-range boundary so it's visually obvious when a melee
+// ability would whiff against a given enemy. The nearest living enemy (the
+// player's default target for offensive abilities) gets a subtle highlight
+// ring so it's clear who an attack will actually land on.
 function drawArena(c) {
   const canvas = document.getElementById('arena-canvas');
   if (!canvas) return;
@@ -2269,16 +2370,40 @@ function drawArena(c) {
   actx.stroke();
   actx.setLineDash([]);
 
-  const enemyR = Math.min(maxR, (c.distance / c.maxDistance) * maxR);
-  const ex = cx;
-  const ey = cy - enemyR;
+  const living = c.enemies.filter((e) => e.alive);
+  const target = living.reduce((a, b) => (!a || b.distance < a.distance ? b : a), null);
 
-  actx.beginPath();
-  actx.moveTo(cx, cy);
-  actx.lineTo(ex, ey);
-  actx.strokeStyle = 'rgba(216, 176, 74, 0.25)';
-  actx.lineWidth = 1;
-  actx.stroke();
+  for (const e of c.enemies) {
+    const r = Math.min(maxR, (e.distance / c.maxDistance) * maxR);
+    const theta = (e.angle * Math.PI) / 180;
+    const ex = cx + Math.sin(theta) * r;
+    const ey = cy - Math.cos(theta) * r;
+
+    if (e.alive) {
+      actx.beginPath();
+      actx.moveTo(cx, cy);
+      actx.lineTo(ex, ey);
+      actx.strokeStyle = 'rgba(216, 176, 74, 0.2)';
+      actx.lineWidth = 1;
+      actx.stroke();
+    }
+
+    if (e.alive && target && e.uid === target.uid) {
+      actx.beginPath();
+      actx.arc(ex, ey, 17, 0, Math.PI * 2);
+      actx.strokeStyle = 'rgba(216, 176, 74, 0.7)';
+      actx.lineWidth = 2;
+      actx.stroke();
+    }
+
+    actx.beginPath();
+    actx.arc(ex, ey, 12, 0, Math.PI * 2);
+    actx.fillStyle = e.alive ? '#c0392b' : '#5a4a42';
+    actx.fill();
+    actx.strokeStyle = e.alive ? '#ffb3a1' : '#8a7a6f';
+    actx.lineWidth = 2;
+    actx.stroke();
+  }
 
   actx.beginPath();
   actx.arc(cx, cy, 10, 0, Math.PI * 2);
@@ -2287,27 +2412,38 @@ function drawArena(c) {
   actx.strokeStyle = '#fff3c9';
   actx.lineWidth = 2;
   actx.stroke();
-
-  actx.beginPath();
-  actx.arc(ex, ey, 12, 0, Math.PI * 2);
-  actx.fillStyle = '#c0392b';
-  actx.fill();
-  actx.strokeStyle = '#ffb3a1';
-  actx.lineWidth = 2;
-  actx.stroke();
 }
 
-// Animates the currently-executing ability slot's fill bar between polls,
-// same fixed-anchor extrapolation trick as the mining/gather clocks:
-// server sends currentAbilityStartedAt + currentAbilityCastSeconds once,
-// client recomputes the fraction fresh every frame from real elapsed time.
+// Animates the current loadout slot's fill bar between polls — now tracking
+// "time until the next combat round resolves" rather than a per-ability cast
+// timer (rounds are the shared unit for both the player and every enemy).
+// Same fixed-anchor extrapolation trick as the mining/gather clocks: server
+// sends nextTickAt + tickIntervalSeconds once, client recomputes the
+// fraction fresh every frame from real elapsed time.
 function updateAbilitySlotFill(c) {
   if (c.abilityCursor < 0 || c.abilityCursor > 5) return;
   const fillEl = document.getElementById(`ability-slot-fill-${c.abilityCursor}`);
-  if (!fillEl || !c.currentAbilityStartedAt || !c.currentAbilityCastSeconds) return;
-  const elapsed = (Date.now() - c.currentAbilityStartedAt) / 1000;
-  const fraction = Math.min(1, Math.max(0, elapsed / c.currentAbilityCastSeconds));
+  if (!fillEl || !c.nextTickAt || !c.tickIntervalSeconds) return;
+  const msUntilNextTick = c.nextTickAt - Date.now();
+  const fraction = Math.min(1, Math.max(0, 1 - msUntilNextTick / (c.tickIntervalSeconds * 1000)));
   fillEl.style.width = `${fraction * 100}%`;
+}
+
+// biteAt is an absolute epoch-ms timestamp from the server (see
+// getFishingBite() in server/store.js), not a fixed-anchor progress fraction
+// like the clocks above — so no extrapolation math is needed at all, just a
+// direct Date.now() comparison every frame. The button is only ever
+// ENABLED here (a purely cosmetic client-side gate on when clicking is
+// worth trying); the server independently re-derives the same window and is
+// the sole authority on whether a click actually lands inside it.
+function updateFishingCatchButton() {
+  const btn = document.getElementById('fishing-catch-btn');
+  if (!btn) return;
+  const skill = state.player.skills.fishing;
+  const now = Date.now();
+  const inWindow = skill && skill.active && skill.biteAt && now >= skill.biteAt && now <= skill.biteAt + skill.biteWindowMs;
+  btn.disabled = !inWindow;
+  btn.classList.toggle('bite-active', !!inWindow);
 }
 
 function animate() {
@@ -2329,6 +2465,8 @@ function animate() {
         const fraction = sync.cycleSeconds > 0 ? progress / sync.cycleSeconds : 0;
         drawClock(clockCanvas.getContext('2d'), clockCanvas.width, fraction);
       }
+
+      updateFishingCatchButton();
 
       if (state.player.combat && !state.player.combat.result) {
         drawArena(state.player.combat);

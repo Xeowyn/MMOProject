@@ -22,6 +22,14 @@ process.on('unhandledRejection', (err) => {
 
 const app = express();
 app.use(express.json());
+// Bare request log — the only prior server output was the single startup
+// line, so there was no way to tell "a device's request never arrived"
+// (firewall/network block) apart from "it arrived and was handled silently."
+// This makes every request that actually reaches the process visible.
+app.use((req, res, next) => {
+  console.log(`[http] ${req.method} ${req.originalUrl} from ${req.headers['cf-connecting-ip'] || req.ip}`);
+  next();
+});
 // no-store: this is an actively-iterated prototype (edit -> refresh browser),
 // so any caching of public/* is pure risk — a stale game.js served after an
 // edit would silently reintroduce fixed bugs with zero visible sign why.
@@ -156,8 +164,11 @@ app.post('/api/travel', (req, res) => {
   res.json(result);
 });
 
+// Generic starter for every node-based resource skill (mining/woodcutting/
+// fishing/hunting/scavenging/harvesting) — replaces the old separate
+// /api/task/start (single fixed location per skill) and /api/mining/start.
 app.post('/api/task/start', (req, res) => {
-  const result = store.startTask(req.body.playerId, req.body.skillId);
+  const result = store.startResourceTask(req.body.playerId, req.body.skillId, req.body.nodeId);
   if (result.error) return res.status(400).json(result);
   res.json(result);
 });
@@ -168,8 +179,12 @@ app.post('/api/task/stop', (req, res) => {
   res.json(result);
 });
 
-app.post('/api/mining/start', (req, res) => {
-  const result = store.startMiningNode(req.body.playerId, req.body.nodeId);
+// A miss/already-attempted is a normal outcome, not a server error — only a
+// real problem (not fishing, wrong location) gets a 400. success:false with
+// a 200 lets the frontend show "you missed the bite!" without tripping the
+// global error banner api() shows for actual HTTP failures.
+app.post('/api/fishing/catch', (req, res) => {
+  const result = store.attemptFishingCatch(req.body.playerId);
   if (result.error) return res.status(400).json(result);
   res.json(result);
 });
@@ -206,6 +221,12 @@ app.post('/api/combat/start', (req, res) => {
 
 app.post('/api/combat/end', (req, res) => {
   const result = store.endCombat(req.body.playerId);
+  if (result.error) return res.status(400).json(result);
+  res.json(result);
+});
+
+app.post('/api/combat/speed', (req, res) => {
+  const result = store.setCombatSpeed(req.body.playerId, req.body.speed);
   if (result.error) return res.status(400).json(result);
   res.json(result);
 });
@@ -368,7 +389,8 @@ function broadcastPresence() {
   }
 }
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  console.log(`[ws] connection opened from ${req.headers['cf-connecting-ip'] || req.socket.remoteAddress}`);
   let identifiedId = null;
   ws.on('message', (raw) => {
     // Everything in this handler runs as a raw EventEmitter callback, NOT

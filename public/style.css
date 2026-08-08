@@ -22,6 +22,11 @@ body {
     radial-gradient(ellipse at top, #1c1712 0%, var(--ink) 60%),
     var(--ink);
   color: var(--parchment);
+  /* Outer safety net: every layout below is built to reflow instead of
+     overflow at any width, but this is the backstop that guarantees the
+     page itself can never grow a horizontal scrollbar even if something
+     still slips through. */
+  overflow-x: hidden;
 }
 
 h1, h2, h3, .tab-btn, button {
@@ -40,11 +45,15 @@ h1, h2, h3, .tab-btn, button {
 }
 
 #login-screen h1 {
-  font-size: 3em;
+  /* clamp(), not a fixed 3em — scales continuously down to a real phone
+     width instead of relying on a breakpoint, so there's no single window
+     size where this title is the thing that forces horizontal scroll. */
+  font-size: clamp(1.8em, 9vw, 3em);
   color: var(--gold);
   margin: 0;
   letter-spacing: 3px;
   text-shadow: 0 0 24px rgba(216, 176, 74, 0.35);
+  text-align: center;
 }
 
 #login-screen h1::before,
@@ -113,8 +122,19 @@ button:not(:disabled):active {
   transform: translateY(0);
 }
 
+#game-screen {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
 #topbar {
   display: flex;
+  flex-wrap: wrap; /* long toast text or a narrow window wraps to a second
+                       line instead of forcing the bar wider than the
+                       viewport — unconditional, not gated behind a
+                       breakpoint, since there's no width where an
+                       overflowing topbar would be OK. */
   justify-content: space-between;
   align-items: center;
   padding: 10px 20px;
@@ -158,9 +178,11 @@ button:not(:disabled):active {
 
 #tab-nav {
   display: flex;
+  flex-wrap: wrap; /* 17 tabs wrap onto extra rows instead of requiring
+                       sideways scrolling to reach the ones that don't fit —
+                       a no-op at desktop widths where they all fit one row. */
   background: #1a1611;
   border-bottom: 1px solid #4a4030;
-  overflow-x: auto;
 }
 
 .tab-btn, .tab-btn:disabled {
@@ -194,16 +216,27 @@ button:not(:disabled):active {
 }
 
 main {
-  height: calc(100vh - 90px);
+  /* flex: 1 inside #game-screen's column, not a hardcoded calc(100vh -
+     90px) — the old fixed offset assumed the header+nav were always
+     exactly 90px tall, which breaks the moment tab-nav wraps onto extra
+     rows (now a real possibility on narrower screens since it wraps
+     instead of scrolling sideways — see #tab-nav). flex sizing adapts to
+     however tall the header+nav actually end up, no magic number to keep
+     in sync. */
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
 }
 
 .tab-panel {
   height: 100%;
   overflow-y: auto;
-  overflow-x: auto; /* narrow (phone-width) screens get a scrollbar on a
-                        wide panel instead of squished/clipped content —
-                        not a real mobile redesign, just a safety net */
+  /* Every layout inside a tab is built to reflow (grids auto-fill, the two
+     fixed-width flex rows collapse to a column below the 760px breakpoint
+     further down) so nothing here should ever need to scroll sideways —
+     hidden, not auto, so a regression clips instead of silently growing a
+     scrollbar the player has to discover. */
+  overflow-x: hidden;
 }
 
 #tab-overworld {
@@ -213,13 +246,13 @@ main {
 
 #tab-skills, #tab-combat, #tab-inventory, #tab-equipment, #tab-gardening, #tab-shop,
 #tab-farming, #tab-crafting, #tab-buildings, #tab-npcs, #tab-tavern, #tab-stats,
-#tab-mining, #tab-character {
+#tab-mining, #tab-fishing, #tab-character {
   padding: 24px;
 }
 
 #tab-skills h2, #tab-combat h2, #tab-inventory h2, #tab-equipment h2, #tab-gardening h2, #tab-shop h2,
 #tab-farming h2, #tab-crafting h2, #tab-buildings h2, #tab-npcs h2, #tab-tavern h2, #tab-stats h2,
-#tab-mining h2, #tab-character h2 {
+#tab-mining h2, #tab-fishing h2, #tab-character h2 {
   color: var(--gold);
   border-bottom: 1px solid var(--border);
   padding-bottom: 10px;
@@ -230,7 +263,7 @@ main {
 #tab-skills h2::before, #tab-combat h2::before, #tab-inventory h2::before, #tab-equipment h2::before,
 #tab-gardening h2::before, #tab-shop h2::before, #tab-farming h2::before, #tab-crafting h2::before,
 #tab-buildings h2::before, #tab-npcs h2::before, #tab-tavern h2::before, #tab-stats h2::before,
-#tab-mining h2::before, #tab-character h2::before {
+#tab-mining h2::before, #tab-fishing h2::before, #tab-character h2::before {
   content: '\2726';
   color: var(--gold-dim);
   font-size: 0.7em;
@@ -260,6 +293,12 @@ main {
 
 #map-wrap {
   flex: 1;
+  /* Without this, the flex item's default min-width:auto lets its content
+     (the canvas, a large replaced element) set a floor on how far it can
+     shrink — the classic flexbox overflow trap where max-width:100% on the
+     canvas gets ignored for the purposes of the row's own width. Matches
+     the same fix #combat-idle-main already used. */
+  min-width: 0;
   position: relative;
   display: flex;
   align-items: center;
@@ -472,6 +511,35 @@ main {
   color: #a6906a;
 }
 
+/* --- fishing minigame: optional bonus-catch button, see attemptFishingCatch()
+   in game.js. Disabled/plain except during the real bite window, when it
+   pulses gold to draw the eye — everything here is a pure CSS/JS animation,
+   no server round-trip until the player actually clicks it. */
+.fishing-minigame {
+  margin-bottom: 10px;
+}
+
+.catch-btn {
+  width: 100%;
+  margin-bottom: 6px;
+}
+
+.catch-btn.bite-active {
+  animation: bite-pulse 0.5s ease-in-out infinite;
+  box-shadow: 0 0 14px rgba(216, 176, 74, 0.8);
+}
+
+@keyframes bite-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.04); }
+}
+
+.fishing-hint {
+  font-size: 0.78em;
+  color: #a6906a;
+  font-style: italic;
+}
+
 /* --- combat tab --- */
 
 #combat-enemy-list {
@@ -551,6 +619,58 @@ main {
 .arena-combatant {
   max-width: 420px;
   margin: 0 auto;
+}
+
+.speed-controls {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  align-items: center;
+  margin: 4px 0 14px 0;
+  font-size: 0.85em;
+}
+
+.speed-controls span {
+  color: #a6906a;
+}
+
+.speed-btn {
+  background: #33291d;
+  color: #cbbf9f;
+  border: 1px solid #4a4030;
+  padding: 5px 12px;
+  border-radius: 6px;
+}
+
+.speed-btn:hover {
+  background: #4a3d28;
+}
+
+.speed-btn.active {
+  border-color: #d8b04a;
+  color: #d8b04a;
+  box-shadow: 0 0 6px rgba(216, 176, 74, 0.4);
+}
+
+#enemy-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: center;
+  max-width: 520px;
+  margin: 10px auto;
+}
+
+.enemy-card {
+  width: 200px;
+  background: linear-gradient(180deg, var(--panel-raised) 0%, var(--panel) 100%);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.enemy-card.dead {
+  opacity: 0.4;
 }
 
 .arena-combatant-header {
@@ -736,6 +856,8 @@ main {
 
 #equip-slots {
   display: flex;
+  flex-wrap: wrap; /* two fixed-width 220px slots stack instead of
+                       squeezing once they no longer fit side by side */
   gap: 16px;
   margin-bottom: 20px;
 }
@@ -851,6 +973,11 @@ main {
   border-radius: 8px;
   padding: 20px;
   min-width: 260px;
+  max-width: calc(100vw - 32px); /* every modal variant (discovery/rare-event/
+                                     dialogue) shares this base — without a
+                                     cap, unusually long content has nothing
+                                     stopping it from exceeding a phone's
+                                     viewport width */
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
 }
 
@@ -1090,6 +1217,23 @@ main {
   gap: 14px;
 }
 
+/* Same tile styling, tighter footprint — used for the Gather panel in the
+   Overworld sidebar and the Woodcutting card in the Skills tab, both of
+   which have much less width to work with than a full tab. */
+.mining-grid-compact {
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.mining-grid-compact .mining-node-tile {
+  padding: 10px 6px;
+}
+
+.mining-grid-compact .mining-node-icon {
+  font-size: 1.3em;
+}
+
 .mining-node-tile {
   background: linear-gradient(180deg, var(--panel-raised) 0%, var(--panel) 100%);
   border: 1px solid var(--border);
@@ -1153,11 +1297,16 @@ main {
 }
 
 /* --- mobile / narrow-viewport layout ---
-   Everything above already degrades gracefully on its own (card-grids use
-   auto-fill minmax so column count shrinks for free, the map/arena canvases
-   scale via max-width:100%). What doesn't shrink on its own is anything
-   built as a fixed-width flex row — those need to explicitly become a
-   stacked column below a phone-ish breakpoint instead. */
+   Everything above is now built to reflow continuously with no breakpoint
+   at all (card-grids use auto-fill minmax so column count shrinks for
+   free, the map/arena canvases scale via max-width:100% + min-width:0 on
+   their flex parents, #tab-nav/#topbar/#equip-slots wrap unconditionally,
+   .modal-content is capped to the viewport). The one thing that still
+   needs an explicit breakpoint is the two main side-by-side layouts
+   (Overworld's map+sidebar, Combat's main+ability-sidebar) — a sidebar
+   that's merely narrower stops being useful well before it'd naturally
+   wrap, so those switch to a stacked column below a phone-ish width
+   instead of just shrinking in place. */
 @media (max-width: 760px) {
   #tab-overworld {
     flex-direction: column;
@@ -1191,12 +1340,11 @@ main {
 
   #tab-skills, #tab-combat, #tab-inventory, #tab-equipment, #tab-gardening, #tab-shop,
   #tab-farming, #tab-crafting, #tab-buildings, #tab-npcs, #tab-tavern, #tab-stats,
-  #tab-mining, #tab-character {
+  #tab-mining, #tab-fishing, #tab-character {
     padding: 14px;
   }
 
   #topbar {
-    flex-wrap: wrap;
     gap: 8px;
     padding: 8px 14px;
   }
