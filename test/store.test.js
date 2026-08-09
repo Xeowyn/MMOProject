@@ -329,6 +329,25 @@ describe('gardening', () => {
     const result = store.plantSeed(id, 999, 'wheat');
     assert.equal(result.error, 'invalid_plot');
   });
+
+  // Regression test: a non-numeric plotIndex (e.g. a string from a hostile
+  // request) used to fail the range check silently (NaN < 0 and NaN >= length
+  // are both false) and plant into a bogus, unreachable plot — wasting the
+  // seed with nothing to show for it. Fixed by requiring an integer index.
+  test('planting with a non-numeric plot index is rejected and does not consume the seed', () => {
+    const { id } = makeCharacter(EVEN_TRAITS);
+    store.devGiveItem(id, 'wheat_seed', 1);
+    const result = store.plantSeed(id, 'not-a-number', 'wheat');
+    assert.equal(result.error, 'invalid_plot');
+    assert.equal(store.getPlayer(id).inventory.wheat_seed, 1);
+  });
+
+  test('planting with a non-integer plot index (e.g. 2.5) is rejected', () => {
+    const { id } = makeCharacter(EVEN_TRAITS);
+    store.devGiveItem(id, 'wheat_seed', 1);
+    const result = store.plantSeed(id, 2.5, 'wheat');
+    assert.equal(result.error, 'invalid_plot');
+  });
 });
 
 describe('farming (animals)', () => {
@@ -768,6 +787,28 @@ describe('expeditions and travel', () => {
   test('starting an expedition with a too-short path fails', () => {
     const { id } = makeCharacter(EVEN_TRAITS);
     const result = store.startExpedition(id, [{ x: 50, y: 50 }]);
+    assert.equal(result.error, 'invalid_path');
+  });
+
+  // Regression test: a path point with a non-numeric or missing x/y used to
+  // turn the length/cost math into NaN, permanently corrupting the
+  // player's supplies count instead of failing cleanly. Fixed by validating
+  // every point has finite x/y before doing any math with it.
+  test('starting an expedition with a non-numeric path point is rejected and spends nothing', () => {
+    const { id } = makeCharacter(EVEN_TRAITS);
+    const suppliesBefore = store.getPlayer(id).inventory.supplies;
+    const result = store.startExpedition(id, [
+      { x: 'a', y: 'b' },
+      { x: 1, y: 2 },
+    ]);
+    assert.equal(result.error, 'invalid_path');
+    assert.equal(store.getPlayer(id).inventory.supplies, suppliesBefore);
+    assert.ok(!Number.isNaN(store.getPlayer(id).inventory.supplies));
+  });
+
+  test('starting an expedition with a missing x/y on a path point is rejected', () => {
+    const { id } = makeCharacter(EVEN_TRAITS);
+    const result = store.startExpedition(id, [{ x: 50 }, { x: 55, y: 55 }]);
     assert.equal(result.error, 'invalid_path');
   });
 

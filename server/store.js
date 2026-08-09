@@ -2004,6 +2004,21 @@ function livingEnemies(c) {
   return c.enemies.filter((e) => e.hp > 0);
 }
 
+// Balance numbers for the abilities that don't use the equipped weapon's
+// own damage (unlike Swing/Power Strike, which scale off equip.damage).
+const PUNCH_DAMAGE = [2, 4];
+const PUNCH_COMBO_MULTIPLIER = 1.5; // bonus damage on the next melee ability after a Punch
+const POWER_STRIKE_DAMAGE_MULTIPLIER = 1.8; // on top of the weapon's normal damage roll
+const POISON_JAB_DAMAGE = [1, 3];
+const POISON_JAB_DOT = { dps: 3, roundsLeft: 4 };
+const THROW_DAGGER_DAMAGE = [3, 6];
+const THROW_DAGGER_CRIT_CHANCE = 0.05;
+const QUICK_STEP_EVASION_MS = 1200;
+const GUARD_UP_ARMOR_BONUS = 5;
+const GUARD_UP_DURATION_MS = 4000;
+const SECOND_WIND_HEAL = 15;
+const ADRENALINE_RUSH_HASTE_MULTIPLIER = 0.5; // halves the charge time of the next ability
+
 // Plays out the player's turn for one round: either keep charging the
 // ability under the cursor (a heavy ability like Power Strike takes more
 // rounds to charge than a fast one like Punch — that's the tradeoff for its
@@ -2049,16 +2064,16 @@ function resolvePlayerTurn(player, c, equip, now) {
     }
   } else if (abilityId === 'punch') {
     if (target && inRange) {
-      const dmg = Math.round(randInt(2, 4) * totalMultiplier);
+      const dmg = Math.round(randInt(PUNCH_DAMAGE[0], PUNCH_DAMAGE[1]) * totalMultiplier);
       target.hp = Math.max(0, target.hp - dmg);
-      c.pendingMeleeComboBuff = { multiplier: 1.5 };
+      c.pendingMeleeComboBuff = { multiplier: PUNCH_COMBO_MULTIPLIER };
       c.lastPlayerActionText = `Punch hits ${ENEMIES[target.enemyId].name} for ${dmg} — next melee ability is primed`;
     } else {
       c.lastPlayerActionText = 'Punch misses — too far away!';
     }
   } else if (abilityId === 'power_strike') {
     if (target && inRange) {
-      let dmg = Math.round(randInt(equip.damage[0], equip.damage[1]) * 1.8 * totalMultiplier);
+      let dmg = Math.round(randInt(equip.damage[0], equip.damage[1]) * POWER_STRIKE_DAMAGE_MULTIPLIER * totalMultiplier);
       if (Math.random() < equip.critChance) dmg *= 2;
       target.hp = Math.max(0, target.hp - dmg);
       c.lastPlayerActionText = `Power Strike hits ${ENEMIES[target.enemyId].name} for ${dmg}!`;
@@ -2067,32 +2082,32 @@ function resolvePlayerTurn(player, c, equip, now) {
     }
   } else if (abilityId === 'poison_jab') {
     if (target && inRange) {
-      const dmg = Math.round(randInt(1, 3) * totalMultiplier);
+      const dmg = Math.round(randInt(POISON_JAB_DAMAGE[0], POISON_JAB_DAMAGE[1]) * totalMultiplier);
       target.hp = Math.max(0, target.hp - dmg);
-      target.dot = { type: 'poison', dps: 3, roundsLeft: 4 };
+      target.dot = { type: 'poison', ...POISON_JAB_DOT };
       c.lastPlayerActionText = `Poison Jab hits ${ENEMIES[target.enemyId].name} for ${dmg} and poisons it`;
     } else {
       c.lastPlayerActionText = 'Poison Jab misses — too far away!';
     }
   } else if (abilityId === 'throw_dagger') {
     if (target) {
-      let dmg = Math.round(randInt(3, 6) * potionDmgMultiplier);
-      if (Math.random() < 0.05) dmg *= 2;
+      let dmg = Math.round(randInt(THROW_DAGGER_DAMAGE[0], THROW_DAGGER_DAMAGE[1]) * potionDmgMultiplier);
+      if (Math.random() < THROW_DAGGER_CRIT_CHANCE) dmg *= 2;
       target.hp = Math.max(0, target.hp - dmg);
       c.lastPlayerActionText = `Throw Dagger hits ${ENEMIES[target.enemyId].name} for ${dmg}`;
     }
   } else if (abilityId === 'quick_step') {
     for (const e of livingEnemies(c)) e.distance = Math.min(MAX_DISTANCE, e.distance + QUICK_STEP_RETREAT);
-    c.evasionUntil = now + 1200;
+    c.evasionUntil = now + QUICK_STEP_EVASION_MS;
     c.lastPlayerActionText = 'Quick Step — you put distance between yourself and every enemy';
   } else if (abilityId === 'guard_up') {
-    c.armorBuff = { amount: 5, expiresAt: now + 4000 };
+    c.armorBuff = { amount: GUARD_UP_ARMOR_BONUS, expiresAt: now + GUARD_UP_DURATION_MS };
     c.lastPlayerActionText = 'Guard Up — your defense is bolstered';
   } else if (abilityId === 'second_wind') {
-    c.playerHp = Math.min(c.playerMaxHp, c.playerHp + 15);
+    c.playerHp = Math.min(c.playerMaxHp, c.playerHp + SECOND_WIND_HEAL);
     c.lastPlayerActionText = 'Second Wind — you recover some health';
   } else if (abilityId === 'adrenaline_rush') {
-    c.pendingHasteBuff = { multiplier: 0.5 };
+    c.pendingHasteBuff = { multiplier: ADRENALINE_RUSH_HASTE_MULTIPLIER };
     c.lastPlayerActionText = 'Adrenaline Rush — your next ability will be faster';
   }
 
@@ -2542,6 +2557,11 @@ function startExpedition(playerId, path) {
   if (player.expedition) return { error: 'expedition_in_progress' };
   if (player.combat && !player.combat.result) return { error: 'busy_fighting' };
   if (!Array.isArray(path) || path.length < 2) return { error: 'invalid_path' };
+  // Every point must have real numeric x/y — this endpoint is open to the
+  // internet, and a bad point (e.g. a string, or missing x/y) would turn
+  // every length/cost calculation below into NaN, corrupting the player's
+  // supplies count permanently instead of just failing cleanly.
+  if (!path.every((p) => p && Number.isFinite(p.x) && Number.isFinite(p.y))) return { error: 'invalid_path' };
 
   const supplies = player.inventory.supplies || 0;
   if (supplies <= 0) return { error: 'no_supplies' };
@@ -2748,7 +2768,14 @@ function plantSeed(playerId, plotIndex, plantId) {
   if (!player) return { error: 'not_found' };
   const plant = PLANTS[plantId];
   if (!plant) return { error: 'unknown_plant' };
-  if (plotIndex < 0 || plotIndex >= player.garden.plots.length) return { error: 'invalid_plot' };
+  // Must check Number.isInteger first — a non-numeric plotIndex (e.g. a
+  // string from a hostile request) fails both range comparisons below
+  // (NaN < 0 and NaN >= length are both false), which used to let it slip
+  // through and plant into a bogus, unreachable "plot" — wasting the seed
+  // with no visible effect for the player.
+  if (!Number.isInteger(plotIndex) || plotIndex < 0 || plotIndex >= player.garden.plots.length) {
+    return { error: 'invalid_plot' };
+  }
   if (player.garden.plots[plotIndex]) return { error: 'plot_occupied' };
   const owned = player.inventory[plant.seed] || 0;
   if (owned <= 0) return { error: 'no_seed' };
