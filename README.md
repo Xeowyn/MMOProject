@@ -2,6 +2,21 @@
 
 This is a fantasy game you play in your web browser. You explore a map, fight monsters, collect stuff, grow plants, and chat with other players — all at the same time as your friends, because everyone connects to the same server.
 
+## How to run it
+
+You need [Node.js](https://nodejs.org/) installed first (version 18 or newer).
+
+```bash
+git clone https://github.com/Xeowyn/MMOProject.git
+cd MMOProject
+npm install
+npm start
+```
+
+Open **http://localhost:3000** in your browser, type in a username, and start playing.
+
+(Want the server to restart itself every time you save a code change? Use `npm run dev` instead of `npm start`.)
+
 ## What you can do in the game
 
 - Walk around a big map and discover new places
@@ -16,33 +31,6 @@ This is a fantasy game you play in your web browser. You explore a map, fight mo
 - **Backend (the server):** Node.js, Express, and a library called `ws` for real-time chat and updates
 - **Save file:** Everything is saved in one plain file (`data/db.json`) — no fancy database needed
 - **Frontend (what you see in the browser):** Plain JavaScript and an HTML5 Canvas (the drawing area), no extra tools required to build it
-
-## How to run it yourself
-
-### What you need first
-- [Node.js](https://nodejs.org/) installed on your computer (version 18 or newer)
-
-### Set it up
-
-```bash
-git clone https://github.com/Xeowyn/MMOProject.git
-cd MMOProject
-npm install
-```
-
-### Start the game
-
-```bash
-npm start
-```
-
-The server starts at **http://localhost:3000**. Open that address in your browser, type in a username, and start playing. (You can change the port with the `PORT` environment variable if you need to.)
-
-If you're changing the code and want the server to restart itself every time you save a file, use this instead:
-
-```bash
-npm run dev
-```
 
 ## How the project is organized
 
