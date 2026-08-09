@@ -124,6 +124,17 @@ async function api(path, options) {
   return body;
 }
 
+// Every player-triggered action (craft, equip, buy, etc) is a POST with a
+// JSON body — this saves every call site from repeating the same
+// method/headers/JSON.stringify boilerplate.
+function post(path, body) {
+  return api(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
 document.getElementById('login-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const username = document.getElementById('username-input').value.trim();
@@ -131,11 +142,7 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
   if (!username) return;
   let result;
   try {
-    result = await api('/api/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password }),
-    });
+    result = await post('/api/login', { username, password });
   } catch {
     return;
   }
@@ -239,11 +246,7 @@ document.getElementById('creation-begin-btn').addEventListener('click', async ()
   const password = document.getElementById('creation-password-input').value;
   let result;
   try {
-    result = await api('/api/create-character', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: state.creationUsername, traits: state.creationTraits, password }),
-    });
+    result = await post('/api/create-character', { username: state.creationUsername, traits: state.creationTraits, password });
   } catch {
     return;
   }
@@ -718,11 +721,7 @@ async function confirmDrawnPath() {
 
   let result;
   try {
-    result = await api('/api/expedition/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, path }),
-    });
+    result = await post('/api/expedition/start', { playerId: state.playerId, path });
   } catch {
     return;
   }
@@ -737,11 +736,7 @@ async function confirmDrawnPath() {
 
 async function travelTo(locationId) {
   try {
-    await api('/api/travel', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, locationId }),
-    });
+    await post('/api/travel', { playerId: state.playerId, locationId });
   } catch {
     return;
   }
@@ -782,11 +777,7 @@ function buildSkillsTab() {
 async function attemptFishingCatch() {
   let result;
   try {
-    result = await api('/api/fishing/catch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId }),
-    });
+    result = await post('/api/fishing/catch', { playerId: state.playerId });
   } catch {
     return;
   }
@@ -874,17 +865,9 @@ function renderNodeTile(skillId, node, deterministic) {
 async function onNodeTileClick(skillId, node) {
   try {
     if (node.active) {
-      await api('/api/task/stop', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerId: state.playerId, skillId }),
-      });
+      await post('/api/task/stop', { playerId: state.playerId, skillId });
     } else {
-      await api('/api/task/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerId: state.playerId, skillId, nodeId: node.id }),
-      });
+      await post('/api/task/start', { playerId: state.playerId, skillId, nodeId: node.id });
     }
   } catch {
     return;
@@ -977,11 +960,7 @@ function renderEquipmentTab() {
 
 async function equipItem(itemId) {
   try {
-    await api('/api/equip', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, itemId }),
-    });
+    await post('/api/equip', { playerId: state.playerId, itemId });
   } catch {
     return;
   }
@@ -990,11 +969,7 @@ async function equipItem(itemId) {
 
 async function unequipSlot(slot) {
   try {
-    await api('/api/unequip', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, slot }),
-    });
+    await post('/api/unequip', { playerId: state.playerId, slot });
   } catch {
     return;
   }
@@ -1061,11 +1036,7 @@ function renderCharacterTab() {
 
 async function allocateTrait(traitName) {
   try {
-    await api('/api/trait/allocate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, trait: traitName }),
-    });
+    await post('/api/trait/allocate', { playerId: state.playerId, trait: traitName });
   } catch {
     return;
   }
@@ -1076,11 +1047,7 @@ async function allocateTrait(traitName) {
 async function unlockPerkUI(perkId) {
   let result;
   try {
-    result = await api('/api/perk/unlock', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, perkId }),
-    });
+    result = await post('/api/perk/unlock', { playerId: state.playerId, perkId });
   } catch {
     return;
   }
@@ -1122,11 +1089,7 @@ function renderSpeedControls(containerId) {
 
 async function setCombatSpeed(speed) {
   try {
-    await api('/api/combat/speed', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, speed }),
-    });
+    await post('/api/combat/speed', { playerId: state.playerId, speed });
   } catch {
     return;
   }
@@ -1319,11 +1282,7 @@ async function placeSelectedAbility(slotIndex) {
   if (!state.selectedAbility) return;
   const abilityId = state.selectedAbility === CLEAR_SLOT_SENTINEL ? null : state.selectedAbility;
   try {
-    await api('/api/loadout/set', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, slotIndex, abilityId }),
-    });
+    await post('/api/loadout/set', { playerId: state.playerId, slotIndex, abilityId });
   } catch {
     return;
   }
@@ -1352,11 +1311,7 @@ function renderLiveAbilitySlots(c) {
 
 async function startFight(enemyId) {
   try {
-    await api('/api/combat/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, enemyId }),
-    });
+    await post('/api/combat/start', { playerId: state.playerId, enemyId });
   } catch {
     return;
   }
@@ -1365,11 +1320,7 @@ async function startFight(enemyId) {
 
 async function endCombat() {
   try {
-    await api('/api/combat/end', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId }),
-    });
+    await post('/api/combat/end', { playerId: state.playerId });
   } catch {
     return;
   }
@@ -1450,11 +1401,7 @@ function onGardenTileClick(plotIndex, plot) {
 
 async function plantSeed(plotIndex, plantId) {
   try {
-    await api('/api/garden/plant', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, plotIndex, plantId }),
-    });
+    await post('/api/garden/plant', { playerId: state.playerId, plotIndex, plantId });
   } catch {
     return;
   }
@@ -1464,11 +1411,7 @@ async function plantSeed(plotIndex, plantId) {
 async function harvestPlot(plotIndex) {
   let result;
   try {
-    result = await api('/api/garden/harvest', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, plotIndex }),
-    });
+    result = await post('/api/garden/harvest', { playerId: state.playerId, plotIndex });
   } catch {
     return;
   }
@@ -1504,11 +1447,7 @@ function renderCraftingTab() {
 async function craftRecipe(recipeId) {
   let result;
   try {
-    result = await api('/api/craft', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, recipeId }),
-    });
+    result = await post('/api/craft', { playerId: state.playerId, recipeId });
   } catch {
     return;
   }
@@ -1577,11 +1516,7 @@ async function runExperiment() {
   if (!ingredientA || !ingredientB || ingredientA === ingredientB) return;
   let result;
   try {
-    result = await api('/api/alchemy/experiment', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, ingredientA, ingredientB }),
-    });
+    result = await post('/api/alchemy/experiment', { playerId: state.playerId, ingredientA, ingredientB });
   } catch {
     return;
   }
@@ -1598,11 +1533,7 @@ async function runExperiment() {
 async function craftKnownPotion(recipeId) {
   let result;
   try {
-    result = await api('/api/alchemy/craft', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, recipeId }),
-    });
+    result = await post('/api/alchemy/craft', { playerId: state.playerId, recipeId });
   } catch {
     return;
   }
@@ -1613,11 +1544,7 @@ async function craftKnownPotion(recipeId) {
 async function usePotion(itemId) {
   let result;
   try {
-    result = await api('/api/potion/use', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, itemId }),
-    });
+    result = await post('/api/potion/use', { playerId: state.playerId, itemId });
   } catch {
     return;
   }
@@ -1668,11 +1595,7 @@ function renderFarmingTab() {
 
 async function buyAnimal(speciesId) {
   try {
-    await api('/api/farm/buy', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, species: speciesId }),
-    });
+    await post('/api/farm/buy', { playerId: state.playerId, species: speciesId });
   } catch {
     return;
   }
@@ -1683,11 +1606,7 @@ async function buyAnimal(speciesId) {
 async function collectAnimal(animalId) {
   let result;
   try {
-    result = await api('/api/farm/collect', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, animalId }),
-    });
+    result = await post('/api/farm/collect', { playerId: state.playerId, animalId });
   } catch {
     return;
   }
@@ -1726,11 +1645,7 @@ function renderBuildingsTab() {
 
 async function buildBuildingUI(buildingType) {
   try {
-    await api('/api/building/build', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, buildingType }),
-    });
+    await post('/api/building/build', { playerId: state.playerId, buildingType });
   } catch {
     return;
   }
@@ -1741,11 +1656,7 @@ async function buildBuildingUI(buildingType) {
 async function collectBuildingUI(buildingType) {
   let result;
   try {
-    result = await api('/api/building/collect', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, buildingType }),
-    });
+    result = await post('/api/building/collect', { playerId: state.playerId, buildingType });
   } catch {
     return;
   }
@@ -1839,11 +1750,7 @@ function closeDialogue() {
 
 async function acceptQuestUI(questId) {
   try {
-    await api('/api/quest/accept', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, questId }),
-    });
+    await post('/api/quest/accept', { playerId: state.playerId, questId });
   } catch {
     return;
   }
@@ -1854,11 +1761,7 @@ async function acceptQuestUI(questId) {
 async function turnInQuestUI(questId) {
   let result;
   try {
-    result = await api('/api/quest/turn-in', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, questId }),
-    });
+    result = await post('/api/quest/turn-in', { playerId: state.playerId, questId });
   } catch {
     return;
   }
@@ -1954,11 +1857,7 @@ function renderShopTab() {
 
 async function buyShopItem(itemId) {
   try {
-    await api('/api/shop/buy', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, itemId }),
-    });
+    await post('/api/shop/buy', { playerId: state.playerId, itemId });
   } catch {
     return;
   }
@@ -1991,11 +1890,7 @@ function renderSellList() {
 async function sellShopItem(itemId, amount) {
   let result;
   try {
-    result = await api('/api/shop/sell', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, itemId, amount }),
-    });
+    result = await post('/api/shop/sell', { playerId: state.playerId, itemId, amount });
   } catch {
     return;
   }
@@ -2006,11 +1901,7 @@ async function sellShopItem(itemId, amount) {
 async function buyLocationReveal() {
   let result;
   try {
-    result = await api('/api/shop/buy-location', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId }),
-    });
+    result = await post('/api/shop/buy-location', { playerId: state.playerId });
   } catch {
     return;
   }
@@ -2491,31 +2382,19 @@ requestAnimationFrame(animate);
 // down before any public launch.
 window.dev = {
   async give(itemId, amount = 1) {
-    const r = await api('/api/dev/give', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, itemId, amount }),
-    });
+    const r = await post('/api/dev/give', { playerId: state.playerId, itemId, amount });
     await refreshMe();
     console.log(`[dev] ${itemId} -> ${r.count}`);
     return r;
   },
   async discover(locationId) {
-    const r = await api('/api/dev/discover', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, locationId }),
-    });
+    const r = await post('/api/dev/discover', { playerId: state.playerId, locationId });
     await refreshMe();
     console.log(`[dev] discovered ${locationId}`);
     return r;
   },
   async setXp(skillId, xp) {
-    const r = await api('/api/dev/set-xp', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId, skillId, xp }),
-    });
+    const r = await post('/api/dev/set-xp', { playerId: state.playerId, skillId, xp });
     await refreshMe();
     console.log(`[dev] ${skillId} xp -> ${r.xp}`);
     return r;
@@ -2532,11 +2411,7 @@ window.dev = {
     );
   },
   async reset() {
-    await api('/api/dev/reset', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerId: state.playerId }),
-    });
+    await post('/api/dev/reset', { playerId: state.playerId });
     await refreshMe();
     console.log('[dev] account reset to a fresh character (same login) — discoveries, inventory, equipment, garden, skills all cleared');
   },

@@ -1143,6 +1143,13 @@ function getLocation(id) {
   return LOCATIONS.find((l) => l.id === id) || null;
 }
 
+// Short unique-enough id for a new record (player, animal, etc) — time-based
+// so ids sort roughly by creation order, plus a random suffix so two
+// generated in the same millisecond still can't collide.
+function genId(prefix) {
+  return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+
 // --- account security: password (login gate) + bearer token (per-request auth) ---
 // Added once the game became reachable over a real internet tunnel rather
 // than just localhost — a friend's playerId is broadcast to every other
@@ -1180,7 +1187,7 @@ function verifyToken(player, suppliedToken) {
 // but keeps newPlayer callable without traits from not blowing up).
 function newPlayer(username, traits, passwordRecord) {
   const startLoc = LOCATIONS.find((l) => l.startingLocation);
-  const id = 'p_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const id = genId('p_');
   const player = {
     id,
     username,
@@ -1322,25 +1329,11 @@ function ensurePlayerShape(player) {
     while (player.garden.plots.length < GARDEN_PLOT_COUNT) player.garden.plots.push(null);
     changed = true;
   }
-  if (!player.skills.woodcutting) {
-    player.skills.woodcutting = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null };
-    changed = true;
-  }
-  if (!player.skills.fishing) {
-    player.skills.fishing = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null };
-    changed = true;
-  }
-  if (!player.skills.hunting) {
-    player.skills.hunting = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null };
-    changed = true;
-  }
-  if (!player.skills.scavenging) {
-    player.skills.scavenging = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null };
-    changed = true;
-  }
-  if (!player.skills.harvesting) {
-    player.skills.harvesting = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null };
-    changed = true;
+  for (const skillId of ['woodcutting', 'fishing', 'hunting', 'scavenging', 'harvesting']) {
+    if (!player.skills[skillId]) {
+      player.skills[skillId] = { xp: 0, progressSeconds: 0, taskStartedAt: null, lastTick: null, activeNode: null };
+      changed = true;
+    }
   }
   if (!player.skills.combat) {
     player.skills.combat = { xp: 0 };
@@ -1562,7 +1555,7 @@ function attemptFishingCatch(playerId) {
     return { success: false, reason: 'missed' };
   }
 
-  player.inventory[node.item] = (player.inventory[node.item] || 0) + FISHING_BONUS_AMOUNT;
+  addItem(player, node.item, FISHING_BONUS_AMOUNT);
   skill.xp += FISHING_BONUS_XP;
   save();
   return { success: true, item: node.item, itemName: ITEMS[node.item].name, amount: FISHING_BONUS_AMOUNT, xp: FISHING_BONUS_XP };
@@ -1608,7 +1601,7 @@ function tickDeterministicNode(player, skillId, skill, node) {
   const itemsCompleted = Math.floor(totalSeconds / effectiveCycleSeconds);
   skill.progressSeconds = totalSeconds % effectiveCycleSeconds;
   if (itemsCompleted > 0) {
-    player.inventory[node.item] = (player.inventory[node.item] || 0) + itemsCompleted;
+    addItem(player, node.item, itemsCompleted);
     skill.xp += itemsCompleted * node.xpPerItem;
   }
   skill.lastTick = now;
@@ -1705,7 +1698,7 @@ function resolveGatherCycleForNode(player, skillId, node) {
       return 'combat';
     }
     if (roll < node.encounterChance + node.successChance + successBonus) {
-      player.inventory[node.resultItem] = (player.inventory[node.resultItem] || 0) + 1;
+      addItem(player, node.resultItem, 1);
       player.skills.hunting.xp += node.xpPerSuccess;
       return 'success';
     }
@@ -1715,7 +1708,7 @@ function resolveGatherCycleForNode(player, skillId, node) {
   // scavenging / harvesting — flat successChance, one random item from the pool
   if (Math.random() < node.successChance + successBonus) {
     const itemId = node.resultPool[Math.floor(Math.random() * node.resultPool.length)];
-    player.inventory[itemId] = (player.inventory[itemId] || 0) + 1;
+    addItem(player, itemId, 1);
     player.skills[skillId].xp += node.xpPerSuccess;
     return 'success';
   }
@@ -1950,7 +1943,7 @@ function discoverLocation(player, locationId) {
   gainCharacterXp(player, DISCOVERY_XP);
   const loc = getLocation(locationId);
   if (loc && loc.loot) {
-    player.inventory[loc.loot.item] = (player.inventory[loc.loot.item] || 0) + loc.loot.amount;
+    addItem(player, loc.loot.item, loc.loot.amount);
   }
   return true;
 }
@@ -1993,6 +1986,26 @@ function tickExpedition(player) {
 
 function randInt(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+// Adds `amount` of an item to a player's inventory, creating the stack if needed.
+function addItem(player, itemId, amount) {
+  player.inventory[itemId] = (player.inventory[itemId] || 0) + amount;
+}
+
+// Removes `amount` of an item, deleting the stack once it hits zero so
+// depleted items don't linger in the saved inventory.
+function spendItem(player, itemId, amount) {
+  player.inventory[itemId] -= amount;
+  if (player.inventory[itemId] <= 0) delete player.inventory[itemId];
+}
+
+function hasIngredients(player, ingredients) {
+  return Object.entries(ingredients).every(([itemId, amount]) => (player.inventory[itemId] || 0) >= amount);
+}
+
+function spendIngredients(player, ingredients) {
+  for (const [itemId, amount] of Object.entries(ingredients)) spendItem(player, itemId, amount);
 }
 
 // Sums trait (from creation/leveling) and perk (from the skill-tree tab)
@@ -2347,7 +2360,7 @@ function checkCombatEnd(player, c) {
       player.skills.combat.xp += enemy.xpReward;
       for (const drop of enemy.lootTable || []) {
         if (Math.random() < drop.chance + lootChanceBonus) {
-          player.inventory[drop.item] = (player.inventory[drop.item] || 0) + 1;
+          addItem(player, drop.item, 1);
           c.rewardLoot.push(drop.item);
         }
       }
@@ -2399,19 +2412,8 @@ function xpCostForLevel(level) {
   return XP_PER_LEVEL + XP_LEVEL_INCREMENT * (level - 1);
 }
 
-function levelFromXp(xp) {
-  let level = 1;
-  let remaining = xp;
-  while (remaining >= xpCostForLevel(level)) {
-    remaining -= xpCostForLevel(level);
-    level += 1;
-  }
-  return level;
-}
-
-// Same walk as levelFromXp but also returns how far into the current level
-// the player is and how much the next level costs — computed together so
-// publicSkill() doesn't have to re-walk the curve twice per skill per poll.
+// Walks the level curve once and returns the level plus how far into it the
+// player is and how much the next level costs.
 function xpProgress(xp) {
   let level = 1;
   let remaining = xp;
@@ -2420,6 +2422,10 @@ function xpProgress(xp) {
     level += 1;
   }
   return { level, xpIntoLevel: remaining, xpToNextLevel: xpCostForLevel(level) };
+}
+
+function levelFromXp(xp) {
+  return xpProgress(xp).level;
 }
 
 function publicSkill(skillId, skill) {
@@ -2770,11 +2776,8 @@ function equipItem(playerId, itemId) {
   const slot = item.type;
   const previous = player.equipment[slot];
 
-  player.inventory[itemId] = owned - 1;
-  if (player.inventory[itemId] <= 0) delete player.inventory[itemId];
-  if (previous) {
-    player.inventory[previous] = (player.inventory[previous] || 0) + 1;
-  }
+  spendItem(player, itemId, 1);
+  if (previous) addItem(player, previous, 1);
   player.equipment[slot] = itemId;
   save();
   return { ok: true, slot, itemId };
@@ -2786,7 +2789,7 @@ function unequipItem(playerId, slot) {
   if (slot !== 'weapon' && slot !== 'armor') return { error: 'invalid_slot' };
   const current = player.equipment[slot];
   if (!current) return { error: 'nothing_equipped' };
-  player.inventory[current] = (player.inventory[current] || 0) + 1;
+  addItem(player, current, 1);
   player.equipment[slot] = null;
   save();
   return { ok: true, slot };
@@ -2903,8 +2906,7 @@ function plantSeed(playerId, plotIndex, plantId) {
   const owned = player.inventory[plant.seed] || 0;
   if (owned <= 0) return { error: 'no_seed' };
 
-  player.inventory[plant.seed] = owned - 1;
-  if (player.inventory[plant.seed] <= 0) delete player.inventory[plant.seed];
+  spendItem(player, plant.seed, 1);
   player.garden.plots[plotIndex] = { plantId, plantedAt: Date.now() };
   save();
   return { ok: true };
@@ -2927,7 +2929,7 @@ function harvestPlot(playerId, plotIndex) {
   const elapsedSeconds = (Date.now() - plot.plantedAt) / 1000;
   if (elapsedSeconds < effectiveGrowSeconds) return { error: 'not_ready' };
 
-  player.inventory[plant.yield] = (player.inventory[plant.yield] || 0) + 1;
+  addItem(player, plant.yield, 1);
   player.garden.plots[plotIndex] = null;
   save();
   return { ok: true, yield: plant.yield };
@@ -2940,14 +2942,9 @@ function craftItem(playerId, recipeId) {
   if (!player) return { error: 'not_found' };
   const recipe = RECIPES.find((r) => r.id === recipeId);
   if (!recipe) return { error: 'unknown_recipe' };
-  for (const [itemId, amount] of Object.entries(recipe.ingredients)) {
-    if ((player.inventory[itemId] || 0) < amount) return { error: 'missing_ingredients' };
-  }
-  for (const [itemId, amount] of Object.entries(recipe.ingredients)) {
-    player.inventory[itemId] -= amount;
-    if (player.inventory[itemId] <= 0) delete player.inventory[itemId];
-  }
-  player.inventory[recipe.result] = (player.inventory[recipe.result] || 0) + recipe.resultAmount;
+  if (!hasIngredients(player, recipe.ingredients)) return { error: 'missing_ingredients' };
+  spendIngredients(player, recipe.ingredients);
+  addItem(player, recipe.result, recipe.resultAmount);
   save();
   return { ok: true, result: recipe.result, resultAmount: recipe.resultAmount };
 }
@@ -2978,13 +2975,11 @@ function experimentAlchemy(playerId, ingredientA, ingredientB) {
     return { ok: true, discovered: false, alreadyTried: true };
   }
 
-  player.inventory[ingredientA] -= 1;
-  if (player.inventory[ingredientA] <= 0) delete player.inventory[ingredientA];
-  player.inventory[ingredientB] -= 1;
-  if (player.inventory[ingredientB] <= 0) delete player.inventory[ingredientB];
+  spendItem(player, ingredientA, 1);
+  spendItem(player, ingredientB, 1);
 
   if (recipe) {
-    player.inventory[recipe.result] = (player.inventory[recipe.result] || 0) + 1;
+    addItem(player, recipe.result, 1);
     const newDiscovery = !player.alchemy.knownRecipes.includes(recipe.id);
     if (newDiscovery) player.alchemy.knownRecipes.push(recipe.id);
     save();
@@ -3006,14 +3001,9 @@ function craftKnownPotion(playerId, recipeId) {
   if (!player.alchemy.knownRecipes.includes(recipeId)) return { error: 'not_known' };
   const recipe = POTION_RECIPES.find((r) => r.id === recipeId);
   if (!recipe) return { error: 'unknown_recipe' };
-  for (const [itemId, amount] of Object.entries(recipe.ingredients)) {
-    if ((player.inventory[itemId] || 0) < amount) return { error: 'missing_ingredients' };
-  }
-  for (const [itemId, amount] of Object.entries(recipe.ingredients)) {
-    player.inventory[itemId] -= amount;
-    if (player.inventory[itemId] <= 0) delete player.inventory[itemId];
-  }
-  player.inventory[recipe.result] = (player.inventory[recipe.result] || 0) + 1;
+  if (!hasIngredients(player, recipe.ingredients)) return { error: 'missing_ingredients' };
+  spendIngredients(player, recipe.ingredients);
+  addItem(player, recipe.result, 1);
   save();
   return { ok: true, result: recipe.result, resultName: ITEMS[recipe.result].name };
 }
@@ -3050,8 +3040,7 @@ function usePotion(playerId, itemId) {
     target.dot = { type: 'venom', dps: effect.dps, roundsLeft: effect.duration };
   }
 
-  player.inventory[itemId] -= 1;
-  if (player.inventory[itemId] <= 0) delete player.inventory[itemId];
+  spendItem(player, itemId, 1);
   save();
   return { ok: true, effect: effect.kind };
 }
@@ -3067,7 +3056,7 @@ function buyAnimal(playerId, speciesId) {
   if (gold < species.price) return { error: 'not_enough_gold' };
 
   player.inventory.gold = gold - species.price;
-  const id = 'a_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const id = genId('a_');
   player.farm.animals.push({ id, species: speciesId, bornAt: Date.now(), lastCollectedAt: null });
   save();
   return { ok: true, id };
@@ -3085,7 +3074,7 @@ function collectAnimal(playerId, animalId) {
   if (ageSeconds < species.matureSeconds) return { error: 'not_mature' };
 
   if (species.butcherItem) {
-    player.inventory[species.butcherItem] = (player.inventory[species.butcherItem] || 0) + 1;
+    addItem(player, species.butcherItem, 1);
     player.farm.animals = player.farm.animals.filter((a) => a.id !== animalId);
     save();
     return { ok: true, item: species.butcherItem, removed: true };
@@ -3094,7 +3083,7 @@ function collectAnimal(playerId, animalId) {
   const since = animal.lastCollectedAt || animal.bornAt + species.matureSeconds * 1000;
   const elapsedSeconds = (Date.now() - since) / 1000;
   if (elapsedSeconds < species.produceIntervalSeconds) return { error: 'not_ready' };
-  player.inventory[species.produceItem] = (player.inventory[species.produceItem] || 0) + 1;
+  addItem(player, species.produceItem, 1);
   animal.lastCollectedAt = Date.now();
   save();
   return { ok: true, item: species.produceItem, removed: false };
@@ -3108,13 +3097,8 @@ function buildBuilding(playerId, buildingType) {
   const building = BUILDINGS[buildingType];
   if (!building) return { error: 'unknown_building' };
   if (player.buildings[buildingType]) return { error: 'already_built' };
-  for (const [itemId, amount] of Object.entries(building.cost)) {
-    if ((player.inventory[itemId] || 0) < amount) return { error: 'missing_resources' };
-  }
-  for (const [itemId, amount] of Object.entries(building.cost)) {
-    player.inventory[itemId] -= amount;
-    if (player.inventory[itemId] <= 0) delete player.inventory[itemId];
-  }
+  if (!hasIngredients(player, building.cost)) return { error: 'missing_resources' };
+  spendIngredients(player, building.cost);
   player.buildings[buildingType] = { builtAt: Date.now(), lastCollectedAt: Date.now() };
   save();
   return { ok: true };
@@ -3129,7 +3113,7 @@ function collectBuilding(playerId, buildingType) {
   const elapsedSeconds = (Date.now() - built.lastCollectedAt) / 1000;
   const amount = Math.floor(elapsedSeconds / building.produceIntervalSeconds);
   if (amount <= 0) return { error: 'nothing_ready' };
-  player.inventory[building.producesItem] = (player.inventory[building.producesItem] || 0) + amount;
+  addItem(player, building.producesItem, amount);
   built.lastCollectedAt += amount * building.produceIntervalSeconds * 1000;
   save();
   return { ok: true, item: building.producesItem, amount };
@@ -3158,11 +3142,10 @@ function turnInQuest(playerId, questId) {
   if (!questObjectiveMet(player, quest)) return { error: 'objective_not_met' };
 
   if (quest.objective.type === 'gather') {
-    player.inventory[quest.objective.itemId] -= quest.objective.count;
-    if (player.inventory[quest.objective.itemId] <= 0) delete player.inventory[quest.objective.itemId];
+    spendItem(player, quest.objective.itemId, quest.objective.count);
   }
   if (quest.reward.gold) {
-    player.inventory.gold = (player.inventory.gold || 0) + quest.reward.gold;
+    addItem(player, 'gold', quest.reward.gold);
   }
   if (quest.reward.xp) {
     for (const [skillId, xp] of Object.entries(quest.reward.xp)) {
@@ -3186,7 +3169,7 @@ function buyItem(playerId, itemId) {
   if (gold < shopEntry.price) return { error: 'not_enough_gold' };
 
   player.inventory.gold = gold - shopEntry.price;
-  player.inventory[itemId] = (player.inventory[itemId] || 0) + 1;
+  addItem(player, itemId, 1);
   save();
   return { ok: true, itemId, price: shopEntry.price, goldRemaining: player.inventory.gold };
 }
@@ -3205,9 +3188,8 @@ function sellItem(playerId, itemId, amount) {
   if ((player.inventory[itemId] || 0) < qty) return { error: 'not_enough_owned' };
 
   const total = item.sellPrice * qty;
-  player.inventory[itemId] -= qty;
-  if (player.inventory[itemId] <= 0) delete player.inventory[itemId];
-  player.inventory.gold = (player.inventory.gold || 0) + total;
+  spendItem(player, itemId, qty);
+  addItem(player, 'gold', total);
   save();
   return { ok: true, itemId, amount: qty, goldEarned: total, goldTotal: player.inventory.gold };
 }
