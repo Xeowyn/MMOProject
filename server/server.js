@@ -438,3 +438,7 @@ wss.on('connection', (ws, req) => {
     console.error('[ws] socket error (recovered, server stays up):', err.message);
   });
 });
+
+// Exported so tests can start the server on a random port (PORT=0) and shut
+// it down cleanly when done, instead of hitting the real one.
+module.exports = { app, server };
