@@ -7,11 +7,9 @@ const SKILL_DISPLAY_NAMES = {
   harvesting: 'Harvesting',
 };
 
-// Every resource-gathering skill is node-grid based (server: RESOURCE_NODES/
-// DETERMINISTIC_TASKS in server/store.js) — mining/woodcutting/fishing yield
-// one guaranteed item per cycle, hunting/scavenging/harvesting only have a
-// chance each cycle. Drives the generic renderNodeSkill()/clockSync loop
-// below so every one of the 6 gets the same node-tile picker UI.
+// All 6 gathering skills use the same node-picker UI. Mining/woodcutting/
+// fishing give a guaranteed item each cycle; hunting/scavenging/harvesting
+// only have a chance each cycle.
 const RESOURCE_SKILL_IDS = ['mining', 'woodcutting', 'fishing', 'hunting', 'scavenging', 'harvesting'];
 const DETERMINISTIC_SKILL_IDS = new Set(['mining', 'woodcutting', 'fishing']);
 
@@ -60,11 +58,10 @@ const state = {
 
 const CAMERA_MAX_ZOOM = 20;
 
-// Camera-aware world<->screen transforms — the map's underlying 0-100
-// percent-space world is unchanged (so all server-side distance math for
-// expeditions stays correct), but the camera lets the player zoom into a
-// small slice of it (as tight as 1/20th) or pan around, purely as a
-// rendering transform.
+// Converts between pixels on screen and the map's underlying 0-100 percent
+// coordinates. The map data itself never changes — the camera just zooms
+// and pans how it's drawn, so all the server's distance math still works
+// with the real coordinates underneath.
 function pixelToPercent(px, py) {
   const viewSize = 100 / state.camera.zoom;
   const left = state.camera.x - viewSize / 2;
@@ -392,10 +389,9 @@ async function refreshMe() {
   }
 
   const now = Date.now();
-  // Every resource skill's clock lives in its node list (player.<skillId>Nodes,
-  // one active node at a time), not on the skill entry itself — sync the
-  // same shape for all 6 so animate() can drive each `${skillId}-clock`
-  // canvas with the identical fixed-anchor extrapolation trick.
+  // Each resource skill's clock progress lives on its active node, not the
+  // skill itself. Save the same info for all 6 skills so animate() can draw
+  // every clock the same way.
   for (const skillId of RESOURCE_SKILL_IDS) {
     const activeNode = state.player[`${skillId}Nodes`].find((n) => n.active);
     state.clockSync[skillId] = activeNode
@@ -403,15 +399,10 @@ async function refreshMe() {
       : { progressSeconds: 0, cycleSeconds: 1, active: false, syncedAt: now };
   }
 
-  // Anchor the sweep to the expedition's fixed startedAt/durationSeconds
-  // ONCE, the moment it's first seen — never re-derive it from a later
-  // poll's fraction. Recomputing the anchor every poll let small per-request
-  // latency accumulate into real drift (worse the more often we poll), so
-  // the client's estimate could end up well behind the server's true
-  // progress; when the server then reported the expedition finished, the
-  // line would vanish wherever the drifted estimate happened to be instead
-  // of at 100%. Computing fraction fresh every frame from fixed anchor
-  // values is immune to that regardless of network/processing latency.
+  // Save the expedition's startedAt/durationSeconds once, the first time we
+  // see it, and never update it from later polls. If we recalculated it on
+  // every poll instead, small delays would build up over time and the
+  // progress line could end up lagging behind where the server really is.
   if (state.player.expedition) {
     const exp = state.player.expedition;
     if (!state.expeditionSync || state.expeditionSync.startedAt !== exp.startedAt) {
@@ -646,13 +637,11 @@ function onCanvasMouseUp() {
   handlePointerUp();
 }
 
-// --- touch support: single finger = pan/draw/tap (same as a mouse), two
-// fingers = pinch-to-zoom. preventDefault() throughout stops the page from
-// scrolling/zooming natively while the player is interacting with the map,
-// and (critically) suppresses the browser's own synthetic click it would
-// otherwise fire after touchend — without that suppression, a tap would
-// travel to a location twice, or start a draw path and then immediately
-// misfire a click on top of it.
+// --- touch support: one finger = pan/draw/tap (same as a mouse), two
+// fingers = pinch-to-zoom. preventDefault() stops the phone's browser from
+// scrolling or zooming the page while the player is touching the map, and
+// also stops the browser from firing its own extra click after a tap —
+// without that, a tap could end up triggering travel twice.
 function touchDistance(t0, t1) {
   return Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
 }
@@ -767,13 +756,10 @@ function buildSkillsTab() {
   `;
 }
 
-// The minigame is purely a client-side-rendered bonus on top of the passive
-// clock (see animate()'s bite-window check, which enables/disables this
-// button) — clicking sends exactly one lightweight request, same shape as
-// any other player-triggered action (craft/equip/buy). The server is the
-// sole authority on whether the click landed in the real window (see
-// getFishingBite()/attemptFishingCatch() in server/store.js); this never
-// trusts the client's own clock for anything but when to let the player try.
+// The minigame is just a bonus on top of the passive fishing clock. The
+// server is the one that decides if the click actually landed in the real
+// bite window — the client's own timer is only used to decide when to let
+// the player try.
 async function attemptFishingCatch() {
   let result;
   try {
@@ -791,19 +777,13 @@ async function attemptFishingCatch() {
   await refreshMe();
 }
 
-// --- unified node-skill engine (Melvor-Idle-style node grid) ---
-// Drives all 6 resource skills (mining/woodcutting/fishing/hunting/
-// scavenging/harvesting) off player.<skillId>Nodes — see RESOURCE_NODES/
-// publicResourceNodes() in server/store.js. Every node is workable from
-// wherever the player currently is once its location has been discovered;
-// each skill's starting-camp node is always unlocked. Tiles reuse the same
-// visual language as the garden's plot grid (.garden-plot-tile) rather than
-// inventing a new pattern. Mining/Fishing each get a full dedicated tab with
-// a big "currently working X" header panel; Woodcutting (Skills tab) and
-// Hunting/Scavenging/Harvesting (Overworld sidebar) use the compact form —
-// just the clock/bar/label and grid, no separate header panel — since they
-// share space with other UI. opts: { gridId, barFillId, labelId,
-// activePanelId?, activeNameId? }
+// --- shared rendering for all 6 gathering skills ---
+// Every node is workable no matter where the player is, once its location
+// is discovered; each skill's starting camp node is always unlocked.
+// Mining and Fishing get their own full tab with a big "currently working
+// X" panel; Woodcutting, Hunting, Scavenging, and Harvesting use a smaller
+// compact version (just the clock, bar, and grid) since they share space
+// with other UI. opts: { gridId, barFillId, labelId, activePanelId?, activeNameId? }
 function renderNodeSkill(skillId, opts) {
   const nodes = state.player[`${skillId}Nodes`];
   const skill = state.player.skills[skillId];
@@ -1057,18 +1037,15 @@ async function unlockPerkUI(perkId) {
 
 // --- combat tab ---
 //
-// Combat 2.0: a tick-based, multi-enemy ability-sequencer arena. The player
-// picks up to 6 unlocked abilities into a persistent loadout (editable any
-// time outside a fight); during a fight, each combat round the player
-// resolves (or continues charging, for heavier multi-round abilities) their
-// current loadout ability, then every living enemy takes one AI-driven
-// action of its own. See server/store.js resolvePlayerTurn()/
-// enemyTakeTurn()/tickCombat() for the simulation this renders.
+// A multi-enemy fight arena. The player picks up to 6 unlocked abilities
+// into a loadout (editable outside a fight); during a fight, each round the
+// player uses (or keeps charging) their current ability, then every living
+// enemy takes its own turn. See resolvePlayerTurn()/enemyTakeTurn()/
+// tickCombat() in server/store.js for the actual simulation.
 
-// Player-adjustable pacing — how fast combat rounds tick by. A persisted
-// preference (state.player.combatSpeed, carries between fights) that also
-// applies live to a fight in progress. Rendered in both the idle screen
-// (so it can be set before a fight starts) and the active-fight screen.
+// How fast combat rounds play out — a saved preference that carries between
+// fights and can also be changed live during one. Shown both before a fight
+// starts and during it.
 const COMBAT_SPEEDS = [
   { id: 'slow', label: 'Slow' },
   { id: 'normal', label: 'Normal' },
@@ -1207,9 +1184,9 @@ function renderCombatTab() {
   }
 }
 
-// Sentinel for "Clear Slot" being the selected sidebar entry — distinct from
-// null (nothing selected at all), since the loadout API itself already uses
-// abilityId: null to mean "empty this slot".
+// A special marker meaning "Clear Slot" is selected — different from null,
+// which means nothing is selected. (The API separately uses abilityId: null
+// to mean "make this slot empty".)
 const CLEAR_SLOT_SENTINEL = '__clear__';
 
 // The persistent loadout, editable any time the player isn't mid-fight.
@@ -1993,12 +1970,10 @@ function renderExplorationPanel() {
   if (state.player.expedition) {
     exploreBtn.classList.remove('hidden');
     exploreBtn.disabled = true;
-    // Use the same smooth, fixed-anchor fraction the map's sweep line uses
-    // (not the raw server-reported fraction, which only changes once per
-    // ~300ms poll) — otherwise this text visibly jumps in chunks every poll
-    // while the line animates every frame, and the two read as wildly
-    // different speeds even though they're tracking the same underlying
-    // progress.
+    // Calculate progress smoothly every frame instead of using the raw
+    // number from the server (which only updates once per poll) — otherwise
+    // this percentage would jump in visible steps while the map's progress
+    // line animates smoothly, even though they're the same progress.
     const sync = state.expeditionSync;
     const liveFraction = sync
       ? Math.min(1, Math.max(0, (Date.now() - sync.startedAt) / 1000 / sync.durationSeconds))
@@ -2132,12 +2107,10 @@ function drawMap() {
   drawInProgressPath();
 }
 
-// The full committed route, drawn faint, plus a brighter overlay that
-// sweeps along it as the expedition progresses — same "reveals locations
-// without pausing" idea as the mining clock, just along a path instead of
-// in a circle. Computed every frame straight from the expedition's fixed
-// startedAt/durationSeconds (set once in refreshMe(), not re-derived from
-// each poll) so it's a smooth, drift-free sweep regardless of poll timing.
+// Draws the full route faintly, plus a brighter line that sweeps along it
+// as the expedition progresses. The sweep is calculated fresh every frame
+// from the expedition's fixed start time and duration, so it stays smooth
+// no matter how often the server is polled.
 function drawExpedition() {
   const sync = state.expeditionSync;
   if (!sync) return;
@@ -2155,13 +2128,9 @@ function drawExpedition() {
   ctx.stroke();
   ctx.setLineDash([]);
 
-  // targetLength/sync.totalLength are in percent-space units (matching
-  // sync.path's coordinates), so segment lengths must be measured in that
-  // same space too — measuring them in pixel-space instead (10-16x larger
-  // per unit) made the very first segment blow past the target almost
-  // immediately, stopping the visible sweep within its first few percent
-  // regardless of the true fraction. Pixel coordinates are only used for
-  // where to actually draw, not for measuring distance.
+  // The path's coordinates and totalLength are both in the map's own 0-100
+  // units, not screen pixels — so distance along the path must be measured
+  // in those same units too, or the sweep would be wildly off.
   const targetLength = sync.totalLength * fraction;
   let coveredLength = 0;
   ctx.beginPath();
@@ -2232,16 +2201,12 @@ function drawClock(clockCtx, size, fraction) {
   }
 }
 
-// The arena: player dot fixed at center; each enemy is positioned at its own
-// fixed angle (assigned once at fight start, never changed — see
-// COMBAT_GROUP_ANGLES server-side) and a radius scaled from its own
-// distance, so multiple enemies spread around the top arc instead of
-// stacking on the player or each other. angle 0 = straight up, matching the
-// original single-enemy layout; positive angles sweep clockwise. A dashed
-// ring marks the melee-range boundary so it's visually obvious when a melee
-// ability would whiff against a given enemy. The nearest living enemy (the
-// player's default target for offensive abilities) gets a subtle highlight
-// ring so it's clear who an attack will actually land on.
+// The fight arena: the player is a dot fixed at the center. Each enemy sits
+// at its own fixed angle (picked once when the fight starts) and a distance
+// from center, so multiple enemies spread out instead of stacking on top of
+// each other. A dashed ring marks melee range, so it's obvious when a melee
+// attack would miss. The nearest living enemy — the default target — gets a
+// highlight ring so it's clear who an attack will hit.
 function drawArena(c) {
   const canvas = document.getElementById('arena-canvas');
   if (!canvas) return;
@@ -2305,12 +2270,10 @@ function drawArena(c) {
   actx.stroke();
 }
 
-// Animates the current loadout slot's fill bar between polls — now tracking
-// "time until the next combat round resolves" rather than a per-ability cast
-// timer (rounds are the shared unit for both the player and every enemy).
-// Same fixed-anchor extrapolation trick as the mining/gather clocks: server
-// sends nextTickAt + tickIntervalSeconds once, client recomputes the
-// fraction fresh every frame from real elapsed time.
+// Animates the current ability's fill bar between polls, based on how much
+// time is left until the next combat round. Same trick as the mining/gather
+// clocks: the server sends a target time once, and the client recalculates
+// the fill fraction fresh every frame from that.
 function updateAbilitySlotFill(c) {
   if (c.abilityCursor < 0 || c.abilityCursor > 5) return;
   const fillEl = document.getElementById(`ability-slot-fill-${c.abilityCursor}`);
@@ -2320,13 +2283,10 @@ function updateAbilitySlotFill(c) {
   fillEl.style.width = `${fraction * 100}%`;
 }
 
-// biteAt is an absolute epoch-ms timestamp from the server (see
-// getFishingBite() in server/store.js), not a fixed-anchor progress fraction
-// like the clocks above — so no extrapolation math is needed at all, just a
-// direct Date.now() comparison every frame. The button is only ever
-// ENABLED here (a purely cosmetic client-side gate on when clicking is
-// worth trying); the server independently re-derives the same window and is
-// the sole authority on whether a click actually lands inside it.
+// biteAt is a fixed point in time from the server, so this just compares it
+// to the current time every frame — no extra math needed. Enabling the
+// button here is purely cosmetic; the server independently checks the real
+// timing and has the final say on whether a click actually counts.
 function updateFishingCatchButton() {
   const btn = document.getElementById('fishing-catch-btn');
   if (!btn) return;

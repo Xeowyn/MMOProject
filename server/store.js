@@ -2,44 +2,38 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-// Overridable so testing/dev tooling can point at a scratch file instead of
-// risking the real save data (this file is the actual player database).
+// Can be overridden so tests can use a scratch file instead of the real
+// save data.
 const DB_PATH = process.env.MMO_DB_PATH || path.join(__dirname, '..', 'data', 'db.json');
 
 const XP_PER_LEVEL = 100; // cost of the very first level-up (level 1 -> 2)
 const XP_LEVEL_INCREMENT = 15; // each subsequent level costs this much more than the last
 
 // Combat distance is a 0-100 scale, not real pixels — the frontend maps it
-// onto the arena circle's radius. 0 = adjacent/melee, MAX_DISTANCE = as far
-// back as Quick Step can push things. Declared early since ENEMIES below
-// references MELEE_RANGE.
+// onto the arena circle. 0 means adjacent/melee range, MAX_DISTANCE is as
+// far back as Quick Step can push things.
 const MELEE_RANGE = 30;
 const MAX_DISTANCE = 100;
 const QUICK_STEP_RETREAT = 50;
 const EVASION_DODGE_CHANCE = 0.6;
 
-// --- traits (Fallout SPECIAL-style point-buy at character creation) ---
-// Every trait starts at TRAIT_BASE; the player distributes TRAIT_EXTRA_POINTS
-// on top of that across the 4 traits at creation (createCharacter()),
-// clamped to [TRAIT_MIN, TRAIT_MAX] each. After creation, traits only move by
-// spending a traitPointsAvailable earned from character leveling (see
-// allocateTraitPoint()) — no cap on further growth from leveling, since those
-// points are earned, not front-loaded.
+// --- traits (point-buy stats picked at character creation) ---
+// Every trait starts at TRAIT_BASE; the player spreads TRAIT_EXTRA_POINTS
+// across the 4 traits when creating their character, each clamped between
+// TRAIT_MIN and TRAIT_MAX. After that, traits can only go up further by
+// spending points earned from leveling up (see allocateTraitPoint()).
 const TRAIT_KEYS = ['strength', 'dexterity', 'luck', 'vigor'];
 const TRAIT_BASE = 5;
 const TRAIT_MIN = 1;
 const TRAIT_MAX = 10;
 const TRAIT_EXTRA_POINTS = 10;
 
-// Character-level XP is completely separate from skill xp — earned from
-// discovering new locations (see gainCharacterXp()/discoverLocation()).
-// Reuses the same xpCostForLevel()/levelFromXp() curve every skill uses.
+// Character-level xp is separate from skill xp — earned by discovering new
+// locations.
 const DISCOVERY_XP = 25;
 
-// Perks are permanent, one-time unlocks (no multi-rank in v1) bought with
-// perkPoints earned from character leveling, gated by character level in
-// tiers so the "tree" has real structure without needing a prerequisite
-// graph. Effects are summed by getPlayerModifiers() below.
+// Perks are permanent one-time unlocks bought with perk points earned from
+// leveling up, grouped into tiers unlocked at higher levels.
 const PERKS = {
   brute_force: { name: 'Brute Force', description: '+10% melee damage.', tier: 1, requiresLevel: 1, cost: 1, effect: { type: 'meleeDamageMult', value: 0.1 } },
   swift_strikes: { name: 'Swift Strikes', description: '+8% attack speed (abilities cast faster).', tier: 1, requiresLevel: 1, cost: 1, effect: { type: 'attackSpeedMult', value: 0.08 } },
@@ -58,17 +52,14 @@ const PERKS = {
 };
 
 // --- mining nodes (Melvor-Idle-style skill grid) ---
-// Mining is decoupled from the overworld map entirely — once a node's
-// linked location has been discovered, it's minable from the Mining tab
-// regardless of where the player currently is (see tickResourceTask()/
-// startResourceTask() in the unified resource-node engine below). Nodes are
-// ordered so lesser ores sit near the starting location (Wanderer's Camp,
-// 50/50) and rarer ores farther out — see the distance comment on each entry.
+// Mining doesn't care where the player currently is standing — once a
+// node's location has been discovered, it can be mined from the Mining tab
+// from anywhere. Nodes are ordered with weaker ores near the starting
+// location and rarer ores farther out.
 const MINING_NODES = {
-  // always unlocked (linked to the starting location, which every player
-  // discovers on character creation) — see RESOURCE_NODES/discoverLocation.
-  // Deliberately the weakest node in the registry so the real ore veins
-  // discovered further out stay worth traveling for.
+  // Always unlocked, since the starting location is always discovered.
+  // Deliberately the weakest node here, so the ores found further out are
+  // worth traveling for.
   stone: { name: 'Loose Rocks', item: 'stone', locationId: 'wanderers_camp', tier: 1, cycleSeconds: 2, xpPerItem: 2 },
   copper: { name: 'Copper Vein', item: 'copper_ore', locationId: 'wyrmwood_hold', tier: 1, cycleSeconds: 2.5, xpPerItem: 4 }, // dist ~10.7
   tin: { name: 'Tin Vein', item: 'tin_ore', locationId: 'moonshade_reach', tier: 1, cycleSeconds: 2.5, xpPerItem: 4 }, // dist ~13.3
@@ -79,13 +70,8 @@ const MINING_NODES = {
   mithril: { name: 'Mithril Vein', item: 'mithril_ore', locationId: 'ruined_mine', tier: 4, cycleSeconds: 5.5, xpPerItem: 20 }, // dist ~38.8
 };
 
-// Woodcutting/fishing use the exact same node-grid shape as MINING_NODES —
-// one item per cycle, guaranteed on completion (cycleSeconds/xpPerItem) —
-// unlocked by discovery and workable from anywhere once unlocked, same as
-// mining. Each skill's camp node is tied to the starting location (always
-// discovered) so the skill is usable from the moment a character is
-// created; every other node needs its location discovered first and always
-// yields an item exclusive to that node — see RESOURCE_NODES below.
+// Woodcutting and fishing work exactly like mining: one item guaranteed
+// per cycle, workable from anywhere once the node's location is unlocked.
 const WOODCUTTING_NODES = {
   camp_grove: { name: 'Camp Grove', item: 'wood', locationId: 'wanderers_camp', tier: 1, cycleSeconds: 4, xpPerItem: 5 },
   gladewind_grove: { name: 'Gladewind Grove', item: 'oak_wood', locationId: 'gladewind_grove', tier: 2, cycleSeconds: 5, xpPerItem: 9 },
@@ -95,11 +81,10 @@ const FISHING_NODES = {
   grimwater_bridge: { name: 'Grimwater Bridge', item: 'trout', locationId: 'grimwater_bridge', tier: 2, cycleSeconds: 6, xpPerItem: 10 },
 };
 
-// sellPrice: gold paid by sellItem() when the player sells one unit back to
-// the shop. Omitted entirely on 'gold' itself (not sellable) — every other
-// item has one so nothing a player can hold is a dead end if they'd rather
-// have gold. Roughly half of SHOP_ITEMS' buy price for anything also sold
-// there, so buy-then-sell isn't a profitable loop.
+// sellPrice: how much gold selling one of this item back to the shop pays.
+// Every item has one except 'gold' itself. For anything also bought at the
+// shop, sellPrice is roughly half the buy price, so buying just to resell
+// isn't a way to make free money.
 const ITEMS = {
   iron_ore: { name: 'Iron Ore', sellPrice: 2 },
   // mining node grid ores (see MINING_NODES) — sellPrice roughly scales with tier
@@ -191,17 +176,14 @@ const ITEMS = {
   },
 };
 
-// Fixed per-creature attacks/effects (not derived from equipment, unlike the
-// player) — goldReward/xpReward are [min,max] rolled on a win.
-// aiType drives how an enemy spends its one action per combat round (see
-// enemyTakeTurn()): 'melee_aggressive' always closes to range then attacks
-// every turn it can (differentiated per-enemy via approachSpeed/damage/hp);
-// 'skirmisher' closes in, attacks, then hops back out to re-approach next
-// turn instead of standing and trading; 'ranged_kiter' tries to hold at
-// preferredRange, backing off if the player gets too close and closing in
-// if they're too far, only shooting once actually in that band. approachSpeed
-// is now distance units closed (or, for a kiter repositioning, opened) per
-// ROUND rather than per second — see the tick-engine rewrite below.
+// Each enemy's stats are fixed, not based on gear like the player's are.
+// goldReward/xpReward are [min, max] ranges rolled on a win.
+// aiType controls what an enemy does each round (see enemyTakeTurn()):
+// 'melee_aggressive' closes in and attacks every chance it gets.
+// 'skirmisher' closes in, attacks, then backs off before attacking again.
+// 'ranged_kiter' tries to stay at its preferredRange — backing off if the
+// player gets close, closing in if they're too far, only attacking while
+// in that range.
 const ENEMIES = {
   giant_rat: {
     name: 'Giant Rat',
@@ -349,14 +331,9 @@ const ENEMIES = {
   },
 };
 
-// Angle offsets (degrees, 0 = straight up from the player) assigned to each
-// enemy in a fight at combat start, indexed by [groupSize][slotIndex] — kept
-// as a small fixed table rather than a generic spacing formula since group
-// size is capped at 3. Spread across the top arc so every enemy visually
-// faces the player without anyone directly behind another, and since each
-// enemy only ever moves radially (toward/away along its own fixed angle,
-// never around the circle), two enemies can never collide with each other
-// or the player as long as their angles differ — which this table guarantees.
+// Where each enemy stands around the player when a fight starts, in
+// degrees (0 = straight up), based on how many enemies are in the group.
+// Spread out so enemies never overlap each other or the player.
 const COMBAT_GROUP_ANGLES = {
   1: [0],
   2: [-38, 38],
@@ -375,11 +352,9 @@ const PLANTS = {
 };
 const GARDEN_PLOT_COUNT = 24;
 
-// Converts garden crops into supplies — the resource expeditions consume —
-// so gardening and exploration feed into each other instead of being
-// isolated systems. resultAmount scales with the crop's grow time (potato
-// takes longest to grow, so it converts to the most supplies) to keep the
-// three crop types roughly comparable in supplies-per-second-grown.
+// Turns garden crops into supplies (which expeditions use up), so gardening
+// and exploring feed into each other. Crops that take longer to grow
+// convert into more supplies, to keep them roughly balanced.
 const RECIPES = [
   { id: 'wheat_supplies', ingredients: { wheat_crop: 2 }, result: 'supplies', resultAmount: 1 },
   { id: 'carrot_supplies', ingredients: { carrot_crop: 2 }, result: 'supplies', resultAmount: 2 },
@@ -387,14 +362,10 @@ const RECIPES = [
   { id: 'meat_supplies', ingredients: { raw_meat: 2 }, result: 'supplies', resultAmount: 2 },
 ];
 
-// Alchemy recipes are deliberately NOT exposed raw via any GET endpoint —
-// unlike RECIPES (crafting), the whole point is the player doesn't know
-// these combos up front and has to discover them via experimentAlchemy().
-// publicPlayer() only ever sends back the subset the player has personally
-// discovered (player.alchemy.knownRecipes), via ingredientComboKey() below.
-// Every recipe combines exactly two distinct ingredients (amount 1 each) —
-// matches the two-ingredient-slot experiment UI, no need for RECIPES'
-// variable-amount object shape here.
+// Unlike RECIPES (crafting), these are never sent to the client as a full
+// list — the whole point of alchemy is that players don't know the combos
+// up front and have to discover them by experimenting. Each recipe always
+// combines exactly two different ingredients, one of each.
 const POTION_RECIPES = [
   { id: 'healing_potion', ingredients: { sunpetal: 1, moonleaf: 1 }, result: 'healing_potion' },
   { id: 'antidote', ingredients: { redcap_cap: 1, bog_root: 1 }, result: 'antidote' },
@@ -443,22 +414,17 @@ const LOCATION_REVEAL_PRICE = 30;
 const PLAYER_BASE_HP = 50;
 const PLAYER_HP_PER_LEVEL = 5;
 
-// Combat runs in discrete rounds (ticks): each round, the player either
-// resolves their current loadout ability or spends the round still charging
-// it (see baseCastRounds below), then every living enemy takes one AI-driven
-// action. tickIntervalSeconds is how much real time one round takes to play
-// out — purely a pacing/watchability knob (see COMBAT_SPEED_PRESETS), not a
-// balance lever; it doesn't change how many rounds a fight takes, just how
-// fast those rounds tick by on screen. Persisted per-player as a preference
-// (player.combatSpeed) so it carries between fights, adjustable mid-fight.
+// Combat plays out in rounds: each round the player either finishes
+// charging their current ability or uses it, then every living enemy takes
+// its turn. tickIntervalSeconds is just how fast rounds play out on screen
+// (see COMBAT_SPEED_PRESETS) — it doesn't change how many rounds a fight
+// takes, just the pacing. Saved per player so it carries between fights.
 const COMBAT_SPEED_PRESETS = { slow: 2.2, normal: 1.1, fast: 0.4 };
 const DEFAULT_COMBAT_SPEED = 'normal';
 
-// Player abilities go in 6 loadout slots and execute left-to-right, looping
-// back to slot 0 — see resolvePlayerTurn()/advanceCursor(). unlockLevel
-// gates them behind the player's Combat skill level (see levelFromXp()),
-// giving a "learn more throughout the game" progression without needing any
-// separate unlock system (shop/quest) for v1.
+// Abilities go into 6 loadout slots and play out left to right, looping
+// back to the start. unlockLevel gates each one behind the player's Combat
+// skill level, so new abilities unlock naturally as you fight more.
 const ABILITIES = {
   swing: {
     name: 'Swing',
@@ -548,14 +514,11 @@ const OVERLAP_THRESHOLD = 3.5; // how close the drawn path must pass to a locati
 const EXPEDITION_SPEED = 1.5; // percent-units of path covered per second — slow, deliberate travel, not a blip
 const MIN_EXPEDITION_DURATION = 8; // seconds — even the shortest possible trip should take a real, watchable while
 
-// Gather tasks — Hunting/Scavenging/Harvesting. Now node-grid based, same
-// unlock-by-discovery/workable-from-anywhere shape as mining/woodcutting/
-// fishing (see RESOURCE_NODES below), EXCEPT each completed cycle only has a
-// *chance* of yielding anything, resolved in tickChanceNode() rather than
-// the guaranteed-yield math tickDeterministicNode() uses. Each skill's camp
-// node is intentionally the weaker/cheaper pool — the better items (rarer
-// alchemy ingredients, iron ore, etc) only ever drop from the discovery-
-// gated node, never from camp, so there's always a reason to go find it.
+// Gather tasks — Hunting/Scavenging/Harvesting. Unlocked by discovery and
+// workable from anywhere, same as mining/woodcutting/fishing, except each
+// completed cycle only has a *chance* of finding something instead of a
+// guaranteed item. Each skill's starting camp node only gives common items —
+// the better stuff only drops from nodes you have to go discover.
 const HUNTING_NODES = {
   camp_hunt: {
     name: 'Camp Woods',
@@ -852,11 +815,8 @@ const LOCATIONS = [
   { id: 'copperburrow_spire', name: 'Copperburrow Spire', x: 43.6, y: 58.6, combat: ['bandit'], loot: { item: 'supplies', amount: 3 } },
 ];
 
-// Pure flavor text + branching, no game-state mutation embedded in the tree
-// itself — an NPC's associated quest (if any) is a separate object shown
-// alongside the tree in the client, not a node in it. Keeps the tree a
-// simple static graph instead of needing a mini scripting language for
-// conditionals.
+// Just flavor text and branching choices — an NPC's quest (if it has one)
+// is shown separately in the client, not part of this tree.
 const DIALOGUE_TREES = {
   root_mira: {
     id: 'root_mira',
@@ -1006,10 +966,10 @@ const NPCS = {
   sage_thistle: { id: 'sage_thistle', name: 'Sage Thistle', locationId: 'stonehaven_ruins', dialogueTreeId: 'root_thistle', questId: 'the_deep_stone' },
 };
 
-// objective types: 'kill' (cumulative lifetime kill count, so a quest can be
-// satisfied instantly by prior kills — deliberate, keeps this simple rather
-// than needing quest-scoped counters), 'gather' (inventory count, consumed
-// on turn-in), 'visit' (location already discovered).
+// objective types: 'kill' (your all-time kill count for that enemy — so a
+// quest can already be done if you've killed enough before accepting it),
+// 'gather' (how many of an item you're holding, used up on turn-in), 'visit'
+// (a location you've discovered).
 const QUESTS = {
   first_hunt: {
     id: 'first_hunt',
@@ -1099,16 +1059,12 @@ function loadDb() {
 
 let db = loadDb();
 
-// save() used to writeFileSync the ENTIRE db (every player, not just one)
-// synchronously on every call — and publicPlayer() (called by GET /api/me,
-// which every connected client polls every 300ms-2s) calls save()
-// unconditionally on every single poll. That's a full-file disk write, on
-// Node's single thread (blocking every other in-flight request for its
-// duration), that scales with player count x poll frequency rather than
-// with how often anything actually changed. Debouncing coalesces however
-// many save() calls land within SAVE_DEBOUNCE_MS — across ALL players, not
-// per-player — into a single write, so disk cost stays roughly flat as more
-// players connect instead of growing linearly with them.
+// save() writes the whole save file to disk, and /api/me (which every
+// player's browser calls every second or so) used to call save() every
+// single time — that's a lot of slow disk writes as more players connect.
+// Instead, save() just marks the file as "needs saving" and a timer
+// actually writes it once per second, no matter how many times save() was
+// called in that second.
 const SAVE_DEBOUNCE_MS = 1000;
 let saveTimer = null;
 let dirty = false;
@@ -1129,9 +1085,9 @@ function save() {
   saveTimer = setTimeout(flushSave, SAVE_DEBOUNCE_MS);
 }
 
-// Make sure a pending debounced save isn't lost on a clean shutdown
-// (nodemon restart, Ctrl+C, deploy) — up to SAVE_DEBOUNCE_MS of the most
-// recent progress would otherwise never reach disk.
+// If the server stops (Ctrl+C, restart, deploy) while a save is still
+// waiting on its timer, write it now so that last second of progress isn't
+// lost.
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
     flushSave();
@@ -1150,16 +1106,13 @@ function genId(prefix) {
   return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
 
-// --- account security: password (login gate) + bearer token (per-request auth) ---
-// Added once the game became reachable over a real internet tunnel rather
-// than just localhost — a friend's playerId is broadcast to every other
-// connected client (needed for the "nearby adventurers" presence list), so
-// without a token check anyone could copy that id out of the websocket
-// traffic and issue actions as that player without ever needing their
-// password. Every account created from here on gets both; accounts that
-// existed before this shipped are backfilled with passwordHash/token left
-// null (see ensurePlayerShape) so they keep working exactly as before —
-// deliberately not force-migrating the user's own existing real account.
+// --- account security: password to log in + a token checked on every request ---
+// Needed once the game was reachable over the internet instead of just on
+// one computer — a player's id is visible to every other connected player
+// (it's how the "nearby adventurers" list works), so without a token check
+// anyone could grab that id and act as that player. New accounts get a
+// password and a token; accounts made before this existed keep working
+// without one (see ensurePlayerShape).
 function hashPassword(password, salt) {
   return crypto.scryptSync(String(password), salt, 64).toString('hex');
 }
@@ -1168,23 +1121,21 @@ function makePasswordRecord(password) {
   return { passwordHash: hashPassword(password, passwordSalt), passwordSalt };
 }
 function verifyPassword(player, password) {
-  if (!player.passwordHash) return true; // legacy/no-password account — unchanged open behavior
+  if (!player.passwordHash) return true; // old account with no password set — still lets anyone in, same as before
   if (!password) return false;
   const candidate = Buffer.from(hashPassword(password, player.passwordSalt), 'hex');
   const actual = Buffer.from(player.passwordHash, 'hex');
   return candidate.length === actual.length && crypto.timingSafeEqual(candidate, actual);
 }
-// Used by the server's auth middleware on every mutating/read request.
-// player.token === null means a legacy account with enforcement off, exactly
-// matching today's wide-open behavior for any account that predates this.
+// player.token === null means an old account made before tokens existed —
+// it stays open, same as it always was.
 function verifyToken(player, suppliedToken) {
   return player.token === null || player.token === suppliedToken;
 }
 
-// traits: {strength, dexterity, luck, vigor} — always provided by
-// createCharacter() (validated there); defaults to an even TRAIT_BASE spread
-// only as a fallback (devResetPlayer/legacy callers never actually hit this,
-// but keeps newPlayer callable without traits from not blowing up).
+// traits is always given by createCharacter() (which validates it) — the
+// even spread here only kicks in as a fallback so this function never
+// crashes if it's ever called without traits.
 function newPlayer(username, traits, passwordRecord) {
   const startLoc = LOCATIONS.find((l) => l.startingLocation);
   const id = genId('p_');
@@ -1232,10 +1183,9 @@ function newPlayer(username, traits, passwordRecord) {
   return player;
 }
 
-// Two-step now: an unrecognized username no longer auto-creates a player —
-// it hands back { existing: false, username } so the client can show the
-// trait point-buy character-creation screen and call createCharacter()
-// with the chosen traits. A recognized username logs in exactly as before.
+// A username nobody's used yet doesn't create a player right away — it
+// tells the client to show the character creation screen instead. A known
+// username logs in like normal.
 function login(username, password) {
   const clean = String(username || '').trim().slice(0, 24);
   if (!clean) return null;
@@ -1248,10 +1198,8 @@ function login(username, password) {
   return { existing: false, username: clean };
 }
 
-// Validates the Fallout-SPECIAL-style point-buy pool (TRAIT_BASE each +
-// TRAIT_EXTRA_POINTS to distribute, each trait clamped to
-// [TRAIT_MIN, TRAIT_MAX]) server-side — never trusts the client's math even
-// though the UI enforces it too.
+// Checks the trait point spending server-side too, even though the UI
+// already enforces it — never trust the client's math alone.
 const MIN_PASSWORD_LENGTH = 4;
 
 function createCharacter(username, rawTraits, password) {
@@ -1273,12 +1221,10 @@ function createCharacter(username, rawTraits, password) {
   return { ok: true, player: publicPlayer(player), token: player.token };
 }
 
-// Any player created before a given feature existed (equipment/garden/combat
-// skill/gold, added in the big 2026-07-21 batch) is missing those fields on
-// disk. Backfill them on load instead of assuming every player object has
-// the current shape — without this, publicPlayer() throws the moment it
-// touches e.g. player.equipment.weapon on an old record, which surfaces to
-// the client as a bare 500 on login with no indication why.
+// Players made before a feature existed (equipment, garden, combat skill,
+// gold, etc) are missing those fields in the save file. This fills in
+// anything missing when a player is loaded, so the rest of the code can
+// always assume every field is there.
 function ensurePlayerShape(player) {
   let changed = false;
   if (player.inventory.gold === undefined) {
@@ -1294,25 +1240,16 @@ function ensurePlayerShape(player) {
     changed = true;
   }
   // Combat 2.0 (ability-sequencer arena) changed the shape of an in-progress
-  // fight (added loadout/distance/abilityCursor/etc). Any account that had
-  // an UNRESOLVED fight open at the moment that shipped is stuck holding an
-  // old-shape combat object — publicPlayer() unconditionally reads
-  // c.loadout.map(...), which throws on the old shape and breaks /api/me
-  // entirely for that account (not just the fight button). Same class of
-  // bug as the login-500 and dangling-location-id incidents: schema
-  // evolved, old in-flight state didn't migrate. Resetting to null loses
-  // that one stale fight, same tradeoff already accepted for the location
-  // migration.
+  // fight (added loadout/distance/abilityCursor/etc). If someone had a fight
+  // still open when that shipped, their save has the old shape and reading
+  // it would crash. Just clear that one stale fight instead of trying to
+  // convert it.
   if (player.combat && !Array.isArray(player.combat.loadout)) {
     player.combat = null;
     changed = true;
   }
-  // Same class of migration, same tradeoff: the tick-based multi-enemy
-  // combat rewrite changed a fight's shape from singular enemyId/enemyHp to
-  // c.enemies[] — any account with an unresolved fight open at that moment
-  // is stuck on the old shape, which the new engine can't read. Reset it
-  // (loses that one stale fight) rather than trying to migrate mid-fight
-  // state into a structurally different engine.
+  // Same fix, different rewrite: fights used to track one enemy, now they
+  // track a list of enemies. Clear any fight still stuck on the old shape.
   if (player.combat && !Array.isArray(player.combat.enemies)) {
     player.combat = null;
     changed = true;
@@ -1393,10 +1330,8 @@ function ensurePlayerShape(player) {
     player.perks = [];
     changed = true;
   }
-  // Every resource skill is node-grid based now (was mining-only) — any
-  // account whose skill entry predates that for a given skill (created
-  // before woodcutting/fishing/hunting/scavenging/harvesting moved to nodes)
-  // is missing activeNode entirely.
+  // Every gathering skill uses the node system now (only mining used to) —
+  // older accounts might be missing activeNode on some skills.
   for (const skillId of Object.keys(RESOURCE_NODES)) {
     if (player.skills[skillId] && player.skills[skillId].activeNode === undefined) {
       player.skills[skillId].activeNode = null;
@@ -1413,13 +1348,9 @@ function ensurePlayerShape(player) {
     changed = true;
   }
 
-  // The location list was completely regenerated (6 hand-written locations
-  // -> 55 procedurally-placed ones) when the expedition-drawing feature was
-  // built. Any player from before that has discoveries/currentLocation
-  // pointing at ids that no longer exist at all — every location-driven
-  // feature (mining's location check, drawing a route from "current
-  // location", travel) silently fails to find a match and no-ops, which is
-  // indistinguishable from those features just being broken.
+  // The map's locations were completely redone at one point, so an old save
+  // might point at locations that don't exist anymore. Drop those and fall
+  // back to the starting location so nothing breaks.
   const validLocationIds = new Set(LOCATIONS.map((l) => l.id));
   const filteredDiscoveries = player.discoveries.filter((id) => validLocationIds.has(id));
   if (filteredDiscoveries.length !== player.discoveries.length) {
@@ -1472,10 +1403,10 @@ const FISHING_CATCH_GRACE_MS = 200; // slack for the catch request's own network
 const FISHING_BONUS_AMOUNT = 1;
 const FISHING_BONUS_XP = 4;
 
-// Tiny deterministic PRNG seeded from a string — NOT Math.random(). The bite
-// window has to come out identically whether it's being read for a status
-// poll or re-derived later to validate a catch attempt, with zero extra
-// state persisted in between; a string-seeded hash makes both calls agree.
+// A random-number generator that always gives the same result for the same
+// input string, unlike Math.random(). We need the bite window to come out
+// the same whether we're just checking it or actually validating a catch, so
+// both calls need to agree without saving anything extra.
 function hashSeed(str) {
   let h = 1779033703 ^ str.length;
   for (let i = 0; i < str.length; i++) {
@@ -1490,15 +1421,10 @@ function hashSeed(str) {
   };
 }
 
-// Returns the CURRENT fishing cycle's bite window as {biteAt (absolute ms
-// epoch), windowMs, cycleIndex}, or null while fishing isn't active. Purely
-// a function of already-saved state (skill.taskStartedAt) plus wall-clock
-// time — nothing new is written to the player record just by calling this,
-// so a status poll and a later catch attempt can each call it independently
-// and always land on the same window for whichever cycle "now" falls in.
-// Reads cycleSeconds from whichever node is currently active (camp vs a
-// discovery-gated node) rather than a single fixed value, same as the
-// passive tick — a faster/slower node just moves the whole window with it.
+// Works out when the current fishing cycle's "bite" window is: {biteAt,
+// windowMs, cycleIndex}, or null if not fishing. This only reads existing
+// state and the current time — it doesn't save anything — so a status check
+// and a later catch attempt always agree on the same window.
 function getFishingBite(player) {
   const skill = player.skills.fishing;
   if (!skill || !skill.taskStartedAt || !skill.activeNode) return null;
@@ -1510,29 +1436,20 @@ function getFishingBite(player) {
   const cycleIndex = Math.floor(elapsedSeconds / effectiveCycleSeconds);
   const cycleStartMs = skill.taskStartedAt + cycleIndex * effectiveCycleSeconds * 1000;
   const cycleMs = effectiveCycleSeconds * 1000;
-  // Clamp the window itself to a third of the cycle — defends against a
-  // stacked speed bonus someday shrinking effectiveCycleSeconds enough that
-  // a fixed 600ms window wouldn't fit (not reachable with current perks,
-  // whose fishing-speed bonuses are small, but cheap to make impossible
-  // rather than merely unlikely).
+  // Never let the bite window be bigger than a third of the cycle, in case
+  // speed bonuses ever shrink the cycle enough that the normal window
+  // wouldn't fit.
   const windowMs = Math.min(FISHING_BITE_WINDOW_MS, cycleMs / 3);
-  // keep the window off the very start/end of the cycle so it's never
-  // clipped by the passive item-yield boundary
+  // Keep the window away from the very start/end of the cycle.
   const usableMs = Math.max(0, cycleMs - windowMs * 2);
   const rand = hashSeed(`${player.id}:${skill.taskStartedAt}:${cycleIndex}`);
   const offsetMs = windowMs + rand() * usableMs;
   return { biteAt: Math.round(cycleStartMs + offsetMs), windowMs, cycleIndex };
 }
 
-// Player-triggered: click Catch during the bite window for a bonus catch +
-// xp on top of whatever the passive clock already yields — the bonus item
-// is always whichever item the currently active node produces (camp's
-// plain fish, or a discovered node's better fish), never a fixed item, so
-// the minigame never outperforms picking a better node. At most one
-// resolved attempt per cycle (skill.lastCatchCycle), hit or miss, so rapid
-// button-mashing can't be used to brute-force the timing check. No location
-// check needed any more — fishing nodes are workable from anywhere once
-// unlocked, same as every other resource task.
+// Click Catch during the bite window for a bonus catch and xp on top of what
+// you'd get passively. Only one attempt counts per cycle, so mashing the
+// button can't be used to cheat the timing.
 function attemptFishingCatch(playerId) {
   const player = getPlayer(playerId);
   if (!player) return { error: 'not_found' };
@@ -1607,22 +1524,17 @@ function tickDeterministicNode(player, skillId, skill, node) {
   skill.lastTick = now;
 }
 
-// Resolves elapsed time on a chance-based node (hunting/scavenging/
-// harvesting) into whole completed cycles, then rolls each one
-// independently instead of granting a guaranteed yield — see
-// RARE_GATHER_EVENT_CHANCE for the shared jackpot odds. A hunting cycle can
-// trigger an ambush (see resolveGatherCycleForNode/beginAmbushCombat),
-// which immediately stops the task — combat is a hard block on every other
-// task in this codebase, same as it is for mining/expeditions. Cycles are
-// capped per tick (same idea as tickCombat's guard cap) so a very long AFK
-// gap can't turn into an unbounded loop; any still-unprocessed whole cycles
-// just carry over as extra progressSeconds and get resolved on the next tick.
+// Works out how many full cycles have passed on a chance-based node
+// (hunting/scavenging/harvesting) and rolls each one separately, instead of
+// always giving a guaranteed item like mining does. A hunting cycle can
+// trigger an ambush fight, which stops the task right away. Cycles are
+// capped per call so a player who was away a very long time can't cause a
+// huge loop — any leftover cycles just carry over to the next tick.
 const GATHER_TICK_CAP = 500;
 
 function tickChanceNode(player, skillId, skill, node) {
   if (player.combat && !player.combat.result) {
-    // something else (an earlier ambush this same tick, or any other path
-    // into combat) already put the player in a fight — stop gathering
+    // Already in a fight (maybe from an ambush this same tick) — stop gathering.
     skill.taskStartedAt = null;
     skill.lastTick = null;
     return;
@@ -1630,21 +1542,12 @@ function tickChanceNode(player, skillId, skill, node) {
 
   const now = Date.now();
   const from = skill.lastTick || skill.taskStartedAt;
-  // Clamp (not skip-on-<=0): after a GATHER_TICK_CAP-limited tick,
-  // progressSeconds can hold far more than one cycle's worth of
-  // still-unprocessed backlog. Bailing out whenever elapsedSeconds isn't
-  // strictly positive (e.g. two ticks landing in the same millisecond —
-  // unreachable over real network polling, but trivially hit by any tight
-  // synchronous loop calling publicPlayer() repeatedly) would stall that
-  // backlog from ever draining further, even though there's still real
-  // progress to process. Only skip entirely when there's truly nothing to do.
   const elapsedSeconds = Math.max(0, (now - from) / 1000);
   const totalSeconds = (skill.progressSeconds || 0) + elapsedSeconds;
   const cyclesCompleted = Math.floor(totalSeconds / node.cycleSeconds);
   if (cyclesCompleted <= 0) {
-    // Must persist totalSeconds here, not just advance lastTick — otherwise
-    // every sub-cycle tick discards the elapsed time it just measured, so
-    // cyclesCompleted can never climb past 0 and the task never completes.
+    // Save the partial progress even though no cycle finished yet, so it
+    // isn't lost and counts toward the next one.
     skill.progressSeconds = totalSeconds;
     skill.lastTick = now;
     return;
@@ -1672,12 +1575,9 @@ function tickChanceNode(player, skillId, skill, node) {
 }
 
 function resolveGatherCycleForNode(player, skillId, node) {
-  // Every completed cycle grants a small flat xp regardless of outcome —
-  // previously xp only came from xpPerSuccess (a 30% roll), so 55-70% of
-  // completed cycles gave literally nothing, which read as "the circle
-  // fills and nothing happens." Matches how mining/woodcutting/fishing
-  // always grant xp per completed cycle; the chance-based item/loot stays
-  // exactly as designed, only xp is now guaranteed per attempt.
+  // Every completed cycle gives a small flat xp, even on a "nothing found"
+  // roll, so it never feels like a wasted cycle. The chance-based
+  // item/loot roll is separate and unaffected.
   player.skills[skillId].xp += node.attemptXp;
 
   if (Math.random() < RARE_GATHER_EVENT_CHANCE) {
@@ -1685,9 +1585,8 @@ function resolveGatherCycleForNode(player, skillId, node) {
     return 'rare';
   }
 
-  // luck trait + Treasure Hunter perk — added on top of the node's own
-  // successChance, never touches encounterChance (an ambush isn't a
-  // "success" to boost away)
+  // Luck trait and the Treasure Hunter perk boost the success roll, but
+  // never the ambush roll — an ambush isn't a "success" to boost away.
   const successBonus = getPlayerModifiers(player).gatherSuccessBonus;
 
   if (skillId === 'hunting') {
@@ -1715,12 +1614,8 @@ function resolveGatherCycleForNode(player, skillId, node) {
   return 'nothing';
 }
 
-// Starts working a node the player has unlocked (its linked location has
-// been discovered) — usable from anywhere, no travel needed once unlocked.
-// Switching to a different node (or re-clicking the active one to stop)
-// both go through this + stopTask(skillId) on the client. Replaces the old
-// separate startTask()/startMiningNode() — every resource skill now goes
-// through the same node picker.
+// Starts working a node the player has unlocked (its location has been
+// discovered) — no need to travel there first once it's unlocked.
 function startResourceTask(playerId, skillId, nodeId) {
   const player = getPlayer(playerId);
   if (!player) return { error: 'not_found' };
@@ -1740,10 +1635,8 @@ function startResourceTask(playerId, skillId, nodeId) {
   return { ok: true };
 }
 
-// Every node for a skill, locked or not — the Mining/Fishing tabs and the
-// Woodcutting/Hunting/Scavenging/Harvesting skill cards all show the full
-// node list so players can see what's still out there to discover, same
-// idea as the ability sidebar showing locked abilities.
+// Every node for a skill, locked or not — so players can see what's still
+// out there to discover.
 function publicResourceNodes(player, skillId) {
   const skill = player.skills[skillId];
   const registry = RESOURCE_NODES[skillId];
@@ -1774,19 +1667,13 @@ function publicResourceNodes(player, skillId) {
   });
 }
 
-// Shared combat-instance constructor used by both startCombat() (the player
-// chose to fight) and beginAmbushCombat() (a hunting gather task triggered
-// it with nobody clicking anything) — same shape either way, just an
-// `ambush` flag the client uses to show a distinct toast. Snapshots
-// player.abilityLoadout into c.loadout at fight start rather than reading it
-// live, since loadout edits are blocked during combat (see setLoadoutSlot) —
-// this keeps mid-fight state simple and immune to any future relaxation of
-// that rule.
-// enemyIds: an array (1-3) — see rollEncounterGroup(). Each gets its own
-// fixed angle slot (COMBAT_GROUP_ANGLES) assigned once here and never
-// changed again, so no two enemies (or the player, fixed at the center) can
-// ever occupy the same position — every enemy only ever moves radially along
-// its own angle afterward (see enemyTakeTurn()).
+// Sets up a fight — used both when the player picks a fight (startCombat)
+// and when a hunting task triggers a surprise ambush (beginAmbushCombat).
+// The `ambush` flag just tells the client to show a different message.
+// Copies the player's ability loadout into the fight at the start, since
+// loadout can't be edited mid-fight. enemyIds is 1-3 enemies (see
+// rollEncounterGroup); each gets its own fixed angle around the player so
+// they never overlap.
 function beginCombatInstance(player, enemyIds, ambush) {
   const now = Date.now();
   const maxHp = playerMaxHp(player);
@@ -1862,11 +1749,10 @@ function rollEncounterGroup(loc, chosenEnemyId) {
   return group;
 }
 
-// The 0.01% jackpot, shared across all three gather tasks: either the rare
-// armor drop or a nudge toward an NPC's quest (any NPC anywhere, unlike the
-// gather tasks' own results — "meeting someone" is a chance encounter, not
-// tied to where the player is standing). Falls back to the armor branch if
-// no quest is left to offer, so the rare roll is never wasted on nothing.
+// The 0.01% jackpot on a gather task: either rare armor, or a nudge toward
+// a quest from any NPC in the game (not just nearby ones — "meeting
+// someone" is a random encounter). Falls back to armor if there's no quest
+// left to offer.
 function resolveRareGatherEvent(player) {
   const questNpc = Object.values(NPCS).find(
     (n) => n.questId && !player.quests.started.includes(n.questId) && !player.quests.completed.includes(n.questId)
@@ -1881,10 +1767,9 @@ function resolveRareGatherEvent(player) {
   }
 }
 
-// Stops any currently-running skill task (banking whatever progress had
-// already accrued first) — used to enforce "only one task at a time":
-// starting any new task (a different skill, an expedition, or combat) stops
-// whatever else was running instead of letting them stack.
+// Only one task can run at a time — starting a new one (a different skill,
+// an expedition, or a fight) stops whatever was already running, after
+// saving its progress so far.
 function stopAllSkillTasks(player) {
   for (const skillId of Object.keys(RESOURCE_NODES)) {
     tickResourceTask(player, skillId);
@@ -1931,12 +1816,9 @@ function closestPointOnPath(loc, path) {
   return best;
 }
 
-// Grants a newly-discovered location + character xp for it in one place, so
-// every path that can add to player.discoveries (expedition reveal, paid
-// shop reveal) awards xp consistently rather than duplicating the
-// already-discovered check + level-up math. Returns true if this was a real
-// new discovery (false if already known — callers that only want to push
-// once, like tickExpedition's trigger loop, rely on this).
+// Marks a location discovered and grants character xp for it, in one place
+// so every way of discovering a location (expedition, paid reveal) works
+// the same. Returns true if it was actually new.
 function discoverLocation(player, locationId) {
   if (player.discoveries.includes(locationId)) return false;
   player.discoveries.push(locationId);
@@ -1948,11 +1830,9 @@ function discoverLocation(player, locationId) {
   return true;
 }
 
-// Character-level xp is a separate pool from every skill's xp, reusing the
-// same xpCostForLevel()/levelFromXp() curve (defined further down, but
-// function declarations are hoisted so the forward reference is fine). A
-// single grant can cross more than one level (e.g. several locations
-// revealed by one expedition tick) — loop rather than assume at most one.
+// Character-level xp is separate from every skill's own xp, but uses the
+// same level curve. One grant can cross more than one level at once (e.g.
+// several locations discovered in the same expedition tick).
 function gainCharacterXp(player, amount) {
   const before = levelFromXp(player.characterXp);
   player.characterXp += amount;
@@ -1964,11 +1844,8 @@ function gainCharacterXp(player, amount) {
   }
 }
 
-// Advances the sweeping "fill" along an active expedition's drawn path and
-// reveals any location the fill has reached, without pausing the expedition
-// itself — matches ticking pattern of tickSkills (elapsed real time since
-// last check, so it's the same math whether polled continuously or after
-// being away).
+// Moves an expedition's progress forward based on real time passed, and
+// reveals any location the progress has reached along the way.
 function tickExpedition(player) {
   const exp = player.expedition;
   if (!exp) return;
@@ -2008,10 +1885,8 @@ function spendIngredients(player, ingredients) {
   for (const [itemId, amount] of Object.entries(ingredients)) spendItem(player, itemId, amount);
 }
 
-// Sums trait (from creation/leveling) and perk (from the skill-tree tab)
-// bonuses into one flat modifiers object, computed fresh from player state
-// rather than cached — cheap enough to recompute per-tick/per-request, and
-// avoids any risk of a cached value going stale after a trait/perk change.
+// Adds up all the bonuses from a player's traits and perks into one object.
+// Recomputed fresh every time rather than cached, so it's never out of date.
 function getPlayerModifiers(player) {
   const t = player.traits;
   const perkMods = {
@@ -2078,17 +1953,10 @@ function playerMaxHp(player) {
   return PLAYER_BASE_HP + (level - 1) * PLAYER_HP_PER_LEVEL + mods.hpBonus;
 }
 
-// Both sides attack on independent timers (like the mining clock, just two
-// of them racing) plus up to one poison/fire DOT per side. Rather than
-// stepping in fixed increments, this walks event-by-event in chronological
-// order (whichever of: player attack / enemy attack / either DOT tick comes
-// next) until it catches up to "now" or someone dies — same elapsed-real-time
-// idea as tickSkills/tickExpedition, just with more event types interleaved.
-// Alchemy combat buffs (Potion of Strength/Swiftness) live as a single slot
-// on the combat object, same one-effect-at-a-time pattern as dotOnEnemy/
-// dotOnPlayer — checked fresh against real time on every tick rather than
-// decremented, so it expires correctly whether the player is polling
-// continuously or comes back to a stale tab.
+// Combat runs in rounds, moving forward based on real time passed, the same
+// way skill tasks and expeditions do. A potion buff (Strength/Swiftness) is
+// checked against the real clock here rather than counted down, so it
+// expires correctly even if the player comes back to a stale tab.
 function getActiveCombatBuff(c) {
   if (!c.buff) return null;
   if (Date.now() >= c.buff.expiresAt) {
@@ -2098,8 +1966,7 @@ function getActiveCombatBuff(c) {
   return c.buff;
 }
 
-// Same one-effect-at-a-time / check-fresh-against-real-time pattern as
-// getActiveCombatBuff(), for Guard Up's temporary flat armor bonus.
+// Same idea as getActiveCombatBuff(), for Guard Up's temporary armor bonus.
 function getActiveArmorBuff(c) {
   if (!c.armorBuff) return null;
   if (Date.now() >= c.armorBuff.expiresAt) {
@@ -2109,10 +1976,8 @@ function getActiveArmorBuff(c) {
   return c.armorBuff;
 }
 
-// Moves the ability cursor to the next non-empty loadout slot, wrapping
-// around after slot 5 back to slot 0 — this IS the "abilities execute in
-// order left to right, looping" rotation. Starting from cursor -1 (a fresh
-// fight) correctly lands on slot 0 first.
+// Moves to the next filled loadout slot, wrapping back to slot 0 after slot
+// 5 — this is what makes abilities play out left to right, on a loop.
 function advanceCursor(c) {
   for (let i = 1; i <= 6; i++) {
     const idx = (c.abilityCursor + i) % 6;
@@ -2121,13 +1986,11 @@ function advanceCursor(c) {
       return;
     }
   }
-  // no abilities anywhere in the loadout — leave cursor as-is, resolvePlayerTurn no-ops forever until the fight ends
+  // No abilities in the loadout at all — leave the cursor where it is.
 }
 
-// Nearest living enemy — the default (and only, no manual-targeting UI yet)
-// target for the player's offensive abilities. Simplest sane default; easy
-// to layer manual target-selection on top of later without touching the
-// engine below, since every offensive ability already goes through this.
+// The nearest living enemy — there's no manual targeting yet, so every
+// attack just goes for whoever is closest.
 function pickTarget(c) {
   let best = null;
   for (const e of c.enemies) {
@@ -2141,15 +2004,12 @@ function livingEnemies(c) {
   return c.enemies.filter((e) => e.hp > 0);
 }
 
-// Resolves the player's turn for one round: either continues charging the
-// ability under the cursor (see castRoundsRemaining/baseCastRounds — a
-// direct reinterpretation of the old continuous-time castSeconds as a
-// discrete tick count, so Power Strike still costs noticeably more "enemies
-// get free turns while you commit" than Punch) or, once fully charged,
-// applies its effect and advances to the next loadout slot. Melee-tagged
-// abilities only take effect if the target is within MELEE_RANGE —
-// otherwise they "whiff" (the charge was still spent, cursor still
-// advances, but no effect), same cost-of-commitment idea as before.
+// Plays out the player's turn for one round: either keep charging the
+// ability under the cursor (a heavy ability like Power Strike takes more
+// rounds to charge than a fast one like Punch — that's the tradeoff for its
+// bigger hit), or once fully charged, apply its effect and move to the next
+// loadout slot. A melee ability only lands if the target is close enough —
+// otherwise it still uses up the charge but does nothing.
 function resolvePlayerTurn(player, c, equip, now) {
   const abilityId = c.loadout[c.abilityCursor];
   if (!abilityId) return; // empty loadout slot under the cursor — nothing to do this round
@@ -2249,11 +2109,10 @@ function resolvePlayerTurn(player, c, equip, now) {
   c.castRoundsRemaining = Math.max(0, Math.round(rounds) - 1);
 }
 
-// One enemy's attack, targeting the player — shared by every aiType once
-// it's decided to attack rather than reposition this turn. Quick Step's
-// evasionUntil window (now anchored to round timestamps rather than a
-// continuous clock) gives a real chance to fully dodge; a dexterity-based
-// dodgeChance applies at all times on top of it.
+// One enemy's attack on the player — used by every enemy type once it's
+// decided to attack instead of moving. Quick Step's evasion window gives a
+// real chance to dodge completely; dexterity's dodge chance also always
+// applies on top of that.
 function resolveEnemyAttackOn(player, c, target, equip, now) {
   const enemy = ENEMIES[target.enemyId];
   if (c.evasionUntil && now < c.evasionUntil && Math.random() < EVASION_DODGE_CHANCE) {
@@ -2316,12 +2175,10 @@ function enemyTakeTurn(player, c, target, equip, now) {
   }
 }
 
-// One full combat round: the player acts (or continues charging) once, then
-// every still-living enemy takes its one action, then DOT resolves once per
-// afflicted target. dps/roundsLeft on a DOT are damage-per-round and
-// rounds-remaining now, not real-time-scaled — deliberately decoupled from
-// tickIntervalSeconds so a faster combat speed doesn't make poison hit
-// harder, just play out faster on screen.
+// One full combat round: the player acts once, then every living enemy
+// acts, then poison/DOT damage applies. DOT damage is per-round, not
+// per-second, so a faster combat speed just makes it play out quicker
+// on-screen without actually hitting harder.
 function resolveRound(player, c, equip, now) {
   resolvePlayerTurn(player, c, equip, now);
 
@@ -2375,15 +2232,10 @@ function checkCombatEnd(player, c) {
   }
 }
 
-// Elapsed-real-time-driven round loop — same lazy "catch up on however many
-// units have passed since last checked" idiom as tickSkills/tickGatherTasks,
-// just with "one unit" now being a full combat round instead of a resource
-// cycle. c.nextTickAt advances by exactly tickIntervalSeconds each round
-// (anchored to the previous scheduled time, not wall-clock "now"), so
-// rounds stay evenly paced under catch-up rather than drifting — same
-// fixed-anchor idea used for expedition/mining timing elsewhere. Capped per
-// call (mirrors GATHER_TICK_CAP) so a long-idle gap can't spin forever
-// synchronously; any leftover backlog just continues on the next call.
+// Plays out however many rounds should have happened since the last check,
+// based on real time passed — same idea as the gathering skills. Capped per
+// call so a player who was away a long time doesn't cause a huge loop; any
+// leftover rounds just play out on the next call.
 const COMBAT_ROUND_CAP = 500;
 
 function tickCombat(player) {
@@ -2402,12 +2254,9 @@ function tickCombat(player) {
   }
 }
 
-// xp needed to advance FROM `level` TO `level+1` — grows by XP_LEVEL_INCREMENT
-// every level rather than a flat XP_PER_LEVEL, so later levels take
-// noticeably longer than early ones (like the levelling curves in other
-// idle/RPG games), while staying simple (linear, not exponential) and cheap
-// to compute exactly via the loops below rather than needing an inverse
-// formula.
+// How much xp it takes to go from `level` to `level+1`. Each level costs a
+// bit more than the last, so leveling up gets slower over time, like most
+// RPGs.
 function xpCostForLevel(level) {
   return XP_PER_LEVEL + XP_LEVEL_INCREMENT * (level - 1);
 }
@@ -2826,10 +2675,8 @@ function endCombat(playerId) {
   return { ok: true };
 }
 
-// Persisted preference (carries between fights) that also takes effect
-// immediately on a fight already in progress — resets the round timer's
-// anchor to "now" at the new pace rather than trying to rescale whatever
-// time was already remaining until the next round.
+// Saved as a preference for future fights, and also applies right away if a
+// fight is already happening.
 function setCombatSpeed(playerId, speed) {
   const player = getPlayer(playerId);
   if (!player) return { error: 'not_found' };
@@ -2850,9 +2697,9 @@ function unlockedAbilityIds(player) {
     .map(([id]) => id);
 }
 
-// Loadout editing is blocked mid-fight — c.loadout is a snapshot taken at
-// combat start (see beginCombatInstance), so an edit here can never desync
-// an in-progress fight; it just wouldn't be reflected in the current one.
+// You can't edit your loadout mid-fight — the fight already has its own
+// copy of it from when it started, so an edit here wouldn't affect the
+// current fight anyway.
 function setLoadoutSlot(playerId, slotIndex, abilityId) {
   const player = getPlayer(playerId);
   if (!player) return { error: 'not_found' };
@@ -2951,12 +2798,10 @@ function craftItem(playerId, recipeId) {
 
 // --- alchemy ---
 
-// Combine two owned ingredients. Ingredients are ALWAYS consumed on attempt
-// (success or not) — that's the real cost of experimentation, same as real
-// Oblivion-style alchemy. A combo that's already been tried and failed is
-// remembered per-player (player.alchemy.triedCombos) so retrying it doesn't
-// waste more ingredients pointlessly, but a fresh attempt at a combo that
-// hasn't been tried always costs the ingredients regardless of outcome.
+// Combine two owned ingredients to see what happens. The ingredients are
+// always used up, whether it works or not — that's the cost of
+// experimenting. If a combo has already been tried and failed before, it's
+// remembered so trying it again doesn't waste more ingredients.
 function experimentAlchemy(playerId, ingredientA, ingredientB) {
   const player = getPlayer(playerId);
   if (!player) return { error: 'not_found' };
@@ -3241,12 +3086,9 @@ function devSetSkillXp(playerId, skillId, xp) {
   return { ok: true, skillId, xp: skill.xp };
 }
 
-// Resets the CURRENT player back to a fresh-character state, in place —
-// same id/username, so the browser session stays logged in. For testing
-// things like exploration repeatedly without burning real supplies or
-// permanently using up locations, without needing to touch the save file
-// directly (which is live player data, not test scratch — see the incident
-// this was added in response to).
+// Resets the current player back to a fresh character, keeping the same
+// id/username so they stay logged in. Handy for testing exploration and
+// the economy over and over without editing the save file by hand.
 function devResetPlayer(playerId) {
   const player = getPlayer(playerId);
   if (!player) return { error: 'not_found' };

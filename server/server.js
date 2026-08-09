@@ -5,14 +5,10 @@ const store = require('./store');
 
 const PORT = process.env.PORT || 3000;
 
-// Last-resort safety net for a live multi-hour session: Express already
-// catches synchronous throws inside route handlers (turns them into a 500,
-// confirmed by fuzzing every endpoint with hostile input — zero crashes),
-// but nothing built-in protects async code that throws outside a request
-// (e.g. inside a setTimeout, or a promise nobody awaited/caught) or any bug
-// class not yet anticipated. Without this, ANY such bug kills the whole
-// process — and with it, every connected player's session — instantly.
-// Logging and staying up is strictly better than that for a game server.
+// Safety net: Express already turns a crash inside a route into a normal
+// error response, but a crash outside a request (like in a setTimeout) would
+// normally kill the whole server for every player. Log it instead and keep
+// running.
 process.on('uncaughtException', (err) => {
   console.error('[uncaughtException] recovered, server stays up:', err);
 });
@@ -22,17 +18,15 @@ process.on('unhandledRejection', (err) => {
 
 const app = express();
 app.use(express.json());
-// Bare request log — the only prior server output was the single startup
-// line, so there was no way to tell "a device's request never arrived"
-// (firewall/network block) apart from "it arrived and was handled silently."
-// This makes every request that actually reaches the process visible.
+// Log every request so we can tell "it never arrived" apart from "it
+// arrived and something went wrong silently."
 app.use((req, res, next) => {
   console.log(`[http] ${req.method} ${req.originalUrl} from ${req.headers['cf-connecting-ip'] || req.ip}`);
   next();
 });
-// no-store: this is an actively-iterated prototype (edit -> refresh browser),
-// so any caching of public/* is pure risk — a stale game.js served after an
-// edit would silently reintroduce fixed bugs with zero visible sign why.
+// Tell browsers never to cache the client files — this game is still being
+// worked on, and a cached old game.js would quietly bring back bugs we
+// already fixed.
 app.use(
   express.static(path.join(__dirname, '..', 'public'), {
     etag: false,
@@ -41,13 +35,12 @@ app.use(
   })
 );
 
-// Coarse per-IP rate limit — insurance against a runaway client loop or
-// someone hammering the API once the link is shared over the open internet,
-// not fine-grained throttling. Generous on purpose: a single player during
-// combat/exploration polls every 300ms (~33 req/10s) plus occasional action
-// posts, so this only ever trips on something clearly abnormal.
-// cf-connecting-ip is what Cloudflare Tunnel forwards as the real client IP
-// (req.ip would otherwise be the tunnel's local loopback for every request).
+// Simple per-IP rate limit — protects against a broken client or someone
+// hammering the API once the link is shared over the internet. The limit is
+// generous: normal play sends way fewer requests than this, so it should
+// only ever trip on something clearly wrong.
+// cf-connecting-ip is the real visitor IP that Cloudflare Tunnel forwards
+// (req.ip would just be the tunnel itself).
 const RATE_LIMIT_WINDOW_MS = 10000;
 const RATE_LIMIT_MAX = 300;
 const rateLimitBuckets = new Map(); // ip -> {count, windowStart}
@@ -73,15 +66,11 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
-// Per-request bearer-token auth. Any request carrying a playerId (body for
-// POST, query for GET) must present the matching X-Player-Token header —
-// this is what actually stops one player from acting as another using an id
-// copied out of the websocket presence broadcast (see verifyToken() in
-// store.js for why the id alone was never enough once this crossed onto the
-// open internet). Requests with no playerId at all (login, static metadata
-// GETs) pass through untouched — nothing to check yet. Legacy accounts
-// (player.token === null, created before this shipped) stay fully open,
-// exactly as before.
+// Any request that names a playerId must also send the matching
+// X-Player-Token header. Without this, anyone could grab another player's id
+// (it's visible in the websocket presence list) and act as them. Requests
+// with no playerId (like login) skip this check — there's nothing to verify
+// yet. Old accounts made before this existed have no token and stay open.
 app.use('/api', (req, res, next) => {
   const playerId = (req.body && req.body.playerId) || req.query.playerId;
   if (!playerId) return next();
@@ -128,9 +117,9 @@ app.get('/api/trait-config', (req, res) =>
   res.json({ keys: store.TRAIT_KEYS, base: store.TRAIT_BASE, min: store.TRAIT_MIN, max: store.TRAIT_MAX, extraPoints: store.TRAIT_EXTRA_POINTS })
 );
 
-// Two-step now: an unrecognized username returns { existing: false, username }
-// instead of auto-creating a player, so the client can show the trait
-// point-buy character-creation screen and call /api/create-character next.
+// Logging in is two steps: an unknown username comes back as
+// { existing: false, username } so the client can show the character
+// creation screen, then calls /api/create-character next.
 app.post('/api/login', (req, res) => {
   const result = store.login(req.body.username, req.body.password);
   if (!result) return res.status(400).json({ error: 'invalid_username' });
@@ -164,9 +153,8 @@ app.post('/api/travel', (req, res) => {
   res.json(result);
 });
 
-// Generic starter for every node-based resource skill (mining/woodcutting/
-// fishing/hunting/scavenging/harvesting) — replaces the old separate
-// /api/task/start (single fixed location per skill) and /api/mining/start.
+// One shared endpoint that starts any gathering skill (mining, woodcutting,
+// fishing, hunting, scavenging, harvesting).
 app.post('/api/task/start', (req, res) => {
   const result = store.startResourceTask(req.body.playerId, req.body.skillId, req.body.nodeId);
   if (result.error) return res.status(400).json(result);
@@ -179,10 +167,8 @@ app.post('/api/task/stop', (req, res) => {
   res.json(result);
 });
 
-// A miss/already-attempted is a normal outcome, not a server error — only a
-// real problem (not fishing, wrong location) gets a 400. success:false with
-// a 200 lets the frontend show "you missed the bite!" without tripping the
-// global error banner api() shows for actual HTTP failures.
+// Missing the bite is a normal result, not an error, so it still gets a 200
+// response — only a real problem (like not fishing at all) gets a 400.
 app.post('/api/fishing/catch', (req, res) => {
   const result = store.attemptFishingCatch(req.body.playerId);
   if (result.error) return res.status(400).json(result);
@@ -352,9 +338,9 @@ app.post('/api/dev/reset', (req, res) => {
   res.json(result);
 });
 
-// --- tavern chat history — in-memory only, not persisted to db.json (it's
-// ephemeral flavor, unlike real player progress). Sent to the client once on
-// entering a tavern; new messages after that arrive live over the socket. ---
+// --- tavern chat history — kept only in memory, not saved to db.json (it's
+// just flavor, not real progress). Sent to the client once when they enter a
+// tavern; new messages after that arrive live over the websocket. ---
 const MAX_CHAT_HISTORY = 50;
 const tavernChatHistory = new Map(); // locationId -> [{username, text, at}]
 
@@ -370,9 +356,9 @@ const server = app.listen(PORT, () => {
 const wss = new WebSocketServer({ server });
 const connections = new Map(); // playerId -> ws
 
-// Same 'error'-event-with-no-listener-crashes-the-process rule applies to
-// the server itself, not just individual sockets — belt-and-suspenders
-// alongside the per-connection ws.on('error', ...) below.
+// Same crash-if-nobody's-listening rule applies to the whole websocket
+// server, not just each connection — see the per-connection ws.on('error')
+// below for the full explanation.
 wss.on('error', (err) => {
   console.error('[wss] server error (recovered, server stays up):', err.message);
 });
@@ -393,15 +379,10 @@ wss.on('connection', (ws, req) => {
   console.log(`[ws] connection opened from ${req.headers['cf-connecting-ip'] || req.socket.remoteAddress}`);
   let identifiedId = null;
   ws.on('message', (raw) => {
-    // Everything in this handler runs as a raw EventEmitter callback, NOT
-    // through Express — Express's own routes are already safe (it wraps
-    // every handler and turns a thrown error into a 500, confirmed by
-    // fuzzing every HTTP endpoint with hundreds of hostile payloads with
-    // zero crashes), but nothing does that for a WebSocket 'message'
-    // listener. An uncaught throw here kills the entire Node process,
-    // taking the server down for every connected player at once — this
-    // try/catch is the safety net for that whole class of bug, on top of
-    // the specific null-message fix below.
+    // Express automatically catches errors in normal routes, but this
+    // websocket message handler isn't a route — if something throws in here
+    // and nobody catches it, the whole server crashes for every player. This
+    // try/catch is that safety net.
     try {
       let msg;
       try {
@@ -409,12 +390,9 @@ wss.on('connection', (ws, req) => {
       } catch {
         return;
       }
-      // JSON.parse succeeds on plenty of things that aren't message
-      // objects — "null" -> null, "42" -> a number, "[]" -> an array —
-      // none of those are syntax errors, so the catch above never fires
-      // for them. Reading .type off null throws (TypeError: Cannot read
-      // properties of null), which is exactly what crashed the server
-      // over a single 4-character "null" message before this guard.
+      // A message like "null" or "42" parses fine as JSON but isn't a real
+      // message object, so reading msg.type on it would crash. Skip anything
+      // that isn't a proper object.
       if (!msg || typeof msg !== 'object') return;
       if (msg.type === 'identify' && msg.playerId && store.getPlayer(msg.playerId)) {
         identifiedId = msg.playerId;
@@ -453,12 +431,9 @@ wss.on('connection', (ws, req) => {
     }
   });
 
-  // Node's EventEmitter has a special rule for 'error' events specifically:
-  // if nothing is listening for one, the error is thrown and crashes the
-  // process — a well-documented `ws`-library gotcha, distinct from (and in
-  // addition to) the try/catch in the message handler above. A single
-  // client's dropped connection, malformed frame, or flaky network could
-  // otherwise take the whole server down for every other connected player.
+  // If nobody listens for a socket's 'error' event, Node treats it as a
+  // crash. Without this, one player's dropped connection could take the
+  // whole server down for everybody else.
   ws.on('error', (err) => {
     console.error('[ws] socket error (recovered, server stays up):', err.message);
   });
