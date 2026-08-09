@@ -838,4 +838,12 @@ describe('login and account creation', () => {
     assert.equal(store.verifyToken(player, token), true);
     assert.equal(store.verifyToken(player, 'not-the-real-token'), false);
   });
+
+  test('a legacy account (token === null) accepts any token, including none at all', () => {
+    const { id } = makeCharacter(EVEN_TRAITS);
+    const player = store.getPlayer(id);
+    player.token = null; // simulates an account created before tokens existed
+    assert.equal(store.verifyToken(player, undefined), true);
+    assert.equal(store.verifyToken(player, 'anything'), true);
+  });
 });

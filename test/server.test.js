@@ -266,6 +266,38 @@ describe('gameplay endpoints via HTTP', () => {
   });
 });
 
+describe('missing/empty input', () => {
+  test('POST /api/travel with no playerId at all is a clean 400, not a crash', async () => {
+    const res = await post('/api/travel', { locationId: 'wanderers_camp' });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.error, 'not_found');
+  });
+
+  test('GET /api/me with no playerId query param returns 404, not a crash', async () => {
+    const res = await api('/api/me');
+    assert.equal(res.status, 404);
+    assert.equal(res.body.error, 'not_found');
+  });
+
+  test('POST /api/login with an empty username returns 400', async () => {
+    const res = await post('/api/login', { username: '   ', password: 'x' });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.error, 'invalid_username');
+  });
+
+  test('POST /api/login with no body at all returns 400, not a crash', async () => {
+    const res = await post('/api/login', {});
+    assert.equal(res.status, 400);
+    assert.equal(res.body.error, 'invalid_username');
+  });
+
+  test('POST /api/create-character with no traits field returns 400 invalid_traits', async () => {
+    const res = await post('/api/create-character', { username: `notraits_${Date.now()}`, password: 'testpass123' });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.error, 'invalid_traits');
+  });
+});
+
 describe('input edge cases', () => {
   test('a POST with no body at all does not crash the server', async () => {
     const res = await fetch(baseUrl + '/api/travel', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
