@@ -4,12 +4,12 @@ This is a fantasy game you play in your web browser. You explore a map, fight mo
 
 ## How to run it
 
-**[Download MMOProject-windows.zip](https://github.com/Xeowyn/MMOProject/releases/latest)** — no install, no git clone, no command line. Extract it, double-click `MMOProject.exe`, and the game opens in your browser automatically. A console window opens alongside it — that's the server; close it to stop the game.
+**Click the green "Code" button above → Download ZIP.** Extract it, double-click `MMOProject.exe`, and the game opens in your browser automatically. No install, no command line. A console window opens alongside it — that's the server; close it to stop the game.
 
 **Prefer to run it from the source instead?**
 
 1. Install [Node.js](https://nodejs.org/) (version 18 or newer)
-2. Download this folder and double-click `start.bat` — it installs anything missing, starts the server, and opens the game in your browser
+2. Extract the same downloaded folder and double-click `start.bat` — it installs anything missing, starts the server, and opens the game in your browser
 
 **Prefer the manual/command-line route?**
 
@@ -44,7 +44,7 @@ Open **http://localhost:3000** in your browser, type in a username, and start pl
 - `public/` — everything the browser loads: `index.html`, `game.js`, `style.css`.
 - `data/db.json` — the save file. Everyone playing on the same server shares this one file — there's no separate database, your computer *is* the server.
 - `tools/start-playtest.bat` — a Windows shortcut that starts the server and opens a [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) so other people can connect over the internet without any port forwarding setup.
-- `npm run build-exe` — builds the standalone `MMOProject.exe` (the one in Releases) from the current code.
+- `MMOProject.exe` — the prebuilt standalone game. `npm run build-exe` rebuilds it from the current code.
 
 ## Security basics
 
