@@ -2,9 +2,14 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
+// When bundled into a standalone .exe (see tools/build-exe.js), __dirname
+// points inside the packaged binary's read-only virtual filesystem, so the
+// save file has to live next to the real .exe on disk instead.
+const BASE_DIR = process.pkg ? path.dirname(process.execPath) : path.join(__dirname, '..');
+
 // Can be overridden so tests can use a scratch file instead of the real
 // save data.
-const DB_PATH = process.env.MMO_DB_PATH || path.join(__dirname, '..', 'data', 'db.json');
+const DB_PATH = process.env.MMO_DB_PATH || path.join(BASE_DIR, 'data', 'db.json');
 
 const XP_PER_LEVEL = 100; // cost of the very first level-up (level 1 -> 2)
 const XP_LEVEL_INCREMENT = 15; // each subsequent level costs this much more than the last
@@ -1076,6 +1081,9 @@ function flushSave() {
   }
   if (!dirty) return;
   dirty = false;
+  // A packaged .exe's folder never had `data/` created by `git clone` the
+  // way a normal checkout does -- make sure it exists before writing.
+  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
   fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
 }
 

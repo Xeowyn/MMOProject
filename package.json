@@ -7,13 +7,15 @@
   "scripts": {
     "start": "node server/server.js",
     "dev": "nodemon --watch server --ext js server/server.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "build-exe": "pkg server/server.js --target node18-win-x64 --output dist-exe/MMOProject.exe"
   },
   "dependencies": {
     "express": "^4.19.2",
     "ws": "^8.18.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.14"
+    "nodemon": "^3.1.14",
+    "pkg": "^5.8.1"
   }
 }

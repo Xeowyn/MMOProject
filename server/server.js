@@ -5,6 +5,10 @@ const store = require('./store');
 
 const PORT = process.env.PORT || 3000;
 
+// Same reasoning as store.js's BASE_DIR: a packaged .exe needs to find
+// public/ next to itself on disk, not inside its own read-only snapshot.
+const BASE_DIR = process.pkg ? path.dirname(process.execPath) : path.join(__dirname, '..');
+
 // Safety net: Express already turns a crash inside a route into a normal
 // error response, but a crash outside a request (like in a setTimeout) would
 // normally kill the whole server for every player. Log it instead and keep
@@ -28,7 +32,7 @@ app.use((req, res, next) => {
 // worked on, and a cached old game.js would quietly bring back bugs we
 // already fixed.
 app.use(
-  express.static(path.join(__dirname, '..', 'public'), {
+  express.static(path.join(BASE_DIR, 'public'), {
     etag: false,
     lastModified: false,
     setHeaders: (res) => res.setHeader('Cache-Control', 'no-store'),
@@ -350,6 +354,12 @@ app.get('/api/tavern/history', (req, res) => {
 
 const server = app.listen(PORT, () => {
   console.log(`MMOProject server running at http://localhost:${PORT}`);
+  // Only for the packaged .exe -- npm start/dev users already have their own
+  // way of opening the browser, and this would just pop an extra tab on
+  // every restart while actively developing.
+  if (process.pkg && process.platform === 'win32') {
+    require('child_process').exec(`start http://localhost:${PORT}`);
+  }
 });
 
 // --- presence: who's online and where, broadcast to everyone on change ---
