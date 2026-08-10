@@ -4,7 +4,11 @@ This is a fantasy game you play in your web browser. You explore a map, fight mo
 
 ## How to run it
 
-You need [Node.js](https://nodejs.org/) installed first (version 18 or newer).
+**Download this folder, then double-click `start.bat`.** It installs anything missing the first time, starts the server, and opens the game in your browser automatically. A second window titled "MMOProject Server" opens alongside it — leave that open while you play, close it when you're done. You'll need [Node.js](https://nodejs.org/) installed first (version 18 or newer); that's the only prerequisite.
+
+**Why there's a server window at all — this isn't a static web page.** Every part of this game, not just the multiplayer bits, is a thin browser page talking to a local Node.js server for everything (login, your inventory, skills, saving your progress). There's no offline/no-server mode — `start.bat` running is what makes the game work at all, the same way it also happens to be what makes the shared/multiplayer parts work (seeing other players' locations on the map, tavern chat). If that server window gets closed, the page in your browser will show a "Cannot reach the server" banner and nothing will respond until you run `start.bat` again.
+
+**Prefer the manual/command-line route instead?**
 
 ```bash
 git clone https://github.com/Xeowyn/MMOProject.git
@@ -13,9 +17,7 @@ npm install
 npm start
 ```
 
-Open **http://localhost:3000** in your browser, type in a username, and start playing.
-
-(Want the server to restart itself every time you save a code change? Use `npm run dev` instead of `npm start`.)
+Open **http://localhost:3000** in your browser, type in a username, and start playing. (Want the server to restart itself every time you save a code change? Use `npm run dev` instead of `npm start`.)
 
 ## What you can do in the game
 
