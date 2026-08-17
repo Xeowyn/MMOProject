@@ -577,10 +577,42 @@ describe('traits and perks', () => {
 });
 
 describe('combat', () => {
-  // amberfield_vale has giant_rat + bandit in its combat pool
+  // amberfield_vale is a tier-1 location whose combat pool (giant_rat,
+  // bandit — see WORLD_TIERS[1].enemies) is a fixed distance from the
+  // starting camp; teleporting the player's worldPos/currentLocation
+  // directly (same "poke the mutable player object" pattern the rest of
+  // this file already uses) avoids needing a real multi-step walk over.
   function setUpFightLocation(id) {
-    store.devDiscoverLocation(id, 'amberfield_vale');
-    store.travel(id, 'amberfield_vale');
+    const loc = store.LOCATIONS.find((l) => l.id === 'amberfield_vale');
+    const player = store.getPlayer(id);
+    player.currentLocation = loc.id;
+    player.worldPos = { x: loc.gx, y: loc.gy };
+  }
+
+  // Grid combat has no time-based tick anymore — every submitCombatMove()
+  // call resolves one full turn (player's move/attack, then every living
+  // enemy's response) synchronously. To drive a fight to a result without
+  // depending on the random dungeon layout, place the player directly
+  // adjacent to the first enemy and keep attacking that same direction
+  // (attacking never moves the player, so the direction stays valid) until
+  // the fight ends or the safety cap is hit.
+  function fightToResolution(id, maxTurns = 200) {
+    const player = store.getPlayer(id);
+    const enemy = player.combat.enemies[0];
+    let direction;
+    if (enemy.x > 0) {
+      player.combat.playerPos = { x: enemy.x - 1, y: enemy.y };
+      direction = 'right';
+    } else {
+      player.combat.playerPos = { x: enemy.x + 1, y: enemy.y };
+      direction = 'left';
+    }
+    for (let i = 0; i < maxTurns; i++) {
+      const result = store.submitCombatMove(id, direction);
+      assert.equal(result.error, undefined);
+      if (store.getPlayer(id).combat.result) break;
+    }
+    return store.getPlayer(id).combat.result;
   }
 
   test('cannot start a fight against an enemy not present at the current location', () => {
@@ -588,14 +620,6 @@ describe('combat', () => {
     setUpFightLocation(id);
     const result = store.startCombat(id, 'stone_troll');
     assert.equal(result.error, 'enemy_not_here');
-  });
-
-  test('cannot start a fight with an empty ability loadout', () => {
-    const { id } = makeCharacter(EVEN_TRAITS);
-    setUpFightLocation(id);
-    for (let i = 0; i < 6; i++) store.setLoadoutSlot(id, i, null);
-    const result = store.startCombat(id, 'giant_rat');
-    assert.equal(result.error, 'no_abilities_equipped');
   });
 
   test('starting a fight builds a combat object with the right enemy and full hp', () => {
@@ -622,17 +646,13 @@ describe('combat', () => {
     setUpFightLocation(id);
     store.startCombat(id, 'giant_rat');
     const player = store.getPlayer(id);
-    // Fast-forward the round clock far into the past so tickCombat() can
-    // resolve every round of the fight in one call instead of waiting on
-    // real time.
-    player.combat.nextTickAt = Date.now() - 1000 * 1000;
     const goldBefore = player.inventory.gold || 0;
     const combatXpBefore = player.skills.combat.xp;
 
-    const pub = store.publicPlayer(player);
-    assert.ok(pub.combat.result === 'win' || pub.combat.result === 'loss', `expected a result, got ${pub.combat.result}`);
+    const result = fightToResolution(id);
+    assert.ok(result === 'win' || result === 'loss', `expected a result, got ${result}`);
 
-    if (pub.combat.result === 'win') {
+    if (result === 'win') {
       assert.equal(store.getPlayer(id).combatRecord.wins, 1);
       assert.ok(store.getPlayer(id).inventory.gold >= goldBefore);
       assert.ok(store.getPlayer(id).skills.combat.xp > combatXpBefore);
@@ -644,16 +664,14 @@ describe('combat', () => {
 
   test('a fight where the player is nearly dead reliably ends in a loss', () => {
     // dexterity is left at TRAIT_BASE here so the dodge-chance trait bonus
-    // is exactly 0 — the only way to survive a hit is Quick Step's temporary
-    // evasion window, so with enough rounds this will end in a loss.
+    // is exactly 0 — the enemy's counter-attack is guaranteed to land, so
+    // starting at 1 hp reliably ends the very next turn in a loss.
     const { id } = makeCharacter(NO_DODGE_TRAITS);
     setUpFightLocation(id);
     store.startCombat(id, 'giant_rat');
-    const player = store.getPlayer(id);
-    player.combat.playerHp = 1;
-    player.combat.nextTickAt = Date.now() - 1000 * 1000;
-    const pub = store.publicPlayer(player);
-    assert.equal(pub.combat.result, 'loss');
+    store.getPlayer(id).combat.playerHp = 1;
+    const result = fightToResolution(id, 1);
+    assert.equal(result, 'loss');
     assert.equal(store.getPlayer(id).combatRecord.losses, 1);
   });
 
@@ -670,36 +688,6 @@ describe('combat', () => {
     const { id } = makeCharacter(EVEN_TRAITS);
     const result = store.endCombat(id);
     assert.equal(result.error, 'no_combat');
-  });
-
-  test('setCombatSpeed rejects an invalid preset and accepts a valid one', () => {
-    const { id } = makeCharacter(EVEN_TRAITS);
-    assert.equal(store.setCombatSpeed(id, 'ludicrous').error, 'invalid_speed');
-    const result = store.setCombatSpeed(id, 'fast');
-    assert.equal(result.error, undefined);
-    assert.equal(store.getPlayer(id).combatSpeed, 'fast');
-  });
-
-  test('setLoadoutSlot rejects an ability above the player\'s combat level', () => {
-    const { id } = makeCharacter(EVEN_TRAITS);
-    // guard_up requires combat level 2; a fresh character is level 1
-    const result = store.setLoadoutSlot(id, 0, 'guard_up');
-    assert.equal(result.error, 'not_unlocked');
-  });
-
-  test('setLoadoutSlot rejects an out-of-range slot index and an unknown ability', () => {
-    const { id } = makeCharacter(EVEN_TRAITS);
-    assert.equal(store.setLoadoutSlot(id, 6, 'swing').error, 'invalid_slot');
-    assert.equal(store.setLoadoutSlot(id, -1, 'swing').error, 'invalid_slot');
-    assert.equal(store.setLoadoutSlot(id, 0, 'fireball').error, 'unknown_ability');
-  });
-
-  test('cannot edit the loadout mid-fight', () => {
-    const { id } = makeCharacter(EVEN_TRAITS);
-    setUpFightLocation(id);
-    store.startCombat(id, 'giant_rat');
-    const result = store.setLoadoutSlot(id, 0, 'swing');
-    assert.equal(result.error, 'combat_in_progress');
   });
 });
 
@@ -759,67 +747,65 @@ describe('resource gathering tasks', () => {
   });
 });
 
-describe('expeditions and travel', () => {
-  test('travel to an undiscovered location fails', () => {
-    const { id } = makeCharacter(EVEN_TRAITS);
-    const result = store.travel(id, 'ironbrook_mine');
-    assert.equal(result.error, 'not_discovered');
-  });
-
-  test('travel to a discovered location succeeds', () => {
-    const { id } = makeCharacter(EVEN_TRAITS);
-    store.devDiscoverLocation(id, 'ironbrook_mine');
-    const result = store.travel(id, 'ironbrook_mine');
-    assert.equal(result.error, undefined);
-    assert.equal(store.getPlayer(id).currentLocation, 'ironbrook_mine');
-  });
-
-  test('starting an expedition with no supplies fails', () => {
+describe('overworld grid movement', () => {
+  test('moving onto never-visited ground with no supplies fails', () => {
     const { id } = makeCharacter(EVEN_TRAITS);
     store.getPlayer(id).inventory.supplies = 0;
-    const result = store.startExpedition(id, [
-      { x: 50, y: 50 },
-      { x: 55, y: 55 },
-    ]);
+    const result = store.moveOnWorldGrid(id, 'right');
     assert.equal(result.error, 'no_supplies');
   });
 
-  test('starting an expedition with a too-short path fails', () => {
+  test('moving onto new ground costs one supply and reveals it; moving back over revealed ground is free', () => {
     const { id } = makeCharacter(EVEN_TRAITS);
-    const result = store.startExpedition(id, [{ x: 50, y: 50 }]);
-    assert.equal(result.error, 'invalid_path');
+    store.getPlayer(id).inventory.supplies = 5;
+    const first = store.moveOnWorldGrid(id, 'right');
+    assert.equal(first.error, undefined);
+    assert.equal(store.getPlayer(id).inventory.supplies, 4);
+
+    store.moveOnWorldGrid(id, 'left'); // step back onto the (already revealed) starting tile
+    assert.equal(store.getPlayer(id).inventory.supplies, 4);
+
+    const back = store.moveOnWorldGrid(id, 'right'); // re-enter the tile revealed a moment ago
+    assert.equal(back.error, undefined);
+    assert.equal(store.getPlayer(id).inventory.supplies, 4);
   });
 
-  // Regression test: a path point with a non-numeric or missing x/y used to
-  // turn the length/cost math into NaN, permanently corrupting the
-  // player's supplies count instead of failing cleanly. Fixed by validating
-  // every point has finite x/y before doing any math with it.
-  test('starting an expedition with a non-numeric path point is rejected and spends nothing', () => {
+  test('moving off the edge of the world is blocked and costs nothing', () => {
     const { id } = makeCharacter(EVEN_TRAITS);
-    const suppliesBefore = store.getPlayer(id).inventory.supplies;
-    const result = store.startExpedition(id, [
-      { x: 'a', y: 'b' },
-      { x: 1, y: 2 },
-    ]);
-    assert.equal(result.error, 'invalid_path');
+    const player = store.getPlayer(id);
+    player.worldPos = { x: 0, y: 0 };
+    player.revealedTiles = ['0,0'];
+    const suppliesBefore = player.inventory.supplies;
+    const result = store.moveOnWorldGrid(id, 'left');
+    assert.equal(result.error, 'blocked');
     assert.equal(store.getPlayer(id).inventory.supplies, suppliesBefore);
-    assert.ok(!Number.isNaN(store.getPlayer(id).inventory.supplies));
   });
 
-  test('starting an expedition with a missing x/y on a path point is rejected', () => {
+  test('walking onto a tile with a location discovers it and grants character xp', () => {
     const { id } = makeCharacter(EVEN_TRAITS);
-    const result = store.startExpedition(id, [{ x: 50 }, { x: 55, y: 55 }]);
-    assert.equal(result.error, 'invalid_path');
+    const loc = store.LOCATIONS.find((l) => l.id === 'ironbrook_mine');
+    const player = store.getPlayer(id);
+    player.inventory.supplies = 999;
+    player.worldPos = { x: loc.gx - 1, y: loc.gy };
+    player.revealedTiles = [`${player.worldPos.x},${player.worldPos.y}`];
+    const xpBefore = player.characterXp;
+
+    const result = store.moveOnWorldGrid(id, 'right');
+    assert.equal(result.error, undefined);
+    assert.ok(store.getPlayer(id).discoveries.includes(loc.id));
+    assert.ok(store.getPlayer(id).characterXp > xpBefore);
   });
 
-  test('starting an expedition longer than supplies allow fails', () => {
+  test('world movement is blocked while a fight is in progress', () => {
     const { id } = makeCharacter(EVEN_TRAITS);
-    store.getPlayer(id).inventory.supplies = 1; // allows ~3 percent-units of path
-    const result = store.startExpedition(id, [
-      { x: 0, y: 0 },
-      { x: 100, y: 100 },
-    ]);
-    assert.equal(result.error, 'path_too_long');
+    const loc = store.LOCATIONS.find((l) => l.id === 'amberfield_vale');
+    const player = store.getPlayer(id);
+    player.currentLocation = loc.id;
+    player.worldPos = { x: loc.gx, y: loc.gy };
+    player.revealedTiles = [`${loc.gx},${loc.gy}`];
+    store.startCombat(id, 'giant_rat');
+    const result = store.moveOnWorldGrid(id, 'right');
+    assert.equal(result.error, 'busy_fighting');
   });
 
   test('buyLocationReveal requires gold and discovers a previously-unknown location', () => {

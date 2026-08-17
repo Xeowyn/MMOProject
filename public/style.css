@@ -291,41 +291,141 @@ main {
   margin-top: 0;
 }
 
+/* No boxed-in "map window" — the tile grid fills this entire pane edge to
+   edge, so #map-wrap is purely a sizing container now (flex item that gets
+   the overworld tab's remaining width next to #sidebar), not a frame around
+   a smaller map. */
 #map-wrap {
   flex: 1;
   /* Without this, the flex item's default min-width:auto lets its content
-     (the canvas, a large replaced element) set a floor on how far it can
-     shrink — the classic flexbox overflow trap where max-width:100% on the
-     canvas gets ignored for the purposes of the row's own width. Matches
-     the same fix #combat-idle-main already used. */
+     set a floor on how far it can shrink — the classic flexbox overflow
+     trap. Matches the same fix #combat-idle-main already used. */
   min-width: 0;
+  min-height: 0;
   position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: #1a2a1f;
+  background: #0f1a12;
+  overflow: hidden;
 }
 
-#map-canvas {
-  max-width: 100%;
-  max-height: 100%;
+#world-grid-wrap {
+  width: 100%;
+  height: 100%;
+}
+
+@keyframes grid-blocked-shake-world {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-5px); }
+  75% { transform: translateX(5px); }
+}
+
+#world-grid-wrap.blocked-shake {
+  animation: grid-blocked-shake-world 0.25s ease-in-out;
+}
+
+/* The overworld viewport — same grid-of-tiles idiom as the Combat tab's
+   dungeon grid (15x11, a fixed window into a much larger world), just
+   stretched to fill the whole pane instead of sitting in a bordered box. */
+#world-grid {
+  display: grid;
+  grid-template-columns: repeat(15, 1fr);
+  grid-template-rows: repeat(11, 1fr);
+  gap: 2px;
+  width: 100%;
+  height: 100%;
+}
+
+/* Overrides .grid-cell's fixed 42px combat-dungeon sizing — here tiles
+   stretch to fill whatever the 1fr grid tracks give them, so the whole
+   viewport tiles the entire pane instead of sitting in a small fixed-size
+   box in the middle of it. */
+#world-grid .grid-cell {
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+  font-size: 1.7em;
+}
+
+.world-floor {
   background: #24382c;
-  border: 2px solid #4a4030;
-  cursor: grab;
-  touch-action: none; /* all panning/drawing/pinch-zoom is handled by our own
-                          touch listeners — without this, the browser's own
-                          native scroll/zoom gestures fight with them */
+  cursor: pointer;
 }
 
-#map-canvas:active {
-  cursor: grabbing;
+.world-floor:hover {
+  background: #2e4638;
 }
 
-#map-canvas.draw-mode {
-  cursor: crosshair;
+/* A tile the player has never physically stepped onto — blank fog,
+   deliberately indistinguishable from any other unexplored tile even if a
+   location secretly sits there. Still clickable (walking into fog is
+   allowed, it's how it gets revealed), so it keeps the pointer cursor. */
+.world-fog {
+  background: #06090a;
+  cursor: pointer;
 }
 
-#map-controls {
+.world-fog:hover {
+  background: #0c1210;
+}
+
+/* A clicked-out route awaiting confirmation — see previewWorldPath(). The
+   final tile gets a stronger highlight than the ones passed through, so
+   the destination is unambiguous at a glance. */
+.world-path {
+  box-shadow: inset 0 0 0 2px rgba(255, 215, 94, 0.55);
+}
+
+.world-path-end {
+  box-shadow: inset 0 0 0 3px #ffd75e;
+}
+
+/* A discovered location's tile — same size/glyph slot as plain floor, just
+   a lighter highlight so it visibly stands out at a glance. */
+.world-location {
+  background: #3a3123;
+  box-shadow: inset 0 0 0 1px rgba(216, 176, 74, 0.4);
+}
+
+.world-location:hover {
+  background: #473a29;
+}
+
+/* A small corner dot when another player is standing on this tile. */
+.world-has-others::after {
+  content: '';
+  position: absolute;
+  bottom: 3px;
+  right: 3px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #7fae5a;
+}
+
+#world-dpad {
+  display: grid;
+  grid-template-columns: repeat(3, 44px);
+  grid-template-rows: repeat(3, 44px);
+  gap: 4px;
+  justify-content: center;
+  margin: 10px auto;
+}
+
+.world-dpad-up { grid-column: 2; grid-row: 1; }
+.world-dpad-left { grid-column: 1; grid-row: 2; }
+.world-dpad-right { grid-column: 3; grid-row: 2; }
+.world-dpad-down { grid-column: 2; grid-row: 3; }
+
+#world-message-line {
+  font-size: 0.85em;
+  color: #d8b04a;
+  min-height: 1.2em;
+  margin-bottom: 8px;
+}
+
+/* Floating +/- over the tile grid, same compact circular-button idiom the
+   old canvas map's zoom controls used — doesn't reintroduce a "boxed map
+   window," just controls that sit on top of the full-bleed tiles. */
+#world-zoom-controls {
   position: absolute;
   top: 16px;
   right: 16px;
@@ -334,12 +434,31 @@ main {
   gap: 6px;
 }
 
-#map-controls button {
+#world-zoom-controls button {
   width: 40px;
   height: 40px;
   padding: 0;
   font-size: 1.1em;
   border-radius: 50%;
+}
+
+#world-path-controls {
+  margin-top: 10px;
+}
+
+#world-path-status {
+  font-size: 0.85em;
+  color: #d8b04a;
+  margin-bottom: 8px;
+}
+
+#world-path-buttons {
+  display: flex;
+  gap: 8px;
+}
+
+#world-path-buttons button {
+  flex: 1;
 }
 
 #sidebar {
@@ -375,34 +494,12 @@ main {
   margin-bottom: 10px;
 }
 
-#draw-hint {
-  font-size: 0.8em;
-  color: #d8b04a;
-  margin-bottom: 10px;
-}
-
-#draw-status {
-  font-size: 0.85em;
-  color: #d8b04a;
-  margin-bottom: 10px;
-}
-
-
-#draw-controls {
-  display: flex;
-  gap: 8px;
-}
-
-#draw-controls button {
-  flex: 1;
-}
-
-#cancel-btn, .btn-danger {
+.btn-danger {
   background: #5c1f1f;
   color: #ffd0d0;
 }
 
-#cancel-btn:hover, .btn-danger:hover {
+.btn-danger:hover {
   background: #7a2828;
 }
 
@@ -561,22 +658,10 @@ main {
   background: #4a3d28;
 }
 
-#combat-potions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  justify-content: center;
-  margin: 14px 0;
-}
-
-.potion-btn {
-  background: #2c3a2a;
-  color: #cfe8c2;
-  border: 1px solid #46613f;
-}
-
-.potion-btn:hover {
-  background: #3c4f38;
+.enemy-btn .enemy-icon {
+  font-size: 1.6em;
+  display: block;
+  margin-bottom: 2px;
 }
 
 /* --- alchemy tab --- */
@@ -602,75 +687,9 @@ main {
   font-size: 1.2em;
 }
 
-#arena-wrap {
-  display: flex;
-  justify-content: center;
-  margin: 16px 0;
-}
-
-#arena-canvas {
-  background: radial-gradient(circle, #241c14 0%, #1a140d 100%);
-  border: 2px solid #4a4030;
-  border-radius: 50%;
-  max-width: 100%;
-  height: auto;
-}
-
 .arena-combatant {
   max-width: 420px;
   margin: 0 auto;
-}
-
-.speed-controls {
-  display: flex;
-  gap: 8px;
-  justify-content: center;
-  align-items: center;
-  margin: 4px 0 14px 0;
-  font-size: 0.85em;
-}
-
-.speed-controls span {
-  color: #a6906a;
-}
-
-.speed-btn {
-  background: #33291d;
-  color: #cbbf9f;
-  border: 1px solid #4a4030;
-  padding: 5px 12px;
-  border-radius: 6px;
-}
-
-.speed-btn:hover {
-  background: #4a3d28;
-}
-
-.speed-btn.active {
-  border-color: #d8b04a;
-  color: #d8b04a;
-  box-shadow: 0 0 6px rgba(216, 176, 74, 0.4);
-}
-
-#enemy-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  justify-content: center;
-  max-width: 520px;
-  margin: 10px auto;
-}
-
-.enemy-card {
-  width: 200px;
-  background: linear-gradient(180deg, var(--panel-raised) 0%, var(--panel) 100%);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 8px 10px;
-}
-
-.enemy-card.dead {
-  opacity: 0.4;
 }
 
 .arena-combatant-header {
@@ -681,43 +700,267 @@ main {
   font-size: 0.95em;
 }
 
-#combat-log {
-  max-width: 420px;
-  margin: 10px auto;
-  font-size: 0.85em;
-  color: #b7ab92;
-  text-align: center;
-  min-height: 2.4em;
-}
-
-.ability-slot-row {
+/* The dungeon-room grid — the main combat visual now. One square div per
+   tile: floor tiles a lighter panel shade, walls a flat dark block, the
+   player's @ highlighted, enemy glyphs plain. */
+#combat-grid-wrap {
   display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin: 10px 0 18px 0;
   justify-content: center;
+  margin: 16px 0;
 }
 
-#combat-idle {
+/* A quick side-to-side shake on the whole grid when a move is blocked by a
+   wall/edge — that check never reaches the server (see
+   isCombatMoveBlocked() in game.js), so this is the only feedback a bumped
+   wall gets. */
+@keyframes grid-blocked-shake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-5px); }
+  75% { transform: translateX(5px); }
+}
+
+#combat-grid-wrap.blocked-shake {
+  animation: grid-blocked-shake 0.25s ease-in-out;
+}
+
+#combat-grid {
+  display: grid;
+  gap: 3px;
+  background: #14100a;
+  border: 2px solid #4a4030;
+  border-radius: 6px;
+  padding: 6px;
+}
+
+.grid-cell {
+  width: 42px;
+  height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.35em;
+  font-family: 'Cinzel', Georgia, serif;
+  border-radius: 3px;
+  position: relative; /* anchors floating damage/heal numbers — see .floating-number */
+}
+
+.grid-cell.floor {
+  background: #241c14;
+}
+
+.grid-cell.wall {
+  background: #0c0a07;
+}
+
+.grid-cell.grid-player {
+  background: #3d3320;
+  color: #d8b04a;
+  font-weight: bold;
+  box-shadow: inset 0 0 0 2px rgba(216, 176, 74, 0.6);
+}
+
+.grid-cell.grid-enemy {
+  background: #33231d;
+}
+
+/* A hit landing on a tile: a quick bright flash — shared by an enemy taking
+   player damage and the player's own tile taking enemy damage. See
+   playCombatRound() in game.js. */
+@keyframes grid-hit-flash {
+  0% { filter: brightness(1); }
+  30% { filter: brightness(2.2) saturate(0.3); }
+  100% { filter: brightness(1); }
+}
+
+.grid-cell.hit-flash {
+  animation: grid-hit-flash 0.4s ease-in-out;
+}
+
+@keyframes grid-hit-shake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-4px); }
+  40% { transform: translateX(4px); }
+  60% { transform: translateX(-3px); }
+  80% { transform: translateX(3px); }
+}
+
+.grid-cell.hit-shake {
+  animation: grid-hit-shake 0.35s ease-in-out;
+}
+
+/* Floating combat numbers — spawned by spawnFloatingNumber() in game.js
+   inside a grid cell, removed once the fade finishes. */
+@keyframes float-up-fade {
+  0% { opacity: 1; transform: translate(-50%, 0); }
+  100% { opacity: 0; transform: translate(-50%, -28px); }
+}
+
+.floating-number {
+  position: absolute;
+  left: 50%;
+  top: 6%;
+  transform: translate(-50%, 0);
+  font-family: 'Cinzel', Georgia, serif;
+  font-weight: bold;
+  font-size: 0.8em;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+  pointer-events: none;
+  animation: float-up-fade 1s ease-out forwards;
+  z-index: 3;
+  white-space: nowrap;
+}
+
+.floating-number.damage {
+  color: #ff6b5c;
+}
+
+.floating-number.damage.crit {
+  font-size: 1.15em;
+  color: #ff8a3d;
+}
+
+.floating-number.heal {
+  color: #7fae5a;
+}
+
+.floating-number.miss {
+  font-size: 0.75em;
+  color: #a6906a;
+  font-style: italic;
+}
+
+/* The HP list beside/below the grid — the grid glyphs alone don't carry
+   numbers, so this is where exact HP for each living enemy comes from. */
+#combat-enemy-hp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 420px;
+  margin: 0 auto 12px auto;
+}
+
+.enemy-hp-row {
+  display: grid;
+  grid-template-columns: 1fr 2fr auto;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85em;
+}
+
+.enemy-hp-name {
+  white-space: nowrap;
+}
+
+.enemy-hp-num {
+  color: #b7ab92;
+  font-size: 0.9em;
+}
+
+#combat-message-line {
+  text-align: center;
+  min-height: 1.4em;
+  color: #cbbf9f;
+  margin: 8px 0;
+  font-style: italic;
+}
+
+/* The directional pad: a 3x3 grid with only the cross positions filled —
+   4-directional movement only, no diagonals, matching how enemies and the
+   player both only ever bump-attack in a straight line. */
+#combat-dpad {
+  display: grid;
+  grid-template-columns: repeat(3, 48px);
+  grid-template-rows: repeat(3, 48px);
+  gap: 4px;
+  justify-content: center;
+  margin: 12px auto;
+}
+
+.dpad-btn {
+  font-size: 1.3em;
+  background: #33291d;
+  color: #e8ddc7;
+  border: 1px solid #4a4030;
+  border-radius: 6px;
+}
+
+.dpad-btn:hover:not(:disabled) {
+  background: #4a3d28;
+}
+
+.dpad-up { grid-column: 2; grid-row: 1; }
+.dpad-left { grid-column: 1; grid-row: 2; }
+.dpad-right { grid-column: 3; grid-row: 2; }
+.dpad-down { grid-column: 2; grid-row: 3; }
+
+#combat-turn-actions {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  margin: 8px 0 16px 0;
+}
+
+#combat-item-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 320px;
+  margin: 0 auto 16px auto;
+}
+
+.item-menu-btn {
+  background: linear-gradient(180deg, var(--panel-raised) 0%, var(--panel) 100%);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 14px;
+  color: #e8ddc7;
+  text-align: left;
+}
+
+.item-menu-btn:hover:not(:disabled) {
+  border-color: #6b5c3d;
+}
+
+/* Collapsed-by-default battle log — the grid + hit flashes are the primary
+   feedback now; this is an opt-in detailed text record, toggled via
+   #combat-log-toggle. */
+#combat-log-toggle {
+  display: block;
+  margin: 4px auto 12px auto;
+  background: #33291d;
+  color: #cbbf9f;
+  border: 1px solid #4a4030;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 0.85em;
+}
+
+#combat-log-toggle:hover {
+  background: #4a3d28;
+}
+
+#combat-active-layout {
   display: flex;
   gap: 24px;
   align-items: flex-start;
 }
 
-#combat-idle-main {
+#combat-active-main {
   flex: 1;
   min-width: 0;
+  text-align: center;
 }
 
-#ability-sidebar {
-  width: 300px;
+#combat-log-sidebar {
+  width: 280px;
   flex-shrink: 0;
   max-height: 70vh;
   overflow-y: auto;
   padding-right: 6px;
+  text-align: left;
 }
 
-#ability-sidebar h3 {
+#combat-log-sidebar h3 {
   position: sticky;
   top: 0;
   background: var(--bg, #1a140d);
@@ -725,93 +968,28 @@ main {
   padding-bottom: 6px;
 }
 
-#ability-sidebar-list {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
+#combat-log {
+  font-size: 0.85em;
+  color: #b7ab92;
 }
 
-.ability-card {
-  background: linear-gradient(180deg, var(--panel-raised) 0%, var(--panel) 100%);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 10px 12px;
+/* One block per turn (player line, then every enemy's line) instead of a
+   run-on paragraph, so a multi-enemy fight's log stays readable. */
+.log-round {
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(216, 176, 74, 0.15);
 }
 
-.ability-card h3 {
-  margin: 0 0 4px 0;
-  font-size: 1em;
+.log-round:last-child {
+  border-bottom: none;
+}
+
+.log-player {
   color: #d8b04a;
 }
 
-.ability-card.selectable {
-  cursor: pointer;
-}
-
-.ability-card.selectable:hover {
-  border-color: #6b5c3d;
-}
-
-.ability-card.selected {
-  border-color: #d8b04a;
-  box-shadow: 0 0 8px rgba(216, 176, 74, 0.5);
-}
-
-.ability-card.locked {
-  opacity: 0.5;
-}
-
-.ability-slot {
-  width: 92px;
-  height: 66px;
-  background: linear-gradient(180deg, var(--panel-raised) 0%, var(--panel) 100%);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-  font-size: 0.72em;
-  color: #cbbf9f;
-  padding: 4px;
-  cursor: pointer;
-  position: relative;
-  overflow: hidden;
-}
-
-.ability-slot.empty {
-  color: #6b6252;
-  font-style: italic;
-}
-
-.ability-slot.locked {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.ability-slot.live {
-  cursor: default;
-}
-
-.ability-slot.current {
-  border-color: #d8b04a;
-  box-shadow: 0 0 10px rgba(216, 176, 74, 0.6);
-}
-
-.ability-slot-fill {
-  position: absolute;
-  bottom: 0;
-  left: 0;
-  height: 4px;
-  background: #d8b04a;
-  width: 0%;
-}
-
-.ability-slot-name {
-  font-weight: bold;
-  position: relative;
-  z-index: 1;
+.log-enemy {
+  color: #c98a7a;
 }
 
 .hp-bar-wrap {
@@ -820,6 +998,11 @@ main {
   height: 16px;
   overflow: hidden;
   margin: 10px 0 6px 0;
+}
+
+.hp-bar-wrap.small {
+  height: 10px;
+  margin: 0;
 }
 
 .hp-bar-fill {
@@ -1299,14 +1482,16 @@ main {
 /* --- mobile / narrow-viewport layout ---
    Everything above is now built to reflow continuously with no breakpoint
    at all (card-grids use auto-fill minmax so column count shrinks for
-   free, the map/arena canvases scale via max-width:100% + min-width:0 on
-   their flex parents, #tab-nav/#topbar/#equip-slots wrap unconditionally,
-   .modal-content is capped to the viewport). The one thing that still
-   needs an explicit breakpoint is the two main side-by-side layouts
-   (Overworld's map+sidebar, Combat's main+ability-sidebar) — a sidebar
-   that's merely narrower stops being useful well before it'd naturally
-   wrap, so those switch to a stacked column below a phone-ish width
-   instead of just shrinking in place. */
+   free, #tab-nav/#topbar/#equip-slots wrap unconditionally, .modal-content
+   is capped to the viewport). The one thing that still needs an explicit
+   breakpoint is the two main side-by-side layouts (Overworld's grid+
+   sidebar, Combat's main+battle-log sidebar) — a sidebar that's merely
+   narrower stops being useful well before it'd naturally wrap, so those
+   switch to a stacked column below a phone-ish width instead of just
+   shrinking in place. Both grids' tiles (shared .grid-cell rule) also
+   shrink a little further below, since a 15-wide overworld viewport or a
+   9-wide dungeon of 42px tiles is comfortably wider than a phone screen
+   otherwise. */
 @media (max-width: 760px) {
   #tab-overworld {
     flex-direction: column;
@@ -1324,13 +1509,24 @@ main {
     border-top: 1px solid var(--border);
   }
 
-  #combat-idle {
+  #combat-active-layout {
     flex-direction: column;
   }
 
-  #ability-sidebar {
+  #combat-log-sidebar {
     width: 100%;
     max-height: 40vh;
+  }
+
+  .grid-cell {
+    width: 34px;
+    height: 34px;
+    font-size: 1.1em;
+  }
+
+  #combat-dpad, #world-dpad {
+    grid-template-columns: repeat(3, 44px);
+    grid-template-rows: repeat(3, 44px);
   }
 
   .tab-btn, .tab-btn:disabled {

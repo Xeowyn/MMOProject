@@ -14,13 +14,6 @@ const DB_PATH = process.env.MMO_DB_PATH || path.join(BASE_DIR, 'data', 'db.json'
 const XP_PER_LEVEL = 100; // cost of the very first level-up (level 1 -> 2)
 const XP_LEVEL_INCREMENT = 15; // each subsequent level costs this much more than the last
 
-// Combat distance is a 0-100 scale, not real pixels — the frontend maps it
-// onto the arena circle. 0 means adjacent/melee range, MAX_DISTANCE is as
-// far back as Quick Step can push things.
-const MELEE_RANGE = 30;
-const MAX_DISTANCE = 100;
-const QUICK_STEP_RETREAT = 50;
-const EVASION_DODGE_CHANCE = 0.6;
 
 // --- traits (point-buy stats picked at character creation) ---
 // Every trait starts at TRAIT_BASE; the player spreads TRAIT_EXTRA_POINTS
@@ -41,7 +34,7 @@ const DISCOVERY_XP = 25;
 // leveling up, grouped into tiers unlocked at higher levels.
 const PERKS = {
   brute_force: { name: 'Brute Force', description: '+10% melee damage.', tier: 1, requiresLevel: 1, cost: 1, effect: { type: 'meleeDamageMult', value: 0.1 } },
-  swift_strikes: { name: 'Swift Strikes', description: '+8% attack speed (abilities cast faster).', tier: 1, requiresLevel: 1, cost: 1, effect: { type: 'attackSpeedMult', value: 0.08 } },
+  swift_strikes: { name: 'Swift Strikes', description: '+8% damage on every ability.', tier: 1, requiresLevel: 1, cost: 1, effect: { type: 'bonusDamageMult', value: 0.08 } },
   lucky_strikes: { name: 'Lucky Strikes', description: '+5% critical hit chance.', tier: 1, requiresLevel: 1, cost: 1, effect: { type: 'critChance', value: 0.05 } },
   iron_skin: { name: 'Iron Skin', description: '+3 armor.', tier: 1, requiresLevel: 1, cost: 1, effect: { type: 'armorFlat', value: 3 } },
   vitality: { name: 'Vitality', description: '+15 max HP.', tier: 1, requiresLevel: 1, cost: 1, effect: { type: 'maxHpFlat', value: 15 } },
@@ -51,7 +44,7 @@ const PERKS = {
   anglers_patience: { name: "Angler's Patience", description: '+10% fishing speed.', tier: 2, requiresLevel: 5, cost: 1, effect: { type: 'fishingSpeedMult', value: 0.1 } },
   treasure_hunter: { name: 'Treasure Hunter', description: '+10% success chance on Hunting/Scavenging/Harvesting.', tier: 2, requiresLevel: 5, cost: 1, effect: { type: 'gatherSuccessBonus', value: 0.1 } },
   brutal_force: { name: 'Brutal Force', description: '+15% melee damage (stacks with Brute Force).', tier: 3, requiresLevel: 10, cost: 1, effect: { type: 'meleeDamageMult', value: 0.15 } },
-  adrenal_focus: { name: 'Adrenal Focus', description: '+12% attack speed (stacks with Swift Strikes).', tier: 3, requiresLevel: 10, cost: 1, effect: { type: 'attackSpeedMult', value: 0.12 } },
+  adrenal_focus: { name: 'Adrenal Focus', description: '+12% damage on every ability (stacks with Swift Strikes).', tier: 3, requiresLevel: 10, cost: 1, effect: { type: 'bonusDamageMult', value: 0.12 } },
   deep_roots: { name: 'Deep Roots', description: '+20% plant growth speed (stacks with Green Thumb).', tier: 3, requiresLevel: 10, cost: 1, effect: { type: 'plantGrowthMult', value: 0.2 } },
   hardened: { name: 'Hardened', description: '+5 armor, +25 max HP.', tier: 3, requiresLevel: 10, cost: 1, effect: { type: 'armorFlat', value: 5 } },
 };
@@ -158,7 +151,7 @@ const ITEMS = {
   troll_hide: { name: 'Troll Hide', sellPrice: 25 },
   archer_quiver: { name: "Archer's Quiver", sellPrice: 10 },
   // alchemy potions — result items of POTION_RECIPES, consumed via
-  // usePotion() during combat only (see potionEffect.kind)
+  // submitCombatItemAction() during combat only (see potionEffect.kind)
   healing_potion: { name: 'Healing Potion', type: 'potion', potionEffect: { kind: 'heal', amount: 30 }, sellPrice: 18 },
   antidote: { name: 'Antidote', type: 'potion', potionEffect: { kind: 'cure' }, sellPrice: 18 },
   potion_of_strength: {
@@ -168,9 +161,14 @@ const ITEMS = {
     sellPrice: 22,
   },
   potion_of_swiftness: {
+    // Was an attack-speed buff back when combat ran in real time — with
+    // turn-based combat there's no "speed" left to boost, so this is now a
+    // flat bonus to dodge chance instead (kind stays 'buff_speed' for
+    // save-data/recipe continuity, but see resolveEnemyAttackOn()'s
+    // 'evasion'-type buff for what it actually does now).
     name: 'Potion of Swiftness',
     type: 'potion',
-    potionEffect: { kind: 'buff_speed', multiplier: 0.6, durationSeconds: 15 },
+    potionEffect: { kind: 'buff_speed', multiplier: 0.35, durationSeconds: 15 },
     sellPrice: 22,
   },
   venom_draught: {
@@ -181,14 +179,12 @@ const ITEMS = {
   },
 };
 
-// Each enemy's stats are fixed, not based on gear like the player's are.
-// goldReward/xpReward are [min, max] ranges rolled on a win.
-// aiType controls what an enemy does each round (see enemyTakeTurn()):
-// 'melee_aggressive' closes in and attacks every chance it gets.
-// 'skirmisher' closes in, attacks, then backs off before attacking again.
-// 'ranged_kiter' tries to stay at its preferredRange — backing off if the
-// player gets close, closing in if they're too far, only attacking while
-// in that range.
+// Fixed per-creature attacks/effects (not derived from equipment, unlike the
+// player) — goldReward/xpReward are [min,max] rolled on a win. Every enemy
+// takes its one action each round the same way now (see resolveEnemyTurns()):
+// attack the player, with a chance of its effect (poison, etc) on a hit —
+// there's no more positioning/range to close, so what used to differentiate
+// enemy archetypes is now purely damage/crit/effect stats.
 const ENEMIES = {
   giant_rat: {
     name: 'Giant Rat',
@@ -200,9 +196,6 @@ const ENEMIES = {
     goldReward: [2, 5],
     xpReward: 5,
     lootTable: [{ item: 'rat_tail', chance: 0.25 }],
-    range: MELEE_RANGE,
-    approachSpeed: 45,
-    aiType: 'melee_aggressive',
   },
   wolf: {
     name: 'Wolf',
@@ -214,9 +207,6 @@ const ENEMIES = {
     goldReward: [5, 10],
     xpReward: 10,
     lootTable: [{ item: 'wolf_fang', chance: 0.25 }],
-    range: MELEE_RANGE,
-    approachSpeed: 55,
-    aiType: 'melee_aggressive',
   },
   bog_zombie: {
     name: 'Bog Zombie',
@@ -228,9 +218,6 @@ const ENEMIES = {
     goldReward: [8, 15],
     xpReward: 15,
     lootTable: [{ item: 'zombie_ichor', chance: 0.25 }],
-    range: MELEE_RANGE,
-    approachSpeed: 20,
-    aiType: 'melee_aggressive',
   },
   // Added so the ~40 previously-empty locations have varied, tier-appropriate
   // fights instead of reusing just these original 3 everywhere — tiers
@@ -247,9 +234,6 @@ const ENEMIES = {
     goldReward: [4, 9],
     xpReward: 7,
     lootTable: [{ item: 'bandit_dagger', chance: 0.2 }],
-    range: MELEE_RANGE,
-    approachSpeed: 40,
-    aiType: 'melee_aggressive',
   },
   forest_spider: {
     // tier 2 — fast, poisonous
@@ -262,14 +246,10 @@ const ENEMIES = {
     goldReward: [4, 8],
     xpReward: 9,
     lootTable: [{ item: 'spider_silk', chance: 0.25 }],
-    range: MELEE_RANGE,
-    approachSpeed: 60,
-    aiType: 'melee_aggressive',
   },
-  // tier 2 — the first ranged enemy: holds at range and shoots rather than
-  // closing to melee, backing off if the player pushes in (Quick Step, or
-  // just standing near it). Demonstrates the ranged_kiter archetype.
   forest_archer: {
+    // tier 2 — hits from the first shot, no melee whiff risk to weigh
+    // against (there's no more range to be out of)
     name: 'Forest Archer',
     maxHp: 26,
     damage: [3, 6],
@@ -279,10 +259,6 @@ const ENEMIES = {
     goldReward: [5, 10],
     xpReward: 10,
     lootTable: [{ item: 'archer_quiver', chance: 0.25 }],
-    range: MAX_DISTANCE, // shots always reach once in its preferred band — see aiType logic, not a melee-style range gate
-    approachSpeed: 20,
-    aiType: 'ranged_kiter',
-    preferredRange: 55,
   },
   orc_raider: {
     // tier 3 — a real step up in raw damage
@@ -295,14 +271,9 @@ const ENEMIES = {
     goldReward: [10, 18],
     xpReward: 18,
     lootTable: [{ item: 'orc_tusk', chance: 0.25 }],
-    range: MELEE_RANGE,
-    approachSpeed: 35,
-    aiType: 'melee_aggressive',
   },
   marsh_wraith: {
-    // tier 3 — a ghostly poisoner, favors a high crit chance over raw
-    // damage. skirmisher: bites then phases back out instead of standing
-    // and trading, matching its existing "hard to pin down" flavor.
+    // tier 3 — a ghostly poisoner, favors a high crit chance over raw damage
     name: 'Marsh Wraith',
     maxHp: 45,
     damage: [4, 8],
@@ -312,15 +283,10 @@ const ENEMIES = {
     goldReward: [10, 16],
     xpReward: 18,
     lootTable: [{ item: 'wraith_essence', chance: 0.25 }],
-    range: MELEE_RANGE,
-    approachSpeed: 25,
-    aiType: 'skirmisher',
-    retreatDistance: 35,
   },
   stone_troll: {
     // tier 4 — the toughest fight in the game right now, a real "boss" feel
-    // for the far-flung locations. Slow to approach so Quick Step/kiting
-    // matters more here than anywhere else.
+    // for the far-flung locations
     name: 'Stone Troll',
     maxHp: 90,
     damage: [8, 14],
@@ -330,25 +296,10 @@ const ENEMIES = {
     goldReward: [20, 35],
     xpReward: 35,
     lootTable: [{ item: 'troll_hide', chance: 0.3 }],
-    range: MELEE_RANGE,
-    approachSpeed: 15,
-    aiType: 'melee_aggressive',
   },
 };
 
-// Where each enemy stands around the player when a fight starts, in
-// degrees (0 = straight up), based on how many enemies are in the group.
-// Spread out so enemies never overlap each other or the player.
-const COMBAT_GROUP_ANGLES = {
-  1: [0],
-  2: [-38, 38],
-  3: [-55, 0, 55],
-};
 const MAX_ENCOUNTER_GROUP_SIZE = 3;
-// Enemies hover just outside this distance once fully closed in — keeps them
-// visually distinct from the player dot at the arena center instead of
-// stacking on top of it.
-const MIN_ENEMY_DISTANCE = 12;
 
 const PLANTS = {
   wheat: { name: 'Wheat', seed: 'wheat_seed', growSeconds: 60, yield: 'wheat_crop' },
@@ -357,9 +308,12 @@ const PLANTS = {
 };
 const GARDEN_PLOT_COUNT = 24;
 
-// Turns garden crops into supplies (which expeditions use up), so gardening
-// and exploring feed into each other. Crops that take longer to grow
-// convert into more supplies, to keep them roughly balanced.
+// Converts garden crops into supplies — the resource overworld movement
+// spends one of per tile walked — so gardening and exploration feed into
+// each other instead of being isolated systems. resultAmount scales with
+// the crop's grow time (potato
+// takes longest to grow, so it converts to the most supplies) to keep the
+// three crop types roughly comparable in supplies-per-second-grown.
 const RECIPES = [
   { id: 'wheat_supplies', ingredients: { wheat_crop: 2 }, result: 'supplies', resultAmount: 1 },
   { id: 'carrot_supplies', ingredients: { carrot_crop: 2 }, result: 'supplies', resultAmount: 2 },
@@ -419,105 +373,40 @@ const LOCATION_REVEAL_PRICE = 30;
 const PLAYER_BASE_HP = 50;
 const PLAYER_HP_PER_LEVEL = 5;
 
-// Combat plays out in rounds: each round the player either finishes
-// charging their current ability or uses it, then every living enemy takes
-// its turn. tickIntervalSeconds is just how fast rounds play out on screen
-// (see COMBAT_SPEED_PRESETS) — it doesn't change how many rounds a fight
-// takes, just the pacing. Saved per player so it carries between fights.
-const COMBAT_SPEED_PRESETS = { slow: 2.2, normal: 1.1, fast: 0.4 };
-const DEFAULT_COMBAT_SPEED = 'normal';
-
-// Abilities go into 6 loadout slots and play out left to right, looping
-// back to the start. unlockLevel gates each one behind the player's Combat
-// skill level, so new abilities unlock naturally as you fight more.
-const ABILITIES = {
-  swing: {
-    name: 'Swing',
-    tags: ['melee'],
-    castSeconds: 1.6,
-    unlockLevel: 1,
-    description: 'A basic attack with your equipped weapon (or bare fists).',
-  },
-  punch: {
-    name: 'Punch',
-    tags: ['melee'],
-    castSeconds: 0.6,
-    unlockLevel: 1,
-    description: 'A fast, light jab. Primes your next melee ability with bonus damage.',
-  },
-  quick_step: {
-    name: 'Quick Step',
-    tags: ['utility'],
-    castSeconds: 0.7,
-    unlockLevel: 1,
-    description: 'Step back from your enemy, gaining distance and a chance to dodge their next attack.',
-  },
-  guard_up: {
-    name: 'Guard Up',
-    tags: ['utility'],
-    castSeconds: 0.9,
-    unlockLevel: 2,
-    description: 'Raise your guard, temporarily reducing incoming damage.',
-  },
-  throw_dagger: {
-    name: 'Throw Dagger',
-    tags: ['ranged'],
-    castSeconds: 1.3,
-    unlockLevel: 3,
-    description: 'Hurl a dagger at your enemy. Lands at any distance.',
-  },
-  adrenaline_rush: {
-    name: 'Adrenaline Rush',
-    tags: ['utility'],
-    castSeconds: 0.7,
-    unlockLevel: 4,
-    description: 'A burst of speed — your next ability executes faster.',
-  },
-  poison_jab: {
-    name: 'Poison Jab',
-    tags: ['melee'],
-    castSeconds: 1.0,
-    unlockLevel: 5,
-    description: 'A quick jab coated in poison, dealing damage over time.',
-  },
-  second_wind: {
-    name: 'Second Wind',
-    tags: ['utility'],
-    castSeconds: 2.0,
-    unlockLevel: 6,
-    description: 'Catch your breath and recover some health.',
-  },
-  power_strike: {
-    name: 'Power Strike',
-    tags: ['melee'],
-    castSeconds: 2.6,
-    unlockLevel: 7,
-    description: 'A heavy, slow strike with your weapon for big damage.',
-  },
+// Combat is a classic-Roguelike grid fight: the player and every enemy
+// share a small room (see generateCombatGrid()) and act in strict alternating
+// turns. The player's whole turn is one step in a direction — stepping onto
+// an empty tile just moves, stepping onto a tile an enemy occupies attacks
+// it instead (the "bump to attack" convention Rogue popularized), and using
+// a potion is the only other legal turn. There's no ability menu anymore —
+// every attack uses whatever's equipped, exactly like the old "Swing"
+// ability did. After the player's turn, every living enemy either steps
+// toward the player (if not adjacent) or attacks (if adjacent), same as
+// before: a clean 1-for-1 exchange, resolved fully server-side in a single
+// request (see server.js's /api/combat/move route).
+const COMBAT_GRID_WIDTH = 9;
+const COMBAT_GRID_HEIGHT = 7;
+const COMBAT_WALL_CHANCE = 0.12;
+const COMBAT_MIN_ENEMY_DISTANCE = 3; // Chebyshev distance from the player, for a normal (non-ambush) encounter
+const COMBAT_DIRECTIONS = {
+  up: { dx: 0, dy: -1 },
+  down: { dx: 0, dy: 1 },
+  left: { dx: -1, dy: 0 },
+  right: { dx: 1, dy: 0 },
 };
 
-const DEFAULT_ABILITY_LOADOUT = ['punch', 'swing', 'swing', 'quick_step', 'swing', 'swing'];
-
-// How many combat rounds an ability occupies the player's turn for before it
-// resolves — a direct reinterpretation of the old continuous-time
-// castSeconds as a discrete tick count (Punch ~1 round, Power Strike ~3),
-// preserving the original "heavier ability = enemies get more free turns
-// while you commit to it" tradeoff inside the round-based engine. See
-// resolvePlayerTurn().
-function baseCastRounds(abilityId) {
-  return Math.max(1, Math.round(ABILITIES[abilityId].castSeconds));
-}
-
-// Given to brand new players so the expedition mechanic is testable before
-// a real supplies source (shop / garden) exists.
+// Given to brand new players so movement is testable before a real supplies
+// source (shop / garden) exists — see WORLD_SUPPLIES_PER_MOVE below.
 const STARTER_SUPPLIES = 8;
 
-// Expedition tuning — all distances are in the same 0-100 percent-space the
-// location x/y coordinates use, independent of canvas pixel size.
-const UNIT_LENGTH_PER_SUPPLY = 3; // how far 1 supply lets you draw
-const OVERLAP_THRESHOLD = 3.5; // how close the drawn path must pass to a location to discover it
-const EXPEDITION_SPEED = 1.5; // percent-units of path covered per second — slow, deliberate travel, not a blip
-const MIN_EXPEDITION_DURATION = 8; // seconds — even the shortest possible trip should take a real, watchable while
+// Overworld movement tuning. A tile is only ever discovered by physically
+// stepping onto it — no field-of-view radius, no free peek at what's
+// nearby. Stepping onto a tile not already in player.revealedTiles costs a
+// supply and reveals it (and whatever location is on it, if any) for good;
+// re-walking any tile already revealed is free forever after (see
+// moveOnWorldGrid()) — supplies are the cost of genuinely new ground, not
+// of moving in general.
+const WORLD_SUPPLIES_PER_MOVE = 1;
 
 // Gather tasks — Hunting/Scavenging/Harvesting. Unlocked by discovery and
 // workable from anywhere, same as mining/woodcutting/fishing, except each
@@ -820,8 +709,123 @@ const LOCATIONS = [
   { id: 'copperburrow_spire', name: 'Copperburrow Spire', x: 43.6, y: 58.6, combat: ['bandit'], loot: { item: 'supplies', amount: 3 } },
 ];
 
-// Just flavor text and branching choices — an NPC's quest (if it has one)
-// is shown separately in the client, not part of this tree.
+// --- overworld grid ---
+//
+// The world the player actually walks around in is a very large grid
+// (WORLD_WIDTH x WORLD_HEIGHT tiles) — almost entirely empty space, with
+// LOCATIONS scattered sparsely across it. Rather than hand-picking new grid
+// coordinates for ~200 hand-authored locations, each one's existing percent
+// x/y (0-100, the old canvas-map layout) is scaled once at startup into an
+// integer grid position (gx/gy) — this preserves their relative geography
+// (things that were close together in percent-space stay close together
+// now) while spreading them across a world that's or ders of magnitude
+// bigger than the space they used to fill, which is exactly the "sparse,
+// vast, mostly-empty" feel a grid overworld should have.
+const WORLD_WIDTH = 300;
+const WORLD_HEIGHT = 300;
+
+// Distance (Chebyshev, i.e. max(|dx|,|dy|) — a square "ring" outward from
+// center, matching how the 4 enemy tiers were already informally described
+// in ENEMIES' comments above) from the exact center of the grid, as a
+// fraction of the farthest any tile can be. Buckets that fraction into 4
+// tiers so "how far from the starting area" drives difficulty, same idea
+// the original hand-placed LOCATIONS' combat arrays were already loosely
+// following, just computed instead of eyeballed per-location.
+const WORLD_CENTER = { x: (WORLD_WIDTH - 1) / 2, y: (WORLD_HEIGHT - 1) / 2 };
+const WORLD_MAX_DIST = Math.max(WORLD_CENTER.x, WORLD_CENTER.y);
+function tierForGridPos(gx, gy) {
+  const dist = Math.max(Math.abs(gx - WORLD_CENTER.x), Math.abs(gy - WORLD_CENTER.y));
+  const frac = dist / WORLD_MAX_DIST;
+  if (frac < 0.25) return 1;
+  if (frac < 0.5) return 2;
+  if (frac < 0.75) return 3;
+  return 4;
+}
+
+// One-time layout pass: derive gx/gy + tier for every location from its
+// existing percent x/y, guaranteeing every location lands on a distinct
+// tile (a collision — two locations' percent coordinates rounding to the
+// same grid cell — is vanishingly unlikely at 300x300 resolution with ~200
+// points, but nudged apart deterministically just in case rather than
+// silently letting one shadow the other).
+(function assignWorldGridPositions() {
+  const used = new Set();
+  for (const loc of LOCATIONS) {
+    let gx = Math.round((loc.x / 100) * (WORLD_WIDTH - 1));
+    let gy = Math.round((loc.y / 100) * (WORLD_HEIGHT - 1));
+    let attempts = 0;
+    while (used.has(`${gx},${gy}`) && attempts < 50) {
+      gx = Math.min(WORLD_WIDTH - 1, gx + 1);
+      attempts++;
+    }
+    used.add(`${gx},${gy}`);
+    loc.gx = gx;
+    loc.gy = gy;
+    loc.tier = tierForGridPos(gx, gy);
+  }
+})();
+
+const LOCATION_BY_GRID = new Map(LOCATIONS.map((l) => [`${l.gx},${l.gy}`, l]));
+function getLocationAtGrid(gx, gy) {
+  return LOCATION_BY_GRID.get(`${gx},${gy}`) || null;
+}
+
+// How far a fight's dungeon/enemy roster/bonus loot scale with the location
+// tier it's fought at — this is the "dungeons, enemies, and loot are
+// randomized depending on the area" system. `enemies` replaces the old
+// per-location hand-picked combat arrays as the actual roll pool (LOCATIONS'
+// own `combat` field is now just a boolean "a fight happens here" flag).
+// `dungeonSize`/`wallChance` are ranges randomized fresh per fight (see
+// generateCombatGrid()) so no two fights at the same tier look identical
+// either. Reuses the 9 existing ENEMIES entries, grouped by their own
+// maxHp/design intent (see the tier comments already on ENEMIES above)
+// rather than inventing new creatures.
+const WORLD_TIERS = {
+  1: {
+    enemies: ['giant_rat', 'bandit', 'wolf'],
+    dungeonWidth: [7, 9],
+    dungeonHeight: [5, 7],
+    wallChance: [0.08, 0.12],
+    bonusLoot: [{ item: 'gold', chance: 0.5, amount: [2, 5] }],
+  },
+  2: {
+    enemies: ['forest_spider', 'forest_archer', 'bog_zombie'],
+    dungeonWidth: [9, 11],
+    dungeonHeight: [7, 9],
+    wallChance: [0.1, 0.16],
+    bonusLoot: [
+      { item: 'gold', chance: 0.5, amount: [5, 10] },
+      { item: 'iron_ore', chance: 0.2, amount: [1, 3] },
+    ],
+  },
+  3: {
+    enemies: ['orc_raider', 'marsh_wraith'],
+    dungeonWidth: [11, 13],
+    dungeonHeight: [8, 10],
+    wallChance: [0.12, 0.18],
+    bonusLoot: [
+      { item: 'gold', chance: 0.5, amount: [10, 18] },
+      { item: 'silver_ore', chance: 0.2, amount: [1, 3] },
+    ],
+  },
+  4: {
+    enemies: ['stone_troll'],
+    dungeonWidth: [13, 15],
+    dungeonHeight: [9, 11],
+    wallChance: [0.15, 0.22],
+    bonusLoot: [
+      { item: 'gold', chance: 0.5, amount: [18, 30] },
+      { item: 'gold_ore', chance: 0.2, amount: [1, 2] },
+      { item: 'mithril_ore', chance: 0.05, amount: [1, 1] },
+    ],
+  },
+};
+
+// Pure flavor text + branching, no game-state mutation embedded in the tree
+// itself — an NPC's associated quest (if any) is a separate object shown
+// alongside the tree in the client, not a node in it. Keeps the tree a
+// simple static graph instead of needing a mini scripting language for
+// conditionals.
 const DIALOGUE_TREES = {
   root_mira: {
     id: 'root_mira',
@@ -1155,9 +1159,10 @@ function newPlayer(username, traits, passwordRecord) {
     token: crypto.randomBytes(24).toString('hex'),
     createdAt: Date.now(),
     currentLocation: startLoc.id,
+    worldPos: { x: startLoc.gx, y: startLoc.gy },
+    revealedTiles: [],
     discoveries: [startLoc.id],
     inventory: { supplies: STARTER_SUPPLIES, gold: 20 },
-    expedition: null,
     equipment: { weapon: null, armor: null },
     combat: null,
     garden: { plots: new Array(GARDEN_PLOT_COUNT).fill(null) },
@@ -1177,14 +1182,13 @@ function newPlayer(username, traits, passwordRecord) {
     combatRecord: { wins: 0, losses: 0 },
     lastRareEvent: null,
     alchemy: { knownRecipes: [], triedCombos: [] },
-    abilityLoadout: [...DEFAULT_ABILITY_LOADOUT],
-    combatSpeed: DEFAULT_COMBAT_SPEED,
     traits: traits || { strength: TRAIT_BASE, dexterity: TRAIT_BASE, luck: TRAIT_BASE, vigor: TRAIT_BASE },
     characterXp: 0,
     traitPointsAvailable: 0,
     perkPoints: 0,
     perks: [],
   };
+  player.revealedTiles.push(`${startLoc.gx},${startLoc.gy}`); // the one tile the player starts standing on
   db.players[id] = player;
   db.usernames[username.toLowerCase()] = id;
   save();
@@ -1247,23 +1251,29 @@ function ensurePlayerShape(player) {
     player.combat = null;
     changed = true;
   }
-  // Combat 2.0 (ability-sequencer arena) changed the shape of an in-progress
-  // fight (added loadout/distance/abilityCursor/etc). If someone had a fight
-  // still open when that shipped, their save has the old shape and reading
-  // it would crash. Just clear that one stale fight instead of trying to
-  // convert it.
-  if (player.combat && !Array.isArray(player.combat.loadout)) {
-    player.combat = null;
-    changed = true;
-  }
-  // Same fix, different rewrite: fights used to track one enemy, now they
-  // track a list of enemies. Clear any fight still stuck on the old shape.
+  // Same class of migration, same tradeoff, repeated a few times now as
+  // combat's shape has evolved (see login-500 and dangling-location-id
+  // incidents for the original version of this bug): any account with an
+  // UNRESOLVED fight open at the moment a shape change ships is stuck
+  // holding an old-shape combat object, which the current engine can't
+  // read. Reset it (loses that one stale fight) rather than trying to
+  // migrate mid-fight state into a structurally different engine.
   if (player.combat && !Array.isArray(player.combat.enemies)) {
     player.combat = null;
     changed = true;
   }
-  if (!player.combatSpeed || !COMBAT_SPEED_PRESETS[player.combatSpeed]) {
-    player.combatSpeed = DEFAULT_COMBAT_SPEED;
+  // The turn-based rewrite dropped the preset ability-loadout/auto-cursor
+  // system — any unresolved fight still carrying the old `loadout` field is
+  // from before that change and needs the same reset.
+  if (player.combat && Array.isArray(player.combat.loadout)) {
+    player.combat = null;
+    changed = true;
+  }
+  // The FF-style rewrite dropped the arena distance/angle positioning system
+  // entirely — any unresolved fight whose enemies still carry a `distance`
+  // field predates that change and needs the same reset.
+  if (player.combat && player.combat.enemies && player.combat.enemies.some((e) => 'distance' in e)) {
+    player.combat = null;
     changed = true;
   }
   if (!player.garden) {
@@ -1310,10 +1320,6 @@ function ensurePlayerShape(player) {
   }
   if (!player.alchemy) {
     player.alchemy = { knownRecipes: [], triedCombos: [] };
-    changed = true;
-  }
-  if (!player.abilityLoadout) {
-    player.abilityLoadout = [...DEFAULT_ABILITY_LOADOUT];
     changed = true;
   }
   if (!player.traits) {
@@ -1368,8 +1374,39 @@ function ensurePlayerShape(player) {
     filteredDiscoveries.push(LOCATIONS.find((l) => l.startingLocation).id);
   }
   player.discoveries = filteredDiscoveries;
-  if (!validLocationIds.has(player.currentLocation)) {
+  // currentLocation is legitimately null now (standing on an empty grid
+  // tile, not on any named location) — only a truthy-but-dangling id needs
+  // resetting, null itself is a normal, valid state.
+  if (player.currentLocation && !validLocationIds.has(player.currentLocation)) {
     player.currentLocation = LOCATIONS.find((l) => l.startingLocation).id;
+    changed = true;
+  }
+
+  // The percent-space drag-to-explore overworld was replaced by a grid
+  // players actually walk around on (see moveOnWorldGrid()) — any account
+  // from before that has no worldPos at all, or (same dangling-id problem
+  // as currentLocation above) a currentLocation that no longer resolves to
+  // a real tile. Falls back to wherever currentLocation now points (already
+  // guaranteed valid by the check just above), or the starting location.
+  if (!player.worldPos || !Number.isFinite(player.worldPos.x) || !Number.isFinite(player.worldPos.y)) {
+    const loc = getLocation(player.currentLocation) || LOCATIONS.find((l) => l.startingLocation);
+    player.worldPos = { x: loc.gx, y: loc.gy };
+    changed = true;
+  }
+  // Persistent per-tile fog of war didn't exist when the grid overworld
+  // first shipped — any account from that window has a worldPos but no
+  // revealedTiles at all, which would otherwise render as standing in a
+  // total fog void despite already having walked around. Backfill with
+  // just the one tile they currently occupy, same as a brand new player.
+  if (!Array.isArray(player.revealedTiles)) {
+    player.revealedTiles = [`${player.worldPos.x},${player.worldPos.y}`];
+    changed = true;
+  }
+  // The drag-to-explore system's in-progress-route state has no equivalent
+  // in the grid system at all — stale leftover data, not a value anything
+  // reads anymore, so just drop it instead of migrating it into anything.
+  if (player.expedition !== undefined) {
+    delete player.expedition;
     changed = true;
   }
 
@@ -1532,12 +1569,16 @@ function tickDeterministicNode(player, skillId, skill, node) {
   skill.lastTick = now;
 }
 
-// Works out how many full cycles have passed on a chance-based node
-// (hunting/scavenging/harvesting) and rolls each one separately, instead of
-// always giving a guaranteed item like mining does. A hunting cycle can
-// trigger an ambush fight, which stops the task right away. Cycles are
-// capped per call so a player who was away a very long time can't cause a
-// huge loop — any leftover cycles just carry over to the next tick.
+// Resolves elapsed time on a chance-based node (hunting/scavenging/
+// harvesting) into whole completed cycles, then rolls each one
+// independently instead of granting a guaranteed yield — see
+// RARE_GATHER_EVENT_CHANCE for the shared jackpot odds. A hunting cycle can
+// trigger an ambush (see resolveGatherCycleForNode/beginAmbushCombat),
+// which immediately stops the task — combat is a hard block on every other
+// task in this codebase, same as it is for mining/expeditions. Cycles are
+// capped per tick (same idea as combat's turn-count guard) so a very long AFK
+// gap can't turn into an unbounded loop; any still-unprocessed whole cycles
+// just carry over as extra progressSeconds and get resolved on the next tick.
 const GATHER_TICK_CAP = 500;
 
 function tickChanceNode(player, skillId, skill, node) {
@@ -1601,7 +1642,7 @@ function resolveGatherCycleForNode(player, skillId, node) {
     const roll = Math.random();
     if (roll < node.encounterChance) {
       const enemyId = node.huntableEnemies[Math.floor(Math.random() * node.huntableEnemies.length)];
-      beginAmbushCombat(player, enemyId);
+      beginAmbushCombat(player, enemyId, node.tier);
       return 'combat';
     }
     if (roll < node.encounterChance + node.successChance + successBonus) {
@@ -1633,7 +1674,6 @@ function startResourceTask(playerId, skillId, nodeId) {
   if (!node) return { error: 'unknown_node' };
   if (!player.discoveries.includes(node.locationId)) return { error: 'not_unlocked' };
   if (player.combat && !player.combat.result) return { error: 'busy_fighting' };
-  if (player.expedition) return { error: 'busy_exploring' };
 
   stopAllSkillTasks(player); // only one task at a time
   player.skills[skillId].activeNode = nodeId;
@@ -1675,74 +1715,170 @@ function publicResourceNodes(player, skillId) {
   });
 }
 
-// Sets up a fight — used both when the player picks a fight (startCombat)
-// and when a hunting task triggers a surprise ambush (beginAmbushCombat).
-// The `ambush` flag just tells the client to show a different message.
-// Copies the player's ability loadout into the fight at the start, since
-// loadout can't be edited mid-fight. enemyIds is 1-3 enemies (see
-// rollEncounterGroup); each gets its own fixed angle around the player so
-// they never overlap.
-function beginCombatInstance(player, enemyIds, ambush) {
+// Flood-fill from the player's start tile, respecting walls — used to
+// guarantee every enemy spawn point generateCombatGrid() picks is actually
+// reachable (a wall layout could otherwise seal an enemy behind a pocket
+// nobody can ever fight their way into, or wall the player into a box with
+// no way to approach anyone — either would softlock the fight).
+function combatBfsReachable(start, width, height, wallSet) {
+  const visited = new Set([`${start.x},${start.y}`]);
+  const queue = [start];
+  while (queue.length > 0) {
+    const { x, y } = queue.shift();
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const nx = x + dx;
+      const ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+      const key = `${nx},${ny}`;
+      if (visited.has(key) || wallSet.has(key)) continue;
+      visited.add(key);
+      queue.push({ x: nx, y: ny });
+    }
+  }
+  return visited;
+}
+
+// Builds a small dungeon room: the player starts at dead center, a scatter
+// of wall tiles gives it a "room" feel, and enemyCount enemies are placed on
+// reachable tiles at least COMBAT_MIN_ENEMY_DISTANCE away (an ambush instead
+// places its one attacker right next to the player, since the whole point is
+// being caught off guard). Regenerates (capped at 30 tries) if a random wall
+// layout doesn't leave enough valid, reachable enemy tiles — cheap enough
+// given how small and sparse the grid is, and far simpler than repairing a
+// bad layout after the fact.
+// Distance check for where an enemy is allowed to spawn: a normal encounter
+// just needs to be far enough away to feel like a real approach (Chebyshev
+// distance, so diagonal-ish spacing still counts as "far"); an ambush needs
+// to land the single attacker exactly one Manhattan step away — the same
+// 4-directional adjacency resolveEnemyTurns() checks — so its guaranteed
+// free first hit (see beginCombatInstance()) actually lands as an attack
+// instead of silently becoming "the enemy takes one step closer" if it
+// happened to spawn a tile or two out.
+function combatSpawnDistanceOk(p, playerPos, ambush) {
+  if (ambush) return Math.abs(p.x - playerPos.x) + Math.abs(p.y - playerPos.y) === 1;
+  return Math.max(Math.abs(p.x - playerPos.x), Math.abs(p.y - playerPos.y)) >= COMBAT_MIN_ENEMY_DISTANCE;
+}
+
+function randFloat(min, max) {
+  return min + Math.random() * (max - min);
+}
+
+// Dungeon dimensions and wall density are randomized fresh per fight within
+// the fight's tier range (see WORLD_TIERS) — a tier isn't one fixed
+// dungeon, it's a range of possible ones, so no two fights at the same
+// tier necessarily look alike, and higher tiers trend bigger/mazier.
+function generateCombatGrid(enemyCount, ambush, tier) {
+  const config = WORLD_TIERS[tier] || WORLD_TIERS[1];
+  const width = randInt(config.dungeonWidth[0], config.dungeonWidth[1]);
+  const height = randInt(config.dungeonHeight[0], config.dungeonHeight[1]);
+  const wallChance = randFloat(config.wallChance[0], config.wallChance[1]);
+  const playerPos = { x: Math.floor(width / 2), y: Math.floor(height / 2) };
+
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const walls = [];
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        if (x === playerPos.x && y === playerPos.y) continue;
+        if (Math.random() < wallChance) walls.push({ x, y });
+      }
+    }
+    const wallSet = new Set(walls.map((w) => `${w.x},${w.y}`));
+    const reachable = combatBfsReachable(playerPos, width, height, wallSet);
+    const candidates = [...reachable]
+      .map((key) => {
+        const [x, y] = key.split(',').map(Number);
+        return { x, y };
+      })
+      .filter((p) => combatSpawnDistanceOk(p, playerPos, ambush));
+
+    if (candidates.length < enemyCount) continue;
+
+    for (let i = candidates.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+    }
+    return { width, height, walls, playerPos, enemyPositions: candidates.slice(0, enemyCount) };
+  }
+
+  // Fallback (astronomically unlikely given these wall-chance ranges): an
+  // empty room guarantees enough reachable space no matter what.
+  const openCandidates = [];
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (combatSpawnDistanceOk({ x, y }, playerPos, ambush)) openCandidates.push({ x, y });
+    }
+  }
+  return { width, height, walls: [], playerPos, enemyPositions: openCandidates.slice(0, enemyCount) };
+}
+
+// Shared combat-instance constructor used by both startCombat() (the player
+// chose to fight) and beginAmbushCombat() (a hunting gather task triggered
+// it with nobody clicking anything) — same shape either way, just an
+// `ambush` flag the client uses to show a distinct toast and this function
+// uses to let the ambushing enemy get the first hit in, before the player
+// can react. enemyIds: an array (1-3) — see rollEncounterGroup().
+function beginCombatInstance(player, enemyIds, ambush, tier) {
   const now = Date.now();
   const maxHp = playerMaxHp(player);
-  const angles = COMBAT_GROUP_ANGLES[enemyIds.length] || COMBAT_GROUP_ANGLES[1];
+  const grid = generateCombatGrid(enemyIds.length, ambush, tier);
   const enemies = enemyIds.map((enemyId, i) => {
     const enemy = ENEMIES[enemyId];
-    // MIN_ENEMY_DISTANCE, not 0 — a melee enemy starts "engaged" (already in
-    // range to attack) but never literally on top of the player, or every
-    // melee enemy in a group would collapse onto the same point regardless
-    // of angle (distance 0 means every angle maps to the same coordinate).
-    const startDistance = enemy.aiType === 'ranged_kiter' ? enemy.preferredRange : MIN_ENEMY_DISTANCE;
+    const pos = grid.enemyPositions[i];
     return {
       uid: `e${i}`,
       enemyId,
       hp: enemy.maxHp,
       maxHp: enemy.maxHp,
-      distance: startDistance,
-      angle: angles[i],
       dot: null,
+      x: pos.x,
+      y: pos.y,
     };
   });
   player.combat = {
+    grid: { width: grid.width, height: grid.height, walls: grid.walls },
+    playerPos: grid.playerPos,
     enemies,
     playerHp: maxHp,
     playerMaxHp: maxHp,
-    loadout: [...player.abilityLoadout],
-    abilityCursor: -1,
-    castRoundsRemaining: 0,
     dotOnPlayer: null,
     buff: null,
-    armorBuff: null,
-    pendingMeleeComboBuff: null,
-    pendingHasteBuff: null,
-    evasionUntil: 0,
     lastPlayerActionText: '',
-    lastEnemyActionText: '',
-    tickIntervalSeconds: COMBAT_SPEED_PRESETS[player.combatSpeed] || COMBAT_SPEED_PRESETS[DEFAULT_COMBAT_SPEED],
-    nextTickAt: now + (COMBAT_SPEED_PRESETS[player.combatSpeed] || COMBAT_SPEED_PRESETS[DEFAULT_COMBAT_SPEED]) * 1000,
-    round: 0,
+    lastPlayerHit: null,
+    lastEnemyActionTexts: [],
+    lastEnemyHits: [],
+    turn: 0,
     startedAt: now,
     result: null,
     rewardGold: 0,
     rewardLoot: [],
     ambush,
+    tier, // drives checkCombatEnd()'s bonus-loot roll — see WORLD_TIERS
   };
-  advanceCursor(player.combat);
+  if (ambush) {
+    const equip = getEquippedStats(player);
+    resolveEnemyTurns(player, player.combat, equip);
+    tickDots(player.combat);
+    checkCombatEnd(player, player.combat);
+  }
 }
 
 // Single-enemy convenience wrapper — a hunting ambush is always one
 // surprise attacker, not a coordinated group, so it doesn't go through
-// rollEncounterGroup().
-function beginAmbushCombat(player, enemyId) {
-  beginCombatInstance(player, [enemyId], true);
+// rollEncounterGroup(). tier comes from whichever HUNTING_NODES entry
+// triggered it (see resolveGatherCycleForNode) — falls back to 1 if
+// somehow called without one.
+function beginAmbushCombat(player, enemyId, tier) {
+  beginCombatInstance(player, [enemyId], true, tier || 1);
 }
 
 // Most fights are solo; occasionally (see weights below) 1-2 companions join
-// from the same location's enemy pool, picked independently so a group can
-// repeat a type (e.g. two wolves) or mix types. chosenEnemyId is always
-// included so the player's explicit pick from the enemy list is honored.
+// from the fight's tier-appropriate enemy pool (WORLD_TIERS[loc.tier]) —
+// randomized by area rather than a fixed per-location list, so the same
+// location can produce a different mix of tier-mates fight to fight.
+// chosenEnemyId is always included so the player's explicit pick from the
+// enemy list is honored.
 function rollEncounterGroup(loc, chosenEnemyId) {
-  const pool = loc.combat;
+  const pool = WORLD_TIERS[loc.tier].enemies;
   const roll = Math.random();
   let size = 1;
   if (pool.length > 1) {
@@ -1790,43 +1926,13 @@ function stopAllSkillTasks(player) {
   }
 }
 
-// Closest point on segment a-b to point p, in the same 0-100 percent-space
-// as location/path coordinates. Returns the distance and how far along the
-// segment (0-1) that closest point falls.
-function closestPointOnSegment(p, a, b) {
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const lengthSq = dx * dx + dy * dy;
-  let t = lengthSq === 0 ? 0 : ((p.x - a.x) * dx + (p.y - a.y) * dy) / lengthSq;
-  t = Math.max(0, Math.min(1, t));
-  const cx = a.x + t * dx;
-  const cy = a.y + t * dy;
-  return { distance: Math.hypot(p.x - cx, p.y - cy), t };
-}
-
-// Distance from a location to the nearest point anywhere along a drawn path,
-// plus the arc-length (distance traveled along the path) at that point —
-// used both to decide whether the path "overlaps" the location and to know
-// how far into the expedition the sweeping fill has to reach to reveal it.
-function closestPointOnPath(loc, path) {
-  let best = { distance: Infinity, arcLength: 0 };
-  let cumulative = 0;
-  for (let i = 0; i < path.length - 1; i++) {
-    const a = path[i];
-    const b = path[i + 1];
-    const segLen = Math.hypot(b.x - a.x, b.y - a.y);
-    const { distance, t } = closestPointOnSegment(loc, a, b);
-    if (distance < best.distance) {
-      best = { distance, arcLength: cumulative + t * segLen };
-    }
-    cumulative += segLen;
-  }
-  return best;
-}
-
-// Marks a location discovered and grants character xp for it, in one place
-// so every way of discovering a location (expedition, paid reveal) works
-// the same. Returns true if it was actually new.
+// Grants a newly-discovered location + character xp for it in one place, so
+// every path that can add to player.discoveries (walking within view radius
+// of a location, paid shop reveal) awards xp consistently rather than
+// duplicating the already-discovered check + level-up math. Returns true if
+// this was a real new discovery (false if already known — moveOnWorldGrid's
+// per-move reveal scan relies on this to avoid re-granting xp for a
+// location the player already knows).
 function discoverLocation(player, locationId) {
   if (player.discoveries.includes(locationId)) return false;
   player.discoveries.push(locationId);
@@ -1838,9 +1944,12 @@ function discoverLocation(player, locationId) {
   return true;
 }
 
-// Character-level xp is separate from every skill's own xp, but uses the
-// same level curve. One grant can cross more than one level at once (e.g.
-// several locations discovered in the same expedition tick).
+// Character-level xp is a separate pool from every skill's xp, reusing the
+// same xpCostForLevel()/levelFromXp() curve (defined further down, but
+// function declarations are hoisted so the forward reference is fine). A
+// single grant can cross more than one level (e.g. several locations
+// revealed within view radius by one overworld move) — loop rather than
+// assume at most one.
 function gainCharacterXp(player, amount) {
   const before = levelFromXp(player.characterXp);
   player.characterXp += amount;
@@ -1852,21 +1961,47 @@ function gainCharacterXp(player, amount) {
   }
 }
 
-// Moves an expedition's progress forward based on real time passed, and
-// reveals any location the progress has reached along the way.
-function tickExpedition(player) {
-  const exp = player.expedition;
-  if (!exp) return;
-  const elapsedSeconds = (Date.now() - exp.startedAt) / 1000;
-  const fraction = Math.min(1, elapsedSeconds / exp.durationSeconds);
-  for (const trigger of exp.triggers) {
-    if (fraction >= trigger.fraction) {
-      discoverLocation(player, trigger.locationId);
-    }
+// The whole of overworld movement: stepping onto a tile you've never stood
+// on before costs a supply and reveals it (and its location, if any) for
+// good; stepping onto anywhere already in player.revealedTiles is free,
+// forever — retracing known ground never costs anything, only genuinely new
+// ground does. A blocked move (world edge) costs nothing and moves nobody,
+// same "invalid input, not a real action" idea combat's own blocked-move
+// handling already uses.
+function isTileRevealed(player, x, y) {
+  return player.revealedTiles.includes(`${x},${y}`);
+}
+
+function moveOnWorldGrid(playerId, direction) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
+  if (player.combat && !player.combat.result) return { error: 'busy_fighting' };
+  const delta = COMBAT_DIRECTIONS[direction];
+  if (!delta) return { error: 'invalid_direction' };
+
+  const nx = player.worldPos.x + delta.dx;
+  const ny = player.worldPos.y + delta.dy;
+  if (nx < 0 || ny < 0 || nx >= WORLD_WIDTH || ny >= WORLD_HEIGHT) return { error: 'blocked' };
+
+  const isNewGround = !isTileRevealed(player, nx, ny);
+  if (isNewGround) {
+    const supplies = player.inventory.supplies || 0;
+    if (supplies <= 0) return { error: 'no_supplies' };
+    player.inventory.supplies = supplies - WORLD_SUPPLIES_PER_MOVE;
+    if (player.inventory.supplies <= 0) delete player.inventory.supplies;
   }
-  if (fraction >= 1) {
-    player.expedition = null;
+
+  player.worldPos = { x: nx, y: ny };
+  const hereLoc = getLocationAtGrid(nx, ny);
+  player.currentLocation = hereLoc ? hereLoc.id : null;
+
+  if (isNewGround) {
+    player.revealedTiles.push(`${nx},${ny}`);
+    if (hereLoc) discoverLocation(player, hereLoc.id);
   }
+
+  save();
+  return { ok: true, player: publicPlayer(player) };
 }
 
 function randInt(min, max) {
@@ -1899,7 +2034,7 @@ function getPlayerModifiers(player) {
   const t = player.traits;
   const perkMods = {
     meleeDamageMult: 0,
-    attackSpeedMult: 0,
+    bonusDamageMult: 0,
     plantGrowthMult: 0,
     critChanceBonus: 0,
     armorFlat: 0,
@@ -1918,8 +2053,9 @@ function getPlayerModifiers(player) {
   return {
     // strength: +5% melee damage per point above TRAIT_BASE
     meleeDamageMult: 1 + (t.strength - TRAIT_BASE) * 0.05 + perkMods.meleeDamageMult,
-    // dexterity: -2% ability cast time per point above TRAIT_BASE, floor at 50% of base cast time
-    castSpeedMult: Math.max(0.5, 1 - (t.dexterity - TRAIT_BASE) * 0.02 - perkMods.attackSpeedMult),
+    // dexterity: +2% damage on every attack (not melee-restricted — applies
+    // to any future non-melee source too) per point above TRAIT_BASE.
+    bonusDamageMult: 1 + (t.dexterity - TRAIT_BASE) * 0.02 + perkMods.bonusDamageMult,
     // dexterity: a flat chance to dodge an incoming enemy attack entirely (separate from Quick Step's evasion window)
     dodgeChance: Math.max(0, (t.dexterity - TRAIT_BASE) * 0.015),
     // luck + a sliver of dexterity: bonus crit chance
@@ -1961,10 +2097,11 @@ function playerMaxHp(player) {
   return PLAYER_BASE_HP + (level - 1) * PLAYER_HP_PER_LEVEL + mods.hpBonus;
 }
 
-// Combat runs in rounds, moving forward based on real time passed, the same
-// way skill tasks and expeditions do. A potion buff (Strength/Swiftness) is
-// checked against the real clock here rather than counted down, so it
-// expires correctly even if the player comes back to a stale tab.
+// Alchemy combat buffs (Potion of Strength/Swiftness) live as a single slot
+// on the combat object, same one-effect-at-a-time pattern as dotOnEnemy/
+// dotOnPlayer — checked fresh against real time on every turn rather than
+// decremented, so it expires correctly whether the player is submitting
+// moves quickly or comes back to a stale tab after a while.
 function getActiveCombatBuff(c) {
   if (!c.buff) return null;
   if (Date.now() >= c.buff.expiresAt) {
@@ -1974,242 +2111,145 @@ function getActiveCombatBuff(c) {
   return c.buff;
 }
 
-// Same idea as getActiveCombatBuff(), for Guard Up's temporary armor bonus.
-function getActiveArmorBuff(c) {
-  if (!c.armorBuff) return null;
-  if (Date.now() >= c.armorBuff.expiresAt) {
-    c.armorBuff = null;
-    return null;
+// Resolves who a potion targets: the player-chosen targetUid if it's still
+// alive, otherwise the first living enemy — a defensive fallback so a
+// potion never needs an explicit target picker in the UI (there's rarely
+// more than one enemy, and "nearest/first living" is an obvious default).
+function pickTarget(c, targetUid) {
+  if (targetUid) {
+    const chosen = c.enemies.find((e) => e.uid === targetUid && e.hp > 0);
+    if (chosen) return chosen;
   }
-  return c.armorBuff;
+  return c.enemies.find((e) => e.hp > 0) || null;
 }
 
-// Moves to the next filled loadout slot, wrapping back to slot 0 after slot
-// 5 — this is what makes abilities play out left to right, on a loop.
-function advanceCursor(c) {
-  for (let i = 1; i <= 6; i++) {
-    const idx = (c.abilityCursor + i) % 6;
-    if (c.loadout[idx]) {
-      c.abilityCursor = idx;
-      return;
-    }
-  }
-  // No abilities in the loadout at all — leave the cursor where it is.
+function isWall(grid, x, y) {
+  return grid.walls.some((w) => w.x === x && w.y === y);
 }
 
-// The nearest living enemy — there's no manual targeting yet, so every
-// attack just goes for whoever is closest.
-function pickTarget(c) {
-  let best = null;
-  for (const e of c.enemies) {
-    if (e.hp <= 0) continue;
-    if (!best || e.distance < best.distance) best = e;
-  }
-  return best;
+function enemyAt(c, x, y) {
+  return c.enemies.find((e) => e.hp > 0 && e.x === x && e.y === y) || null;
 }
 
-function livingEnemies(c) {
-  return c.enemies.filter((e) => e.hp > 0);
+// The player's whole turn: attempt one step. A wall or the grid edge blocks
+// the move entirely (classic bump-into-wall — no turn consumed, nothing
+// happens, so a misclick can't cost you a free enemy turn). Stepping onto a
+// living enemy's tile attacks it instead of moving there.
+function resolvePlayerMove(player, c, equip, direction) {
+  const delta = COMBAT_DIRECTIONS[direction];
+  const nx = c.playerPos.x + delta.dx;
+  const ny = c.playerPos.y + delta.dy;
+  if (nx < 0 || ny < 0 || nx >= c.grid.width || ny >= c.grid.height || isWall(c.grid, nx, ny)) {
+    return { error: 'blocked' };
+  }
+  c.lastPlayerHit = null; // structured version of lastPlayerActionText, for the client's hit animation — see snapshotRound()
+  const target = enemyAt(c, nx, ny);
+  if (target) {
+    attackEnemy(player, c, equip, target);
+  } else {
+    c.playerPos = { x: nx, y: ny };
+    c.lastPlayerActionText = '';
+  }
+  return { ok: true };
 }
 
-// Balance numbers for the abilities that don't use the equipped weapon's
-// own damage (unlike Swing/Power Strike, which scale off equip.damage).
-const PUNCH_DAMAGE = [2, 4];
-const PUNCH_COMBO_MULTIPLIER = 1.5; // bonus damage on the next melee ability after a Punch
-const POWER_STRIKE_DAMAGE_MULTIPLIER = 1.8; // on top of the weapon's normal damage roll
-const POISON_JAB_DAMAGE = [1, 3];
-const POISON_JAB_DOT = { dps: 3, roundsLeft: 4 };
-const THROW_DAGGER_DAMAGE = [3, 6];
-const THROW_DAGGER_CRIT_CHANCE = 0.05;
-const QUICK_STEP_EVASION_MS = 1200;
-const GUARD_UP_ARMOR_BONUS = 5;
-const GUARD_UP_DURATION_MS = 4000;
-const SECOND_WIND_HEAL = 15;
-const ADRENALINE_RUSH_HASTE_MULTIPLIER = 0.5; // halves the charge time of the next ability
-
-// Plays out the player's turn for one round: either keep charging the
-// ability under the cursor (a heavy ability like Power Strike takes more
-// rounds to charge than a fast one like Punch — that's the tradeoff for its
-// bigger hit), or once fully charged, apply its effect and move to the next
-// loadout slot. A melee ability only lands if the target is close enough —
-// otherwise it still uses up the charge but does nothing.
-function resolvePlayerTurn(player, c, equip, now) {
-  const abilityId = c.loadout[c.abilityCursor];
-  if (!abilityId) return; // empty loadout slot under the cursor — nothing to do this round
-
-  if (c.castRoundsRemaining > 0) {
-    c.castRoundsRemaining -= 1;
-    c.lastPlayerActionText = `Charging ${ABILITIES[abilityId].name}...`;
-    return;
-  }
-
-  const ability = ABILITIES[abilityId];
-  const isMelee = ability.tags.includes('melee');
-  const target = pickTarget(c);
-  const inRange = !!target && target.distance <= MELEE_RANGE;
-  let comboMultiplier = 1;
-  if (isMelee && c.pendingMeleeComboBuff) {
-    comboMultiplier = c.pendingMeleeComboBuff.multiplier;
-    c.pendingMeleeComboBuff = null;
-  }
+// The player's basic attack — the only attack there is now, always using
+// whatever's equipped (bare fists if nothing is), exactly like the old
+// "Swing" ability. Potion damage/strength/dexterity bonuses from
+// getPlayerModifiers() still apply, same math as before.
+function attackEnemy(player, c, equip, target) {
   const potionBuff = getActiveCombatBuff(c);
   const potionDmgMultiplier = potionBuff && potionBuff.type === 'damage' ? potionBuff.multiplier : 1;
-  // strength + Brute Force/Brutal Force perks only apply to melee-tagged abilities
-  const strMultiplier = isMelee ? getPlayerModifiers(player).meleeDamageMult : 1;
-  const totalMultiplier = comboMultiplier * potionDmgMultiplier * strMultiplier;
-
-  if (abilityId === 'swing') {
-    if (target && inRange) {
-      let dmg = Math.round(randInt(equip.damage[0], equip.damage[1]) * totalMultiplier);
-      if (Math.random() < equip.critChance) dmg *= 2;
-      target.hp = Math.max(0, target.hp - dmg);
-      c.lastPlayerActionText = `Swing hits ${ENEMIES[target.enemyId].name} for ${dmg}`;
-      if (equip.effect && Math.random() < equip.effect.chance) {
-        target.dot = { type: equip.effect.type, dps: equip.effect.dps, roundsLeft: equip.effect.duration };
-      }
-    } else {
-      c.lastPlayerActionText = 'Swing misses — too far away!';
-    }
-  } else if (abilityId === 'punch') {
-    if (target && inRange) {
-      const dmg = Math.round(randInt(PUNCH_DAMAGE[0], PUNCH_DAMAGE[1]) * totalMultiplier);
-      target.hp = Math.max(0, target.hp - dmg);
-      c.pendingMeleeComboBuff = { multiplier: PUNCH_COMBO_MULTIPLIER };
-      c.lastPlayerActionText = `Punch hits ${ENEMIES[target.enemyId].name} for ${dmg} — next melee ability is primed`;
-    } else {
-      c.lastPlayerActionText = 'Punch misses — too far away!';
-    }
-  } else if (abilityId === 'power_strike') {
-    if (target && inRange) {
-      let dmg = Math.round(randInt(equip.damage[0], equip.damage[1]) * POWER_STRIKE_DAMAGE_MULTIPLIER * totalMultiplier);
-      if (Math.random() < equip.critChance) dmg *= 2;
-      target.hp = Math.max(0, target.hp - dmg);
-      c.lastPlayerActionText = `Power Strike hits ${ENEMIES[target.enemyId].name} for ${dmg}!`;
-    } else {
-      c.lastPlayerActionText = 'Power Strike misses — too far away!';
-    }
-  } else if (abilityId === 'poison_jab') {
-    if (target && inRange) {
-      const dmg = Math.round(randInt(POISON_JAB_DAMAGE[0], POISON_JAB_DAMAGE[1]) * totalMultiplier);
-      target.hp = Math.max(0, target.hp - dmg);
-      target.dot = { type: 'poison', ...POISON_JAB_DOT };
-      c.lastPlayerActionText = `Poison Jab hits ${ENEMIES[target.enemyId].name} for ${dmg} and poisons it`;
-    } else {
-      c.lastPlayerActionText = 'Poison Jab misses — too far away!';
-    }
-  } else if (abilityId === 'throw_dagger') {
-    if (target) {
-      let dmg = Math.round(randInt(THROW_DAGGER_DAMAGE[0], THROW_DAGGER_DAMAGE[1]) * potionDmgMultiplier);
-      if (Math.random() < THROW_DAGGER_CRIT_CHANCE) dmg *= 2;
-      target.hp = Math.max(0, target.hp - dmg);
-      c.lastPlayerActionText = `Throw Dagger hits ${ENEMIES[target.enemyId].name} for ${dmg}`;
-    }
-  } else if (abilityId === 'quick_step') {
-    for (const e of livingEnemies(c)) e.distance = Math.min(MAX_DISTANCE, e.distance + QUICK_STEP_RETREAT);
-    c.evasionUntil = now + QUICK_STEP_EVASION_MS;
-    c.lastPlayerActionText = 'Quick Step — you put distance between yourself and every enemy';
-  } else if (abilityId === 'guard_up') {
-    c.armorBuff = { amount: GUARD_UP_ARMOR_BONUS, expiresAt: now + GUARD_UP_DURATION_MS };
-    c.lastPlayerActionText = 'Guard Up — your defense is bolstered';
-  } else if (abilityId === 'second_wind') {
-    c.playerHp = Math.min(c.playerMaxHp, c.playerHp + SECOND_WIND_HEAL);
-    c.lastPlayerActionText = 'Second Wind — you recover some health';
-  } else if (abilityId === 'adrenaline_rush') {
-    c.pendingHasteBuff = { multiplier: ADRENALINE_RUSH_HASTE_MULTIPLIER };
-    c.lastPlayerActionText = 'Adrenaline Rush — your next ability will be faster';
+  const mods = getPlayerModifiers(player);
+  const totalMultiplier = potionDmgMultiplier * mods.meleeDamageMult * mods.bonusDamageMult;
+  let dmg = Math.round(randInt(equip.damage[0], equip.damage[1]) * totalMultiplier);
+  let crit = false;
+  if (Math.random() < equip.critChance) { dmg *= 2; crit = true; }
+  target.hp = Math.max(0, target.hp - dmg);
+  c.lastPlayerActionText = `You hit ${ENEMIES[target.enemyId].name} for ${dmg}`;
+  c.lastPlayerHit = { type: 'damage', targetUid: target.uid, amount: dmg, crit };
+  if (equip.effect && Math.random() < equip.effect.chance) {
+    target.dot = { type: equip.effect.type, dps: equip.effect.dps, roundsLeft: equip.effect.duration };
   }
-
-  advanceCursor(c);
-  const nextAbilityId = c.loadout[c.abilityCursor];
-  let rounds = nextAbilityId ? baseCastRounds(nextAbilityId) : 1;
-  if (c.pendingHasteBuff) {
-    rounds *= c.pendingHasteBuff.multiplier;
-    c.pendingHasteBuff = null;
-  }
-  const speedBuff = getActiveCombatBuff(c);
-  if (speedBuff && speedBuff.type === 'speed') rounds *= speedBuff.multiplier;
-  rounds *= getPlayerModifiers(player).castSpeedMult; // dexterity + Swift Strikes/Adrenal Focus perks
-  c.castRoundsRemaining = Math.max(0, Math.round(rounds) - 1);
 }
 
-// One enemy's attack on the player — used by every enemy type once it's
-// decided to attack instead of moving. Quick Step's evasion window gives a
-// real chance to dodge completely; dexterity's dodge chance also always
-// applies on top of that.
-function resolveEnemyAttackOn(player, c, target, equip, now) {
+// One enemy's attack against the player. A dexterity-based dodgeChance applies on every incoming enemy attack.
+// Pushes onto c.lastEnemyActionTexts/c.lastEnemyHits (both cleared once per
+// turn by resolveEnemyTurns below) rather than overwriting a single value,
+// so a multi-enemy fight's log/animation queue covers what every enemy did,
+// not just the last one. lastEnemyHits is the structured twin of
+// lastEnemyActionTexts, one entry per enemy in the same order, used by the
+// client to animate the correct enemy attacking — see snapshotRound().
+function resolveEnemyAttackOn(player, c, target, equip) {
   const enemy = ENEMIES[target.enemyId];
-  if (c.evasionUntil && now < c.evasionUntil && Math.random() < EVASION_DODGE_CHANCE) {
-    c.lastEnemyActionText = `${enemy.name} attacks — dodged!`;
-    return;
-  }
-  if (Math.random() < getPlayerModifiers(player).dodgeChance) {
-    c.lastEnemyActionText = `${enemy.name} attacks — you dodge!`;
+  const evasionBuff = getActiveCombatBuff(c);
+  const evasionBonus = evasionBuff && evasionBuff.type === 'evasion' ? evasionBuff.multiplier : 0;
+  if (Math.random() < getPlayerModifiers(player).dodgeChance + evasionBonus) {
+    c.lastEnemyActionTexts.push(`${enemy.name} attacks — you dodge!`);
+    c.lastEnemyHits.push({ uid: target.uid, type: 'dodged' });
     return;
   }
   let dmg = randInt(enemy.damage[0], enemy.damage[1]);
-  if (Math.random() < enemy.critChance) dmg *= 2;
-  const armorBuff = getActiveArmorBuff(c);
-  const totalArmor = equip.armor + (armorBuff ? armorBuff.amount : 0);
-  dmg = Math.max(1, dmg - totalArmor);
+  let crit = false;
+  if (Math.random() < enemy.critChance) { dmg *= 2; crit = true; }
+  dmg = Math.max(1, dmg - equip.armor);
   c.playerHp = Math.max(0, c.playerHp - dmg);
-  c.lastEnemyActionText = `${enemy.name} hits you for ${dmg}`;
+  c.lastEnemyActionTexts.push(`${enemy.name} hits you for ${dmg}`);
+  c.lastEnemyHits.push({ uid: target.uid, type: 'damage', amount: dmg, crit });
   if (enemy.effect && Math.random() < enemy.effect.chance) {
     c.dotOnPlayer = { type: enemy.effect.type, dps: enemy.effect.dps, roundsLeft: enemy.effect.duration };
   }
 }
 
-// One living enemy's full action for the round — move or attack, chosen by
-// its aiType (see the ENEMIES comment above for what each archetype does).
-function enemyTakeTurn(player, c, target, equip, now) {
-  const enemy = ENEMIES[target.enemyId];
-  const ai = enemy.aiType || 'melee_aggressive';
-
-  if (ai === 'ranged_kiter') {
-    const pref = enemy.preferredRange;
-    if (target.distance < pref - 12) {
-      target.distance = Math.min(MAX_DISTANCE, target.distance + enemy.approachSpeed);
-      c.lastEnemyActionText = `${enemy.name} backs away`;
-    } else if (target.distance > pref + 12) {
-      target.distance = Math.max(MIN_ENEMY_DISTANCE, target.distance - enemy.approachSpeed);
-      c.lastEnemyActionText = `${enemy.name} closes in`;
-    } else {
-      resolveEnemyAttackOn(player, c, target, equip, now);
-    }
-    return;
-  }
-
-  if (ai === 'skirmisher') {
-    if (target.distance > enemy.range) {
-      target.distance = Math.max(MIN_ENEMY_DISTANCE, target.distance - enemy.approachSpeed);
-      c.lastEnemyActionText = `${enemy.name} closes in`;
-    } else {
-      resolveEnemyAttackOn(player, c, target, equip, now);
-      target.distance = Math.min(MAX_DISTANCE, target.distance + (enemy.retreatDistance || 30));
-    }
-    return;
-  }
-
-  // melee_aggressive (default): close the distance, attack every turn it's in range
-  if (target.distance > enemy.range) {
-    target.distance = Math.max(MIN_ENEMY_DISTANCE, target.distance - enemy.approachSpeed);
-    c.lastEnemyActionText = `${enemy.name} closes in`;
+// Which tile a non-adjacent enemy tries to step into to close the distance:
+// prefer the axis with the bigger gap first (a straighter approach), fall
+// back to the other axis if that step turns out to be blocked.
+function chooseEnemyStep(e, playerPos) {
+  const dx = playerPos.x - e.x;
+  const dy = playerPos.y - e.y;
+  const options = [];
+  const primary = Math.abs(dx) >= Math.abs(dy) ? 'x' : 'y';
+  if (primary === 'x') {
+    if (dx !== 0) options.push({ x: e.x + Math.sign(dx), y: e.y });
+    if (dy !== 0) options.push({ x: e.x, y: e.y + Math.sign(dy) });
   } else {
-    resolveEnemyAttackOn(player, c, target, equip, now);
+    if (dy !== 0) options.push({ x: e.x, y: e.y + Math.sign(dy) });
+    if (dx !== 0) options.push({ x: e.x + Math.sign(dx), y: e.y });
+  }
+  return options;
+}
+
+// Every still-living enemy takes its one action: attack if it's standing
+// next to the player (4-directional adjacency — no diagonal attacks, same
+// as the player can only bump-attack in straight lines), otherwise take one
+// step toward the player. Shared by both a fresh ambush's free first hit
+// and the normal end of a player turn.
+function resolveEnemyTurns(player, c, equip) {
+  c.lastEnemyActionTexts = [];
+  c.lastEnemyHits = [];
+  for (const e of c.enemies) {
+    if (e.hp <= 0 || c.playerHp <= 0) continue;
+    const dx = c.playerPos.x - e.x;
+    const dy = c.playerPos.y - e.y;
+    if (Math.abs(dx) + Math.abs(dy) === 1) {
+      resolveEnemyAttackOn(player, c, e, equip);
+      continue;
+    }
+    for (const step of chooseEnemyStep(e, c.playerPos)) {
+      if (step.x < 0 || step.y < 0 || step.x >= c.grid.width || step.y >= c.grid.height) continue;
+      if (isWall(c.grid, step.x, step.y)) continue;
+      if (step.x === c.playerPos.x && step.y === c.playerPos.y) continue; // never walk onto the player's own tile
+      if (enemyAt(c, step.x, step.y)) continue; // another enemy is already there
+      e.x = step.x;
+      e.y = step.y;
+      break;
+    }
   }
 }
 
-// One full combat round: the player acts once, then every living enemy
-// acts, then poison/DOT damage applies. DOT damage is per-round, not
-// per-second, so a faster combat speed just makes it play out quicker
-// on-screen without actually hitting harder.
-function resolveRound(player, c, equip, now) {
-  resolvePlayerTurn(player, c, equip, now);
-
-  for (const e of c.enemies) {
-    if (e.hp <= 0 || c.playerHp <= 0) continue;
-    enemyTakeTurn(player, c, e, equip, now);
-  }
-
+// DOT resolves once per afflicted target per turn. dps/roundsLeft are
+// damage-per-turn and turns-remaining, not real-time-scaled.
+function tickDots(c) {
   for (const e of c.enemies) {
     if (e.hp <= 0 || !e.dot) continue;
     e.hp = Math.max(0, e.hp - e.dot.dps);
@@ -2221,12 +2261,10 @@ function resolveRound(player, c, equip, now) {
     c.dotOnPlayer.roundsLeft -= 1;
     if (c.dotOnPlayer.roundsLeft <= 0) c.dotOnPlayer = null;
   }
-
-  c.round += 1;
 }
 
 // All enemies dead -> win (rewards summed across every enemy in the group);
-// player dead -> loss. Called after every resolved round.
+// player dead -> loss. Called after every resolved turn.
 function checkCombatEnd(player, c) {
   if (c.result) return;
   if (c.enemies.every((e) => e.hp <= 0)) {
@@ -2246,6 +2284,25 @@ function checkCombatEnd(player, c) {
       }
       player.killCounts[e.enemyId] = (player.killCounts[e.enemyId] || 0) + 1;
     }
+    // Area-tier bonus loot, on top of each individual enemy's own
+    // lootTable — see WORLD_TIERS. Gold rolls fold straight into totalGold;
+    // everything else adds to inventory/rewardLoot exactly like an enemy
+    // drop would, so the client's "found: X, Y, Z" victory line covers both
+    // sources with no special-casing.
+    const tierConfig = WORLD_TIERS[c.tier];
+    if (tierConfig) {
+      for (const drop of tierConfig.bonusLoot) {
+        if (Math.random() < drop.chance + lootChanceBonus) {
+          const amount = randInt(drop.amount[0], drop.amount[1]);
+          if (drop.item === 'gold') {
+            totalGold += amount;
+          } else {
+            player.inventory[drop.item] = (player.inventory[drop.item] || 0) + amount;
+            c.rewardLoot.push(drop.item);
+          }
+        }
+      }
+    }
     player.inventory.gold = (player.inventory.gold || 0) + totalGold;
     c.rewardGold = totalGold;
     player.combatRecord.wins += 1;
@@ -2255,26 +2312,62 @@ function checkCombatEnd(player, c) {
   }
 }
 
-// Plays out however many rounds should have happened since the last check,
-// based on real time passed — same idea as the gathering skills. Capped per
-// call so a player who was away a long time doesn't cause a huge loop; any
-// leftover rounds just play out on the next call.
-const COMBAT_ROUND_CAP = 500;
+// One log entry per resolved turn: text plus structured hit data
+// (playerHit/enemyHits — who got hit, how much, crit/dodge) so the client
+// can drive per-event animations instead of just displaying text, plus a
+// position/HP snapshot of everyone at that exact point so the grid and bars
+// land on the true value — see game.js's playCombatLog().
+function snapshotRound(c) {
+  return {
+    player: c.lastPlayerActionText,
+    playerHit: c.lastPlayerHit || null,
+    enemies: [...c.lastEnemyActionTexts],
+    enemyHits: [...c.lastEnemyHits],
+    playerHp: c.playerHp,
+    playerPos: { ...c.playerPos },
+    enemyPositions: c.enemies.map((e) => ({ uid: e.uid, x: e.x, y: e.y, hp: e.hp })),
+  };
+}
 
-function tickCombat(player) {
+// The rest of a turn once the player's side has already been applied
+// (move, attack, or item effect) — every enemy still living gets its one
+// response, DOT ticks, the turn counter advances, and win/loss is checked.
+// Shared by submitCombatMove()/submitCombatItemAction() since both end in
+// exactly this sequence — the only difference between them is what happens
+// on the player's side before this runs.
+function advanceRound(player, c, equip) {
+  resolveEnemyTurns(player, c, equip);
+  tickDots(c);
+  c.turn += 1;
+  checkCombatEnd(player, c);
+  return snapshotRound(c);
+}
+
+// The whole of a turn-based combat move, server-authoritative start to
+// finish: the player steps in a direction (moving, or attacking whatever's
+// in that tile), then every living enemy gets exactly one response — a
+// strict 1-for-1 exchange, never more than one enemy action per player
+// turn. Returns the full result immediately — no polling needed while the
+// player decides their next move, and nothing for a client to fake, since
+// the server is the only thing that ever runs this logic. A blocked move
+// (wall/edge) returns an error and consumes no turn at all.
+function submitCombatMove(playerId, direction) {
+  const player = getPlayer(playerId);
+  if (!player) return { error: 'not_found' };
   const c = player.combat;
-  if (!c || c.result) return;
-  const equip = getEquippedStats(player);
-  const now = Date.now();
+  if (!c) return { error: 'no_combat' };
+  if (c.result) return { error: 'combat_over' };
+  if (!COMBAT_DIRECTIONS[direction]) return { error: 'invalid_direction' };
 
-  let rounds = 0;
-  while (rounds < COMBAT_ROUND_CAP && !c.result && c.nextTickAt <= now) {
-    const roundNow = c.nextTickAt;
-    resolveRound(player, c, equip, roundNow);
-    checkCombatEnd(player, c);
-    c.nextTickAt = roundNow + c.tickIntervalSeconds * 1000;
-    rounds++;
-  }
+  const equip = getEquippedStats(player);
+  const moveResult = resolvePlayerMove(player, c, equip, direction);
+  if (moveResult.error) return { error: moveResult.error };
+  const round = advanceRound(player, c, equip);
+
+  // publicPlayer() saves once at the end (after also ticking resource
+  // tasks/expedition) — no separate save() here, so a single move never
+  // writes db.json twice.
+  return { ok: true, log: [round], player: publicPlayer(player) };
 }
 
 // How much xp it takes to go from `level` to `level+1`. Each level costs a
@@ -2332,8 +2425,6 @@ function publicPlayer(player) {
   for (const skillId of Object.keys(RESOURCE_NODES)) {
     tickResourceTask(player, skillId);
   }
-  tickExpedition(player);
-  tickCombat(player);
   save();
   const skills = {};
   for (const [id, skill] of Object.entries(player.skills)) {
@@ -2354,18 +2445,6 @@ function publicPlayer(player) {
     name: ITEMS[itemId].name,
     count,
   }));
-  let expedition = null;
-  if (player.expedition) {
-    const elapsedSeconds = (Date.now() - player.expedition.startedAt) / 1000;
-    expedition = {
-      path: player.expedition.path,
-      totalLength: player.expedition.totalLength,
-      durationSeconds: player.expedition.durationSeconds,
-      startedAt: player.expedition.startedAt,
-      fraction: Math.min(1, elapsedSeconds / player.expedition.durationSeconds),
-    };
-  }
-
   const equipStats = getEquippedStats(player);
   const equipment = {
     weapon: player.equipment.weapon ? { id: player.equipment.weapon, name: ITEMS[player.equipment.weapon].name } : null,
@@ -2377,8 +2456,9 @@ function publicPlayer(player) {
   if (player.combat) {
     const c = player.combat;
     const activeBuff = getActiveCombatBuff(c);
-    const armorBuffActive = getActiveArmorBuff(c);
     combat = {
+      grid: { width: c.grid.width, height: c.grid.height, walls: c.grid.walls },
+      playerPos: c.playerPos,
       enemies: c.enemies.map((e) => {
         const enemy = ENEMIES[e.enemyId];
         return {
@@ -2387,33 +2467,22 @@ function publicPlayer(player) {
           name: enemy.name,
           hp: e.hp,
           maxHp: e.maxHp,
-          distance: e.distance,
-          angle: e.angle,
           alive: e.hp > 0,
+          x: e.x,
+          y: e.y,
           dot: e.dot ? { type: e.dot.type } : null,
         };
       }),
       playerHp: c.playerHp,
       playerMaxHp: c.playerMaxHp,
-      maxDistance: MAX_DISTANCE,
-      meleeRange: MELEE_RANGE,
-      loadout: c.loadout.map((id) => (id ? { id, name: ABILITIES[id].name } : null)),
-      abilityCursor: c.abilityCursor,
-      castRoundsRemaining: c.castRoundsRemaining,
-      tickIntervalSeconds: c.tickIntervalSeconds,
-      nextTickAt: c.nextTickAt,
-      round: c.round,
+      turn: c.turn,
       result: c.result,
       rewardGold: c.rewardGold || 0,
       rewardLoot: (c.rewardLoot || []).map((itemId) => ({ id: itemId, name: ITEMS[itemId].name })),
       dotOnPlayer: c.dotOnPlayer ? { type: c.dotOnPlayer.type } : null,
       buff: activeBuff ? { type: activeBuff.type } : null,
-      armorBuffActive: !!armorBuffActive,
-      comboReady: !!c.pendingMeleeComboBuff,
-      hasteReady: !!c.pendingHasteBuff,
-      evasionActive: Date.now() < (c.evasionUntil || 0),
       lastPlayerActionText: c.lastPlayerActionText || '',
-      lastEnemyActionText: c.lastEnemyActionText || '',
+      lastEnemyActionTexts: c.lastEnemyActionTexts || [],
       ambush: !!c.ambush,
     };
   }
@@ -2500,8 +2569,8 @@ function publicPlayer(player) {
     discoveries: player.discoveries,
     inventory,
     skills,
-    expedition,
-    maxExplorationRange: (player.inventory.supplies || 0) * UNIT_LENGTH_PER_SUPPLY,
+    worldPos: player.worldPos,
+    revealedTiles: player.revealedTiles,
     equipment,
     combat,
     combatMaxHp: playerMaxHp(player),
@@ -2522,17 +2591,6 @@ function publicPlayer(player) {
       }),
       triedCount: player.alchemy.triedCombos.length,
     },
-    abilityLoadout: player.abilityLoadout,
-    combatSpeed: player.combatSpeed,
-    abilities: Object.entries(ABILITIES).map(([id, a]) => ({
-      id,
-      name: a.name,
-      description: a.description,
-      tags: a.tags,
-      castRounds: baseCastRounds(id), // rounds this ability occupies the player's turn for once queued — see resolvePlayerTurn()
-      unlockLevel: a.unlockLevel,
-      unlocked: a.unlockLevel <= levelFromXp(player.skills.combat.xp),
-    })),
     traits: player.traits,
     character: xpProgress(player.characterXp), // { level, xpIntoLevel, xpToNextLevel }
     traitPointsAvailable: player.traitPointsAvailable,
@@ -2554,76 +2612,6 @@ function publicPlayer(player) {
     scavengingNodes: publicResourceNodes(player, 'scavenging'),
     harvestingNodes: publicResourceNodes(player, 'harvesting'),
   };
-}
-
-// path: [{x, y}, ...] in percent-space, drawn by the player starting at
-// their current location. Supplies cap how far it's allowed to reach and
-// are spent proportionally to the length actually drawn (not the max).
-function startExpedition(playerId, path) {
-  const player = getPlayer(playerId);
-  if (!player) return { error: 'not_found' };
-  if (player.expedition) return { error: 'expedition_in_progress' };
-  if (player.combat && !player.combat.result) return { error: 'busy_fighting' };
-  if (!Array.isArray(path) || path.length < 2) return { error: 'invalid_path' };
-  // Every point must have real numeric x/y — this endpoint is open to the
-  // internet, and a bad point (e.g. a string, or missing x/y) would turn
-  // every length/cost calculation below into NaN, corrupting the player's
-  // supplies count permanently instead of just failing cleanly.
-  if (!path.every((p) => p && Number.isFinite(p.x) && Number.isFinite(p.y))) return { error: 'invalid_path' };
-
-  const supplies = player.inventory.supplies || 0;
-  if (supplies <= 0) return { error: 'no_supplies' };
-
-  let totalLength = 0;
-  for (let i = 1; i < path.length; i++) {
-    totalLength += Math.hypot(path[i].x - path[i - 1].x, path[i].y - path[i - 1].y);
-  }
-  if (totalLength <= 0) return { error: 'invalid_path' };
-
-  const maxLength = supplies * UNIT_LENGTH_PER_SUPPLY;
-  if (totalLength > maxLength + 0.01) return { error: 'path_too_long' };
-
-  const suppliesCost = Math.min(supplies, Math.max(1, Math.ceil(totalLength / UNIT_LENGTH_PER_SUPPLY)));
-  player.inventory.supplies = supplies - suppliesCost;
-
-  const triggers = [];
-  for (const loc of LOCATIONS) {
-    if (player.discoveries.includes(loc.id)) continue;
-    const { distance, arcLength } = closestPointOnPath(loc, path);
-    if (distance <= OVERLAP_THRESHOLD) {
-      triggers.push({ locationId: loc.id, fraction: arcLength / totalLength });
-    }
-  }
-  triggers.sort((a, b) => a.fraction - b.fraction);
-
-  stopAllSkillTasks(player); // only one task at a time — starting an expedition stops any active skill
-
-  const durationSeconds = Math.max(MIN_EXPEDITION_DURATION, totalLength / EXPEDITION_SPEED);
-  player.expedition = {
-    path,
-    totalLength,
-    durationSeconds,
-    startedAt: Date.now(),
-    triggers,
-  };
-  save();
-  return {
-    ok: true,
-    durationSeconds,
-    totalLength,
-    suppliesCost,
-    suppliesRemaining: player.inventory.supplies,
-    locationsFound: triggers.length,
-  };
-}
-
-function travel(playerId, locationId) {
-  const player = getPlayer(playerId);
-  if (!player) return { error: 'not_found' };
-  if (!player.discoveries.includes(locationId)) return { error: 'not_discovered' };
-  player.currentLocation = locationId;
-  save();
-  return { currentLocation: locationId };
 }
 
 function stopTask(playerId, skillId) {
@@ -2678,16 +2666,14 @@ function startCombat(playerId, enemyId) {
   const player = getPlayer(playerId);
   if (!player) return { error: 'not_found' };
   if (player.combat && !player.combat.result) return { error: 'combat_in_progress' };
-  if (player.expedition) return { error: 'busy_exploring' };
   const loc = getLocation(player.currentLocation);
-  if (!loc || !loc.combat || !loc.combat.includes(enemyId)) return { error: 'enemy_not_here' };
+  if (!loc || !loc.combat || !WORLD_TIERS[loc.tier].enemies.includes(enemyId)) return { error: 'enemy_not_here' };
   const enemy = ENEMIES[enemyId];
   if (!enemy) return { error: 'unknown_enemy' };
-  if (!player.abilityLoadout.some(Boolean)) return { error: 'no_abilities_equipped' };
 
   stopAllSkillTasks(player); // only one task at a time — starting a fight stops any active skill
   const group = rollEncounterGroup(loc, enemyId);
-  beginCombatInstance(player, group, false);
+  beginCombatInstance(player, group, false, loc.tier);
   save();
   return { ok: true };
 }
@@ -2703,44 +2689,6 @@ function endCombat(playerId) {
   return { ok: true };
 }
 
-// Saved as a preference for future fights, and also applies right away if a
-// fight is already happening.
-function setCombatSpeed(playerId, speed) {
-  const player = getPlayer(playerId);
-  if (!player) return { error: 'not_found' };
-  if (!COMBAT_SPEED_PRESETS[speed]) return { error: 'invalid_speed' };
-  player.combatSpeed = speed;
-  if (player.combat && !player.combat.result) {
-    player.combat.tickIntervalSeconds = COMBAT_SPEED_PRESETS[speed];
-    player.combat.nextTickAt = Date.now() + COMBAT_SPEED_PRESETS[speed] * 1000;
-  }
-  save();
-  return { ok: true };
-}
-
-function unlockedAbilityIds(player) {
-  const level = levelFromXp(player.skills.combat.xp);
-  return Object.entries(ABILITIES)
-    .filter(([, a]) => a.unlockLevel <= level)
-    .map(([id]) => id);
-}
-
-// You can't edit your loadout mid-fight — the fight already has its own
-// copy of it from when it started, so an edit here wouldn't affect the
-// current fight anyway.
-function setLoadoutSlot(playerId, slotIndex, abilityId) {
-  const player = getPlayer(playerId);
-  if (!player) return { error: 'not_found' };
-  if (player.combat && !player.combat.result) return { error: 'combat_in_progress' };
-  if (!Number.isInteger(slotIndex) || slotIndex < 0 || slotIndex >= 6) return { error: 'invalid_slot' };
-  if (abilityId !== null) {
-    if (!ABILITIES[abilityId]) return { error: 'unknown_ability' };
-    if (!unlockedAbilityIds(player).includes(abilityId)) return { error: 'not_unlocked' };
-  }
-  player.abilityLoadout[slotIndex] = abilityId;
-  save();
-  return { ok: true, loadout: player.abilityLoadout };
-}
 
 // --- character progression (traits + perks, see Character tab) ---
 
@@ -2892,37 +2840,55 @@ function craftKnownPotion(playerId, recipeId) {
 // enemy) — there's no persistent HP outside combat to heal in this game, so
 // usage is restricted to an active, unresolved fight rather than inventing a
 // resting-HP concept that doesn't exist anywhere else in the codebase.
-function usePotion(playerId, itemId) {
+// Using an item IS the player's turn (same as a move/attack), not a free
+// action available alongside one — same turn-resolution shape as
+// submitCombatMove (apply the player-side effect, then the enemies get
+// their turn, then DOT, then check for a result). A failed use (nothing to
+// cure, no valid target) returns an error before anything is consumed or
+// the enemies act — only a real action costs a turn.
+function submitCombatItemAction(playerId, itemId, targetUid) {
   const player = getPlayer(playerId);
   if (!player) return { error: 'not_found' };
   const item = ITEMS[itemId];
   if (!item || item.type !== 'potion') return { error: 'not_a_potion' };
   if ((player.inventory[itemId] || 0) < 1) return { error: 'not_owned' };
-  if (!player.combat || player.combat.result) return { error: 'not_in_combat' };
-
-  tickCombat(player); // resolve anything pending up to now before the potion lands
   const c = player.combat;
   if (!c || c.result) return { error: 'not_in_combat' };
 
   const effect = item.potionEffect;
+  c.lastPlayerHit = null; // structured version of lastPlayerActionText, for the client's hit animation — see snapshotRound()
   if (effect.kind === 'heal') {
+    const amount = Math.min(effect.amount, c.playerMaxHp - c.playerHp);
     c.playerHp = Math.min(c.playerMaxHp, c.playerHp + effect.amount);
+    c.lastPlayerActionText = `Used ${item.name} — restored ${effect.amount} HP`;
+    if (amount > 0) c.lastPlayerHit = { type: 'heal', amount };
   } else if (effect.kind === 'cure') {
     if (!c.dotOnPlayer) return { error: 'nothing_to_cure' };
     c.dotOnPlayer = null;
+    c.lastPlayerActionText = `Used ${item.name} — cured the affliction`;
   } else if (effect.kind === 'buff_damage') {
     c.buff = { type: 'damage', multiplier: effect.multiplier, expiresAt: Date.now() + effect.durationSeconds * 1000 };
+    c.lastPlayerActionText = `Used ${item.name} — damage boosted`;
   } else if (effect.kind === 'buff_speed') {
-    c.buff = { type: 'speed', multiplier: effect.multiplier, expiresAt: Date.now() + effect.durationSeconds * 1000 };
+    // See ITEMS.potion_of_swiftness — this is an evasion buff now, not a
+    // speed one; resolveEnemyAttackOn() reads it as a flat dodge-chance bonus.
+    c.buff = { type: 'evasion', multiplier: effect.multiplier, expiresAt: Date.now() + effect.durationSeconds * 1000 };
+    c.lastPlayerActionText = `Used ${item.name} — evasion boosted`;
   } else if (effect.kind === 'poison_enemy') {
-    const target = pickTarget(c);
+    const target = pickTarget(c, targetUid);
     if (!target) return { error: 'no_target' };
     target.dot = { type: 'venom', dps: effect.dps, roundsLeft: effect.duration };
+    c.lastPlayerActionText = `Used ${item.name} on ${ENEMIES[target.enemyId].name}`;
+    c.lastPlayerHit = { type: 'debuff', targetUid: target.uid };
   }
 
-  spendItem(player, itemId, 1);
-  save();
-  return { ok: true, effect: effect.kind };
+  player.inventory[itemId] -= 1;
+  if (player.inventory[itemId] <= 0) delete player.inventory[itemId];
+
+  const equip = getEquippedStats(player);
+  const round = advanceRound(player, c, equip);
+
+  return { ok: true, log: [round], player: publicPlayer(player) };
 }
 
 // --- farming (animals) ---
@@ -3084,7 +3050,7 @@ function buyLocationReveal(playerId) {
 
   const found = undiscovered[Math.floor(Math.random() * undiscovered.length)];
   player.inventory.gold = gold - LOCATION_REVEAL_PRICE;
-  discoverLocation(player, found.id); // grants character xp same as a free expedition find
+  discoverLocation(player, found.id); // grants character xp same as walking up to it for free
   save();
   return { ok: true, location: found, goldRemaining: player.inventory.gold };
 }
@@ -3130,9 +3096,10 @@ function devResetPlayer(playerId) {
   const startLoc = LOCATIONS.find((l) => l.startingLocation);
 
   player.currentLocation = startLoc.id;
+  player.worldPos = { x: startLoc.gx, y: startLoc.gy };
+  player.revealedTiles = [`${startLoc.gx},${startLoc.gy}`];
   player.discoveries = [startLoc.id];
   player.inventory = { supplies: STARTER_SUPPLIES, gold: 20 };
-  player.expedition = null;
   player.equipment = { weapon: null, armor: null };
   player.combat = null;
   player.garden = { plots: new Array(GARDEN_PLOT_COUNT).fill(null) };
@@ -3148,7 +3115,6 @@ function devResetPlayer(playerId) {
   player.combatRecord = { wins: 0, losses: 0 };
   player.lastRareEvent = null;
   player.alchemy = { knownRecipes: [], triedCombos: [] };
-  player.abilityLoadout = [...DEFAULT_ABILITY_LOADOUT];
   // Deliberately NOT reset: traits/characterXp/traitPointsAvailable/
   // perkPoints/perks. Those represent the chosen character build, not
   // explore/economy state — dev.reset() is for repeat-testing exploration
@@ -3160,9 +3126,11 @@ function devResetPlayer(playerId) {
 
 module.exports = {
   LOCATIONS,
+  WORLD_TIERS,
+  WORLD_WIDTH,
+  WORLD_HEIGHT,
   ITEMS,
   ENEMIES,
-  ABILITIES,
   PLANTS,
   RECIPES,
   ANIMAL_SPECIES,
@@ -3184,8 +3152,7 @@ module.exports = {
   verifyToken,
   getPlayer,
   publicPlayer,
-  startExpedition,
-  travel,
+  moveOnWorldGrid,
   stopTask,
   attemptFishingCatch,
   startResourceTask,
@@ -3193,14 +3160,13 @@ module.exports = {
   unequipItem,
   startCombat,
   endCombat,
-  setCombatSpeed,
-  setLoadoutSlot,
+  submitCombatMove,
+  submitCombatItemAction,
   plantSeed,
   harvestPlot,
   craftItem,
   experimentAlchemy,
   craftKnownPotion,
-  usePotion,
   buyAnimal,
   collectAnimal,
   buildBuilding,

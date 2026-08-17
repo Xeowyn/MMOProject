@@ -8,7 +8,7 @@ echo Waiting a few seconds for the server to come up...
 timeout /t 4 /nobreak >nul
 
 echo Starting the Cloudflare Tunnel (this makes your game reachable from the internet)...
-start "MMOProject Tunnel - SHARE THIS URL" cmd /k "tools\cloudflared.exe tunnel --url http://localhost:3000"
+start "MMOProject Tunnel - SHARE THIS URL" cmd /k "tools\cloudflared.exe tunnel --url http://localhost:3002"
 
 echo.
 echo Two windows just opened:

@@ -196,7 +196,7 @@ describe('token authentication', () => {
 
   test('a POST action without a token is rejected the same way', async () => {
     const { id } = await createTestPlayer();
-    const { status, body } = await post('/api/travel', { playerId: id, locationId: 'wanderers_camp' });
+    const { status, body } = await post('/api/world/move', { playerId: id, direction: 'up' });
     assert.equal(status, 401);
     assert.equal(body.error, 'invalid_token');
   });
@@ -267,8 +267,8 @@ describe('gameplay endpoints via HTTP', () => {
 });
 
 describe('missing/empty input', () => {
-  test('POST /api/travel with no playerId at all is a clean 400, not a crash', async () => {
-    const res = await post('/api/travel', { locationId: 'wanderers_camp' });
+  test('POST /api/world/move with no playerId at all is a clean 400, not a crash', async () => {
+    const res = await post('/api/world/move', { direction: 'up' });
     assert.equal(res.status, 400);
     assert.equal(res.body.error, 'not_found');
   });
@@ -300,7 +300,7 @@ describe('missing/empty input', () => {
 
 describe('input edge cases', () => {
   test('a POST with no body at all does not crash the server', async () => {
-    const res = await fetch(baseUrl + '/api/travel', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+    const res = await fetch(baseUrl + '/api/world/move', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
     assert.ok(res.status >= 400 && res.status < 500);
     // the server must still be answering after this
     const stillAlive = await api('/api/locations');
@@ -308,7 +308,7 @@ describe('input edge cases', () => {
   });
 
   test('malformed JSON body does not crash the server', async () => {
-    const res = await fetch(baseUrl + '/api/travel', {
+    const res = await fetch(baseUrl + '/api/world/move', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: '{not valid json',

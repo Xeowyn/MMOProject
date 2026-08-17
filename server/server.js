@@ -3,7 +3,7 @@ const express = require('express');
 const { WebSocketServer } = require('ws');
 const store = require('./store');
 
-const PORT = process.env.PORT || 3000;
+const PORT = 3002; // permanent port for this app — LAN players and start-playtest.bat both rely on this staying fixed; kept off 3000/3001 to avoid colliding with other local projects
 
 // Same reasoning as store.js's BASE_DIR: a packaged .exe needs to find
 // public/ next to itself on disk, not inside its own read-only snapshot.
@@ -39,12 +39,15 @@ app.use(
   })
 );
 
-// Simple per-IP rate limit — protects against a broken client or someone
-// hammering the API once the link is shared over the internet. The limit is
-// generous: normal play sends way fewer requests than this, so it should
-// only ever trip on something clearly wrong.
-// cf-connecting-ip is the real visitor IP that Cloudflare Tunnel forwards
-// (req.ip would just be the tunnel itself).
+// Coarse per-IP rate limit — insurance against a runaway client loop or
+// someone hammering the API once the link is shared over the open internet,
+// not fine-grained throttling. Generous on purpose: an auto-walk across the
+// overworld fires one /api/world/move per tile every ~150ms (worst case a
+// few requests/second); combat has no polling at all (one request per
+// chosen move/item, result included in the response), so this only ever
+// trips on something clearly abnormal.
+// cf-connecting-ip is what Cloudflare Tunnel forwards as the real client IP
+// (req.ip would otherwise be the tunnel's local loopback for every request).
 const RATE_LIMIT_WINDOW_MS = 10000;
 const RATE_LIMIT_MAX = 300;
 const rateLimitBuckets = new Map(); // ip -> {count, windowStart}
@@ -91,10 +94,14 @@ app.get('/api/locations', (req, res) => {
     store.LOCATIONS.map((l) => ({
       id: l.id,
       name: l.name,
-      x: l.x,
-      y: l.y,
+      x: l.gx,
+      y: l.gy,
+      tier: l.tier,
       skill: l.skill || null,
-      combat: l.combat || null,
+      // combat is now just "does a fight happen here" — the actual roster
+      // is rolled from the location's tier (see /api/world-tiers), not a
+      // fixed per-location list, so the true enemy pool isn't in this array.
+      combat: !!l.combat,
       tavern: l.tavern || false,
       // loot is granted automatically the moment a location is discovered
       // (see discoverLocation() in store.js) — not a hidden roll, so it's
@@ -102,6 +109,15 @@ app.get('/api/locations', (req, res) => {
       loot: l.loot ? { item: l.loot.item, itemName: store.ITEMS[l.loot.item].name, amount: l.loot.amount } : null,
     }))
   );
+});
+
+// Tier -> enemy pool only (dungeon-size/wall-chance/bonus-loot ranges stay
+// server-only) — drives the Combat tab's idle "who can I fight here" list
+// and lets the client show the right enemy icons for a given location's tier.
+app.get('/api/world-tiers', (req, res) => {
+  const trimmed = {};
+  for (const [tier, cfg] of Object.entries(store.WORLD_TIERS)) trimmed[tier] = { enemies: cfg.enemies };
+  res.json(trimmed);
 });
 
 app.get('/api/enemies', (req, res) => res.json(store.ENEMIES));
@@ -144,14 +160,19 @@ app.get('/api/me', (req, res) => {
   res.json(store.publicPlayer(player));
 });
 
-app.post('/api/expedition/start', (req, res) => {
-  const result = store.startExpedition(req.body.playerId, req.body.path);
-  if (result.error) return res.status(400).json(result);
-  res.json(result);
+// Static grid dimensions the client needs to render the overworld viewport
+// and know how "very very large" the world actually is — fetched once at
+// startup, same idea as /api/trait-config.
+app.get('/api/world-info', (req, res) => {
+  res.json({ width: store.WORLD_WIDTH, height: store.WORLD_HEIGHT });
 });
 
-app.post('/api/travel', (req, res) => {
-  const result = store.travel(req.body.playerId, req.body.locationId);
+// One tile, one supply, every time — see moveOnWorldGrid() in store.js.
+// currentLocation can change as a side effect of a move (walking onto or
+// off of a named tile), so this re-broadcasts presence exactly like the old
+// /api/travel did.
+app.post('/api/world/move', (req, res) => {
+  const result = store.moveOnWorldGrid(req.body.playerId, req.body.direction);
   if (result.error) return res.status(400).json(result);
   broadcastPresence();
   res.json(result);
@@ -215,14 +236,13 @@ app.post('/api/combat/end', (req, res) => {
   res.json(result);
 });
 
-app.post('/api/combat/speed', (req, res) => {
-  const result = store.setCombatSpeed(req.body.playerId, req.body.speed);
-  if (result.error) return res.status(400).json(result);
-  res.json(result);
-});
-
-app.post('/api/loadout/set', (req, res) => {
-  const result = store.setLoadoutSlot(req.body.playerId, req.body.slotIndex, req.body.abilityId);
+// Turn-based grid combat: one direction per call — moves the player, or
+// attacks whatever enemy is standing in that tile — fully resolved and
+// returned in the same response (including the fresh player snapshot) so
+// the client never needs a follow-up /api/me poll while a fight is in
+// progress.
+app.post('/api/combat/move', (req, res) => {
+  const result = store.submitCombatMove(req.body.playerId, req.body.direction);
   if (result.error) return res.status(400).json(result);
   res.json(result);
 });
@@ -257,8 +277,11 @@ app.post('/api/alchemy/craft', (req, res) => {
   res.json(result);
 });
 
-app.post('/api/potion/use', (req, res) => {
-  const result = store.usePotion(req.body.playerId, req.body.itemId);
+// Using an item is a full turn, not a free action — see
+// submitCombatItemAction() for why this shares the same turn-resolution
+// shape as /api/combat/move.
+app.post('/api/combat/item', (req, res) => {
+  const result = store.submitCombatItemAction(req.body.playerId, req.body.itemId, req.body.targetUid);
   if (result.error) return res.status(400).json(result);
   res.json(result);
 });

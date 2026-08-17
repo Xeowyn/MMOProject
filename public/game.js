@@ -19,15 +19,14 @@ const state = {
   player: null,
   locations: [],
   others: [], // [{id, username, locationId}]
-  markers: [], // hit-test cache: [{x, y, r, locationId}] in canvas pixel space
   clockSync: {}, // { [skillId]: { progressSeconds, cycleSeconds, active, syncedAt } }
-  expeditionSync: null, // { path, totalLength, durationSeconds, startedAt } — fixed anchor, set once per expedition
-  drawMode: false,
-  isDrawing: false,
-  drawPath: [], // percent-space points while actively dragging out a route
-  drawLength: 0,
+  worldInfo: { width: 0, height: 0 }, // fetched once, see /api/world-info
+  worldWalking: false, // true while a confirmed route is being walked — blocks overlapping walks
+  worldZoomIndex: 1, // index into WORLD_ZOOM_LEVELS, matches WORLD_DEFAULT_ZOOM_INDEX
+  worldPendingPath: null, // [{x,y}, ...] a clicked-out route awaiting Confirm/Cancel, not yet walked
   itemsMeta: {},
   enemiesMeta: {},
+  worldTiers: {}, // { [tier]: { enemies: [...] } } — which enemies can appear at each area tier, see /api/world-tiers
   plantsMeta: {},
   recipesMeta: [],
   animalSpeciesMeta: {},
@@ -43,43 +42,19 @@ const state = {
   tavernMessages: [],
   tavernLocationId: null, // which tavern's history is currently loaded, so it's only fetched once per location change
   selectedSeed: null, // plantId currently picked in the Gardening tab's seed-then-click-plots flow
-  selectedAbility: null, // ability id (or CLEAR_SLOT_SENTINEL) currently picked in the Combat tab's sidebar-then-click-slots flow
+  combatActionPending: false, // true while a submitted move/item's response hasn't landed yet — blocks double-submit
+  combatLog: [], // [{player, playerHit, enemies, enemyHits, playerHp, playerPos, enemyPositions}] turn-by-turn result from the fight so far
+  combatItemMenuOpen: false, // true while the potion list is showing instead of the flee/item buttons
+  combatLogSidebarOpen: false, // whether the full text log panel is expanded (grid + flashes are the primary feedback, this is opt-in detail)
   lastSeenRareEventAt: null, // dedupes lastRareEvent across polls, same idea as the discovery-array diff
   traitConfig: null, // { keys, base, min, max, extraPoints } — fetched once, drives the character-creation screen
   creationTraits: null, // { strength, dexterity, luck, vigor } while allocating on the creation screen
   creationUsername: null,
   perksMeta: {}, // static perk definitions, keyed by id (tier/requiresLevel/cost) — merged with player.perks' per-player unlocked/levelMet flags
-  camera: { x: 50, y: 50, zoom: 1 }, // percent-space camera center + zoom (1 = whole map visible, up to CAMERA_MAX_ZOOM)
-  isPanning: false,
-  panStart: null, // { clientX, clientY, camX, camY }
-  wasPanning: false, // suppresses the click-to-travel handler right after a pan drag
-  pinch: null, // { startDist, startZoom } while a two-finger touch gesture is active
 };
-
-const CAMERA_MAX_ZOOM = 20;
-
-// Converts between pixels on screen and the map's underlying 0-100 percent
-// coordinates. The map data itself never changes — the camera just zooms
-// and pans how it's drawn, so all the server's distance math still works
-// with the real coordinates underneath.
-function pixelToPercent(px, py) {
-  const viewSize = 100 / state.camera.zoom;
-  const left = state.camera.x - viewSize / 2;
-  const top = state.camera.y - viewSize / 2;
-  return { x: left + (px / canvas.width) * viewSize, y: top + (py / canvas.height) * viewSize };
-}
-
-function percentToPixel(x, y) {
-  const viewSize = 100 / state.camera.zoom;
-  const left = state.camera.x - viewSize / 2;
-  const top = state.camera.y - viewSize / 2;
-  return { x: ((x - left) / viewSize) * canvas.width, y: ((y - top) / viewSize) * canvas.height };
-}
 
 const loginScreen = document.getElementById('login-screen');
 const gameScreen = document.getElementById('game-screen');
-const canvas = document.getElementById('map-canvas');
-const ctx = canvas.getContext('2d');
 
 function showError(text) {
   const el = document.getElementById('error-banner');
@@ -183,7 +158,7 @@ async function showCreationScreen(username) {
 const TRAIT_DISPLAY_NAMES = { strength: 'Strength', dexterity: 'Dexterity', luck: 'Luck', vigor: 'Vigor' };
 const TRAIT_DESCRIPTIONS = {
   strength: 'Increases melee damage.',
-  dexterity: 'Increases ability speed, crit chance, and dodge chance.',
+  dexterity: 'Increases attack damage, crit chance, and dodge chance.',
   luck: 'Increases crit chance, loot chance, and gather success chance.',
   vigor: 'Increases max HP.',
 };
@@ -257,8 +232,10 @@ async function enterGame() {
   document.getElementById('player-name').textContent = state.player.username;
 
   state.locations = await api('/api/locations');
+  state.worldInfo = await api('/api/world-info');
   state.itemsMeta = await api('/api/items');
   state.enemiesMeta = await api('/api/enemies');
+  state.worldTiers = await api('/api/world-tiers');
   state.plantsMeta = await api('/api/plants');
   state.recipesMeta = await api('/api/recipes');
   state.animalSpeciesMeta = await api('/api/animal-species');
@@ -281,13 +258,58 @@ async function enterGame() {
   // per-skill Skills-tab cards were), so its one-off Catch button is wired
   // here rather than inside a build function.
   document.getElementById('fishing-catch-btn').addEventListener('click', attemptFishingCatch);
-  document.getElementById('explore-btn').addEventListener('click', toggleDrawMode);
-  document.getElementById('confirm-btn').addEventListener('click', confirmDrawnPath);
-  document.getElementById('cancel-btn').addEventListener('click', cancelDrawnPath);
   document.getElementById('unequip-weapon-btn').addEventListener('click', () => unequipSlot('weapon'));
   document.getElementById('unequip-armor-btn').addEventListener('click', () => unequipSlot('armor'));
   document.getElementById('flee-btn').addEventListener('click', endCombat);
   document.getElementById('combat-continue-btn').addEventListener('click', endCombat);
+  document.getElementById('combat-log-toggle').addEventListener('click', () => {
+    state.combatLogSidebarOpen = !state.combatLogSidebarOpen;
+    renderCombatTab();
+  });
+  document.getElementById('item-btn').addEventListener('click', () => {
+    state.combatItemMenuOpen = !state.combatItemMenuOpen;
+    renderCombatTab();
+  });
+  for (const btn of document.querySelectorAll('.dpad-btn[data-dir]')) {
+    btn.addEventListener('click', () => submitCombatMove(btn.dataset.dir));
+  }
+  for (const btn of document.querySelectorAll('.dpad-btn[data-wdir]')) {
+    btn.addEventListener('click', () => submitWorldMove(btn.dataset.wdir));
+  }
+  document.getElementById('world-confirm-btn').addEventListener('click', confirmWorldPath);
+  document.getElementById('world-cancel-btn').addEventListener('click', cancelWorldPath);
+  document.getElementById('world-zoom-in-btn').addEventListener('click', zoomWorldIn);
+  document.getElementById('world-zoom-out-btn').addEventListener('click', zoomWorldOut);
+  // { passive: false } so preventDefault() can actually stop the page from
+  // scrolling while the player scrolls over the map to zoom it instead.
+  document.getElementById('world-grid-wrap').addEventListener(
+    'wheel',
+    (e) => {
+      e.preventDefault();
+      if (e.deltaY < 0) zoomWorldIn();
+      else if (e.deltaY > 0) zoomWorldOut();
+    },
+    { passive: false }
+  );
+  // Arrow keys/WASD: move in an active fight if the Combat tab is open,
+  // otherwise walk the overworld if the Overworld tab is open — ignored
+  // while typing in any text field (e.g. tavern chat) so this can't hijack
+  // normal typing.
+  document.addEventListener('keydown', (e) => {
+    if (!state.player) return;
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    const key = e.key.toLowerCase();
+    const direction = { arrowup: 'up', w: 'up', arrowdown: 'down', s: 'down', arrowleft: 'left', a: 'left', arrowright: 'right', d: 'right' }[key];
+    if (!direction) return;
+    if (state.player.combat && !state.player.combat.result && !document.getElementById('tab-combat').classList.contains('hidden')) {
+      e.preventDefault();
+      submitCombatMove(direction);
+    } else if (!state.player.combat && !document.getElementById('tab-overworld').classList.contains('hidden')) {
+      e.preventDefault();
+      submitWorldMove(direction);
+    }
+  });
   document.getElementById('buy-location-btn').addEventListener('click', buyLocationReveal);
   document.getElementById('alchemy-experiment-btn').addEventListener('click', runExperiment);
   document.getElementById('alchemy-ingredient-a').addEventListener('change', renderAlchemyTab);
@@ -305,24 +327,6 @@ async function enterGame() {
     socket.send(JSON.stringify({ type: 'chat', playerId: state.playerId, text }));
     input.value = '';
   });
-  canvas.addEventListener('click', onCanvasClick);
-  canvas.addEventListener('mousedown', onCanvasMouseDown);
-  canvas.addEventListener('mousemove', onCanvasMouseMove);
-  window.addEventListener('mouseup', onCanvasMouseUp);
-  canvas.addEventListener('wheel', onCanvasWheel, { passive: false });
-  // touch: { passive: false } so preventDefault() can actually stop the page
-  // from scrolling/zooming while a finger is on the map. Unlike mouse events,
-  // touchend keeps firing on the element a touch started on even if the
-  // finger drifts elsewhere first, so (unlike mouseup) canvas itself is the
-  // right place to listen, not window.
-  canvas.addEventListener('touchstart', onCanvasTouchStart, { passive: false });
-  canvas.addEventListener('touchmove', onCanvasTouchMove, { passive: false });
-  canvas.addEventListener('touchend', onCanvasTouchEnd, { passive: false });
-  canvas.addEventListener('touchcancel', onCanvasTouchEnd, { passive: false });
-  document.getElementById('zoom-in-btn').addEventListener('click', () => zoomCamera(1.5));
-  document.getElementById('zoom-out-btn').addEventListener('click', () => zoomCamera(1 / 1.5));
-  document.getElementById('center-btn').addEventListener('click', centerCameraOnPlayer);
-
   render();
 }
 
@@ -338,31 +342,29 @@ function setupTabs() {
   });
 }
 
-// Polls faster while a fight or an expedition is active. Combat attack
-// speeds (1-2.5s) are faster than the normal 2s poll, so combat needs
-// tighter sync or the on-screen attack timers visibly lag. Expeditions are
-// often even shorter (as little as ~2s) — at the normal poll rate the whole
-// trip could complete between two polls, and every location it found would
-// appear to be revealed all at once instead of one by one as the sweep
-// actually passes over each one.
+// Combat and overworld movement both need no fast polling at all: nothing
+// changes server-side between player actions, and each submitted move/action
+// already returns the fresh state directly (see submitWorldMove()/
+// submitCombatMove()), so this normal-rate poll is only ever a fallback
+// (e.g. picking up a hunting-ambush fight nobody clicked into, or another
+// player's presence) rather than how the active UI actually stays in sync.
 function scheduleNextPoll() {
-  const inCombat = state.player && state.player.combat && !state.player.combat.result;
-  const exploring = state.player && state.player.expedition;
-  const delay = inCombat || exploring ? 300 : 2000;
   setTimeout(async () => {
     await refreshMe();
     scheduleNextPoll();
-  }, delay);
+  }, 2000);
 }
 
-async function refreshMe() {
+// Shared "a fresh player snapshot just arrived" handling — used by both
+// refreshMe()'s poll and every direct action response (world move/combat
+// move already hand back the updated player instead of making the caller
+// wait for the next poll) so discovery popups/ambush toasts/rare-event
+// popups/clock sync all fire immediately regardless of which path produced
+// the new data, not just on the next 2s poll.
+function applyPlayerSnapshot(newPlayer) {
   const previousDiscoveries = new Set(state.player ? state.player.discoveries : []);
   const wasInCombat = !!(state.player && state.player.combat);
-  try {
-    state.player = await api(`/api/me?playerId=${state.playerId}`);
-  } catch {
-    return;
-  }
+  state.player = newPlayer;
 
   const newlyDiscovered = state.player.discoveries
     .filter((id) => !previousDiscoveries.has(id))
@@ -399,29 +401,17 @@ async function refreshMe() {
       : { progressSeconds: 0, cycleSeconds: 1, active: false, syncedAt: now };
   }
 
-  // Save the expedition's startedAt/durationSeconds once, the first time we
-  // see it, and never update it from later polls. If we recalculated it on
-  // every poll instead, small delays would build up over time and the
-  // progress line could end up lagging behind where the server really is.
-  if (state.player.expedition) {
-    const exp = state.player.expedition;
-    if (!state.expeditionSync || state.expeditionSync.startedAt !== exp.startedAt) {
-      state.expeditionSync = {
-        path: exp.path,
-        totalLength: exp.totalLength,
-        durationSeconds: exp.durationSeconds,
-        startedAt: exp.startedAt,
-      };
-    }
-  } else if (state.expeditionSync) {
-    // Server says it's done — but let the local animation actually finish
-    // reaching 100% before clearing, rather than cutting it off the instant
-    // this poll landed (which is exactly the premature-disappearance bug).
-    const localFraction = (Date.now() - state.expeditionSync.startedAt) / 1000 / state.expeditionSync.durationSeconds;
-    if (localFraction >= 1) {
-      state.expeditionSync = null;
-    }
+  render();
+}
+
+async function refreshMe() {
+  let newPlayer;
+  try {
+    newPlayer = await api(`/api/me?playerId=${state.playerId}`);
+  } catch {
+    return;
   }
+  applyPlayerSnapshot(newPlayer);
 
   // Tavern chat history is only fetched once per tavern entered (not on
   // every poll) — new messages after that arrive live over the socket.
@@ -439,8 +429,6 @@ async function refreshMe() {
   } else {
     state.tavernLocationId = null;
   }
-
-  render();
 }
 
 // Popups (not toasts) for newly discovered locations, per the original
@@ -483,253 +471,288 @@ function showRareEventPopup(event) {
   document.getElementById('rare-event-modal').classList.remove('hidden');
 }
 
-function toggleDrawMode() {
-  if (state.player.expedition) return; // button should already be disabled in this case
-  if (state.drawMode) {
-    console.log('[explore] exiting draw mode via toggle');
-    exitDrawMode();
-    return;
-  }
-  if ((state.player.maxExplorationRange || 0) <= 0) {
-    console.log('[explore] blocked — no supplies (maxExplorationRange <= 0)');
-    showToast('Not enough supplies to explore.');
-    return;
-  }
-  console.log('[explore] entering draw mode, maxRange =', state.player.maxExplorationRange);
-  state.drawMode = true;
-  canvas.classList.add('draw-mode');
-  document.getElementById('draw-hint').classList.remove('hidden');
+// --- overworld tab: a very large grid the player walks around on ---
+//
+// Each tile is either empty (plain floor) or a named location, hidden until
+// discovered. A tile is only ever discovered by physically stepping onto
+// it — no field-of-view radius, no free peek at what's nearby — and once
+// revealed it stays revealed forever (player.revealedTiles only ever
+// grows), classic-roguelike "explored map" style. Re-walking any already-
+// revealed tile is free; stepping onto genuinely new ground costs 1
+// supplies (see moveOnWorldGrid() server-side) — supplies are the cost of
+// pushing the frontier outward, not of moving in general. The viewport
+// fills the whole overworld screen, centered on the player and zoomable
+// (more tiles visible = more of the world at once, each tile smaller), same
+// visual language as the Combat tab's grid. Clicking a tile previews the
+// route there (highlighted, not yet taken) and needs an explicit Confirm
+// before the player actually walks it — dpad/keyboard moves stay instant,
+// single-tile nudges with no confirm step.
+
+const WORLD_DIRS = {
+  up: { dx: 0, dy: -1 },
+  down: { dx: 0, dy: 1 },
+  left: { dx: -1, dy: 0 },
+  right: { dx: 1, dy: 0 },
+};
+
+// Each entry is how many tiles are visible at once (w x h) — more tiles
+// visible = zoomed out (each individually smaller, since the viewport
+// always stretches to fill the whole screen either way), fewer = zoomed in.
+// Index 1 is the default, matching the original fixed 15x11 viewport size.
+const WORLD_ZOOM_LEVELS = [
+  { w: 9, h: 7 },
+  { w: 15, h: 11 },
+  { w: 21, h: 15 },
+  { w: 29, h: 21 },
+];
+const WORLD_DEFAULT_ZOOM_INDEX = 1;
+
+function currentWorldViewport() {
+  return WORLD_ZOOM_LEVELS[state.worldZoomIndex];
+}
+
+function zoomWorldIn() {
+  state.worldZoomIndex = Math.max(0, state.worldZoomIndex - 1);
   render();
 }
 
-function exitDrawMode() {
-  state.drawMode = false;
-  state.isDrawing = false;
-  state.drawPath = [];
-  state.drawLength = 0;
-  canvas.classList.remove('draw-mode');
-  document.getElementById('draw-hint').classList.add('hidden');
+function zoomWorldOut() {
+  state.worldZoomIndex = Math.min(WORLD_ZOOM_LEVELS.length - 1, state.worldZoomIndex + 1);
   render();
 }
 
-// --- map camera: pan (click-drag) + zoom (wheel/buttons) ---
-// Only active outside draw mode — while drawing an expedition route,
-// mousedown/move/up already mean "draw the path", so panning would collide
-// with that. A plain click (no real drag) still falls through to
-// onCanvasClick for travel — wasPanning distinguishes the two.
-
-function zoomCamera(factor) {
-  state.camera.zoom = Math.min(CAMERA_MAX_ZOOM, Math.max(1, state.camera.zoom * factor));
+function isWorldMoveBlocked(direction) {
+  const delta = WORLD_DIRS[direction];
+  const nx = state.player.worldPos.x + delta.dx;
+  const ny = state.player.worldPos.y + delta.dy;
+  return nx < 0 || ny < 0 || nx >= state.worldInfo.width || ny >= state.worldInfo.height;
 }
 
-function clampCamera() {
-  state.camera.x = Math.min(100, Math.max(0, state.camera.x));
-  state.camera.y = Math.min(100, Math.max(0, state.camera.y));
-}
-
-function centerCameraOnPlayer() {
-  const loc = state.locations.find((l) => l.id === state.player.currentLocation);
-  if (loc) {
-    state.camera.x = loc.x;
-    state.camera.y = loc.y;
-  }
-}
-
-function onCanvasWheel(e) {
-  e.preventDefault();
-  zoomCamera(e.deltaY < 0 ? 1.15 : 1 / 1.15);
-}
-
-// clientX/clientY-based versions of the pointer-down/move/up logic, shared
-// between mouse events and single-finger touch events (a finger and a mouse
-// cursor are the same "one point moving across the canvas" input as far as
-// pan/draw/tap care — only how the coordinates are read differs).
-function handlePointerDown(clientX, clientY) {
-  if (!state.drawMode) {
-    state.isPanning = true;
-    state.wasPanning = false;
-    state.panStart = { clientX, clientY, camX: state.camera.x, camY: state.camera.y };
-    return;
-  }
-  const currentLoc = state.locations.find((l) => l.id === state.player.currentLocation);
-  if (!currentLoc) {
-    console.warn('[explore] pointerdown: could not find current location', state.player.currentLocation);
-    return;
-  }
-  console.log('[explore] pointerdown — starting path at', currentLoc.name);
-  state.isDrawing = true;
-  state.drawPath = [{ x: currentLoc.x, y: currentLoc.y }];
-  state.drawLength = 0;
-  render();
-}
-
-function handlePointerMove(clientX, clientY) {
-  if (!state.drawMode) {
-    if (!state.isPanning) return;
-    const rect = canvas.getBoundingClientRect();
-    const dxPixel = clientX - state.panStart.clientX;
-    const dyPixel = clientY - state.panStart.clientY;
-    if (Math.hypot(dxPixel, dyPixel) > 3) state.wasPanning = true;
-    const viewSize = 100 / state.camera.zoom;
-    const dxPercent = (dxPixel / rect.width) * viewSize;
-    const dyPercent = (dyPixel / rect.height) * viewSize;
-    state.camera.x = state.panStart.camX - dxPercent;
-    state.camera.y = state.panStart.camY - dyPercent;
-    clampCamera();
-    return;
-  }
-  if (!state.isDrawing) return;
-  const rect = canvas.getBoundingClientRect();
-  const scaleX = canvas.width / rect.width;
-  const scaleY = canvas.height / rect.height;
-  const px = (clientX - rect.left) * scaleX;
-  const py = (clientY - rect.top) * scaleY;
-  const point = pixelToPercent(px, py);
-
-  const last = state.drawPath[state.drawPath.length - 1];
-  const segLength = Math.hypot(point.x - last.x, point.y - last.y);
-  const MIN_STEP = 0.4; // percent-units, avoids flooding the path with points
-  if (segLength < MIN_STEP) return;
-
-  const maxLength = state.player.maxExplorationRange;
-  if (state.drawLength + segLength > maxLength) {
-    const remaining = Math.max(0, maxLength - state.drawLength);
-    if (remaining <= 0) return; // already at max range, ignore further movement
-    const ratio = remaining / segLength;
-    state.drawPath.push({ x: last.x + (point.x - last.x) * ratio, y: last.y + (point.y - last.y) * ratio });
-    state.drawLength = maxLength;
-    return;
-  }
-
-  state.drawPath.push(point);
-  state.drawLength += segLength;
-}
-
-// Releasing the pointer just stops the drag — the drawn route stays on
-// screen until the player explicitly confirms or cancels it, so there's
-// no window where the line silently disappears before anything happens.
-function handlePointerUp() {
-  if (state.isPanning) {
-    state.isPanning = false;
-  }
-  if (!state.drawMode || !state.isDrawing) {
-    return;
-  }
-  state.isDrawing = false;
-  console.log('[explore] pointerup — path points:', state.drawPath.length, 'length:', state.drawLength.toFixed(2));
-  if (state.drawPath.length < 2 || state.drawLength <= 0) {
-    console.log('[explore] path too short, discarding (normal for a tap/click with no drag)');
-    state.drawPath = [];
-    state.drawLength = 0;
-  }
-  render();
-}
-
-function onCanvasMouseDown(e) {
-  handlePointerDown(e.clientX, e.clientY);
-}
-
-function onCanvasMouseMove(e) {
-  handlePointerMove(e.clientX, e.clientY);
-}
-
-function onCanvasMouseUp() {
-  handlePointerUp();
-}
-
-// --- touch support: one finger = pan/draw/tap (same as a mouse), two
-// fingers = pinch-to-zoom. preventDefault() stops the phone's browser from
-// scrolling or zooming the page while the player is touching the map, and
-// also stops the browser from firing its own extra click after a tap —
-// without that, a tap could end up triggering travel twice.
-function touchDistance(t0, t1) {
-  return Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
-}
-
-function onCanvasTouchStart(e) {
-  e.preventDefault();
-  if (e.touches.length === 2) {
-    // switching to a pinch gesture always wins over an in-progress
-    // pan/draw from whatever the first finger was doing
-    state.isPanning = false;
-    state.isDrawing = false;
-    state.pinch = { startDist: touchDistance(e.touches[0], e.touches[1]), startZoom: state.camera.zoom };
-    return;
-  }
-  if (e.touches.length === 1) {
-    state.pinch = null;
-    const t = e.touches[0];
-    handlePointerDown(t.clientX, t.clientY);
-  }
-}
-
-function onCanvasTouchMove(e) {
-  e.preventDefault();
-  if (state.pinch && e.touches.length === 2) {
-    const dist = touchDistance(e.touches[0], e.touches[1]);
-    const ratio = dist / state.pinch.startDist;
-    state.camera.zoom = Math.min(CAMERA_MAX_ZOOM, Math.max(1, state.pinch.startZoom * ratio));
-    return;
-  }
-  if (e.touches.length === 1) {
-    const t = e.touches[0];
-    handlePointerMove(t.clientX, t.clientY);
-  }
-}
-
-function onCanvasTouchEnd(e) {
-  e.preventDefault();
-  if (e.touches.length > 0) return; // still at least one finger down (e.g. lifting one of two) — not done yet
-  const wasPinching = !!state.pinch;
-  state.pinch = null;
-  handlePointerUp();
-  // A genuine tap-to-travel: not the end of a pinch, and not the end of a
-  // real drag (handlePointerUp already turned a drag past the 3px
-  // threshold into state.wasPanning; handlePointerClick itself already
-  // skips this while in draw mode, matching the mouse 'click' behavior).
-  if (!wasPinching && !state.wasPanning) {
-    const t = e.changedTouches[0];
-    if (t) handlePointerClick(t.clientX, t.clientY);
-  }
-}
-
-function cancelDrawnPath() {
-  if (state.drawPath.length === 0) {
-    // nothing drawn yet — cancel backs all the way out of draw mode
-    exitDrawMode();
-    return;
-  }
-  state.drawPath = [];
-  state.drawLength = 0;
-  render();
-}
-
-async function confirmDrawnPath() {
-  if (state.drawPath.length < 2 || state.drawLength <= 0) return;
-  const path = state.drawPath;
-
+// The actual network call, shared by a single dpad/keyboard step and by
+// confirmWorldPath()'s walk-the-previewed-route loop. Returns whether the
+// step actually happened, so a caller stepping repeatedly knows when to
+// stop (out of supplies on new ground, hit the world edge, network hiccup —
+// all just "false, stop").
+async function worldMoveStep(direction) {
   let result;
   try {
-    result = await post('/api/expedition/start', { playerId: state.playerId, path });
+    result = await api('/api/world/move', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, direction }),
+    });
   } catch {
-    return;
+    return false;
   }
-  exitDrawMode();
-  showToast(
-    result.locationsFound > 0
-      ? `Expedition underway — ${result.locationsFound} location${result.locationsFound === 1 ? '' : 's'} within reach!`
-      : 'Expedition underway...'
-  );
-  await refreshMe();
+  applyPlayerSnapshot(result.player);
+  return true;
 }
 
-async function travelTo(locationId) {
-  try {
-    await post('/api/travel', { playerId: state.playerId, locationId });
-  } catch {
+// A direct dpad/keyboard step — instant, no confirmation, and supersedes
+// any route the player had clicked out but not yet confirmed.
+async function submitWorldMove(direction) {
+  if (state.worldWalking || !state.player || (state.player.combat && !state.player.combat.result)) return;
+  state.worldPendingPath = null;
+  if (isWorldMoveBlocked(direction)) {
+    const wrap = document.getElementById('world-grid-wrap');
+    if (wrap) {
+      wrap.classList.add('blocked-shake');
+      setTimeout(() => wrap.classList.remove('blocked-shake'), 250);
+    }
+    render();
     return;
   }
-  await refreshMe();
+  const supplies = state.player.inventory.find((i) => i.id === 'supplies');
+  const revealed = new Set(state.player.revealedTiles);
+  const delta = WORLD_DIRS[direction];
+  const destKey = `${state.player.worldPos.x + delta.dx},${state.player.worldPos.y + delta.dy}`;
+  if (!revealed.has(destKey) && (!supplies || supplies.count <= 0)) {
+    showToast("Out of supplies — you can't push into new ground until you find or buy more.");
+    return;
+  }
+  await worldMoveStep(direction);
+}
+
+// No pathfinding needed (unlike a dungeon room, the overworld has no
+// walls) — a simple greedy axis-priority walk always reaches any tile in
+// view, one step per array entry, in the order they'll actually be walked.
+function computeWorldPath(targetX, targetY) {
+  const path = [];
+  let cx = state.player.worldPos.x;
+  let cy = state.player.worldPos.y;
+  let guard = 0;
+  while ((cx !== targetX || cy !== targetY) && guard < 2000) {
+    guard++;
+    const dx = targetX - cx;
+    const dy = targetY - cy;
+    if (Math.abs(dx) >= Math.abs(dy) && dx !== 0) cx += Math.sign(dx);
+    else if (dy !== 0) cy += Math.sign(dy);
+    else break;
+    path.push({ x: cx, y: cy });
+  }
+  return path;
+}
+
+// Clicking a tile in view only plans the route — it doesn't move anyone.
+// The path stays highlighted on the grid until the player explicitly
+// confirms or cancels it (see confirmWorldPath()/cancelWorldPath()).
+function previewWorldPath(targetX, targetY) {
+  if (state.worldWalking || !state.player || (state.player.combat && !state.player.combat.result)) return;
+  state.worldPendingPath = computeWorldPath(targetX, targetY);
+  render();
+}
+
+function cancelWorldPath() {
+  state.worldPendingPath = null;
+  render();
+}
+
+// Walks the exact previewed route, one server-authoritative step at a time
+// — not recomputed mid-walk, so what was shown is what actually happens.
+// Stops early (banking whatever already happened) if a step fails, e.g.
+// supplies ran out partway into new territory.
+async function confirmWorldPath() {
+  const path = state.worldPendingPath;
+  if (!path || path.length === 0 || state.worldWalking) return;
+  state.worldPendingPath = null;
+  state.worldWalking = true;
+  render();
+  try {
+    let prev = state.player.worldPos;
+    for (const step of path) {
+      const dir = step.x > prev.x ? 'right' : step.x < prev.x ? 'left' : step.y > prev.y ? 'down' : 'up';
+      const moved = await worldMoveStep(dir);
+      if (!moved) break;
+      prev = step;
+      await sleep(150);
+    }
+  } finally {
+    state.worldWalking = false;
+    render();
+  }
+}
+
+function worldViewportOrigin() {
+  const { width, height } = state.worldInfo;
+  const { w: vw, h: vh } = currentWorldViewport();
+  const pos = state.player.worldPos;
+  let ox = pos.x - Math.floor(vw / 2);
+  let oy = pos.y - Math.floor(vh / 2);
+  ox = Math.max(0, Math.min(Math.max(0, width - vw), ox));
+  oy = Math.max(0, Math.min(Math.max(0, height - vh), oy));
+  return { ox, oy };
+}
+
+function locationGridIcon(loc) {
+  if (loc.tavern) return '🍺';
+  if (loc.combat) return '⚔️';
+  if (loc.skill) return '⛏️';
+  return '📍';
+}
+
+// Rebuilt fresh every render (cheap — at most a few hundred tiles). A tile
+// the player has never physically stepped onto renders as blank fog — no
+// floor, no icon, indistinguishable from any other unexplored tile even if
+// a location secretly sits there. Once revealed, a tile stays revealed
+// forever, so walking away doesn't re-hide anything.
+function renderWorldGrid() {
+  const gridDiv = document.getElementById('world-grid');
+  if (!state.worldInfo.width) return; // /api/world-info hasn't landed yet
+  const { w: vw, h: vh } = currentWorldViewport();
+  const { ox, oy } = worldViewportOrigin();
+  gridDiv.innerHTML = '';
+  gridDiv.style.gridTemplateColumns = `repeat(${vw}, 1fr)`;
+  gridDiv.style.gridTemplateRows = `repeat(${vh}, 1fr)`;
+
+  const revealed = new Set(state.player.revealedTiles);
+  const locByCell = {};
+  for (const loc of state.locations) {
+    if (!state.player.discoveries.includes(loc.id)) continue;
+    if (loc.x < ox || loc.x >= ox + vw || loc.y < oy || loc.y >= oy + vh) continue;
+    locByCell[`${loc.x},${loc.y}`] = loc;
+  }
+  const othersByCell = {};
+  for (const other of state.others) {
+    const loc = state.locations.find((l) => l.id === other.locationId);
+    if (!loc) continue;
+    const key = `${loc.x},${loc.y}`;
+    (othersByCell[key] = othersByCell[key] || []).push(other);
+  }
+  const pathByCell = {};
+  const pendingPath = state.worldPendingPath || [];
+  pendingPath.forEach((step, i) => {
+    pathByCell[`${step.x},${step.y}`] = i === pendingPath.length - 1 ? 'end' : 'mid';
+  });
+
+  for (let y = oy; y < oy + vh; y++) {
+    for (let x = ox; x < ox + vw; x++) {
+      const cell = document.createElement('div');
+      cell.dataset.x = x;
+      cell.dataset.y = y;
+      const isPlayer = state.player.worldPos.x === x && state.player.worldPos.y === y;
+      const isRevealed = isPlayer || revealed.has(`${x},${y}`);
+      cell.className = 'grid-cell ' + (isRevealed ? 'world-floor' : 'world-fog');
+      const loc = locByCell[`${x},${y}`];
+      if (isPlayer) {
+        cell.classList.add('grid-player');
+        cell.textContent = '@';
+        cell.title = loc ? loc.name : 'You';
+      } else if (isRevealed && loc) {
+        cell.classList.add('world-location');
+        cell.textContent = locationGridIcon(loc);
+        cell.title = loc.name;
+      }
+      if (!isPlayer && othersByCell[`${x},${y}`]) {
+        cell.classList.add('world-has-others');
+      }
+      const pathState = pathByCell[`${x},${y}`];
+      if (pathState === 'mid') cell.classList.add('world-path');
+      else if (pathState === 'end') cell.classList.add('world-path-end');
+      if (!isPlayer) {
+        cell.addEventListener('click', () => previewWorldPath(x, y));
+      }
+      gridDiv.appendChild(cell);
+    }
+  }
+}
+
+function renderOverworldTab() {
+  const loc = state.locations.find((l) => l.id === state.player.currentLocation);
+  document.getElementById('current-location').textContent = `Location: ${
+    loc ? loc.name : state.player.currentLocation ? '--' : 'the wilds'
+  }`;
+
+  const supplies = state.player.inventory.find((i) => i.id === 'supplies');
+  const suppliesCount = supplies ? supplies.count : 0;
+  document.getElementById('supplies-info').textContent = `Supplies: ${suppliesCount}`;
+
+  const inCombat = !!(state.player.combat && !state.player.combat.result);
+  const pendingPath = state.worldPendingPath;
+  document.getElementById('world-message-line').textContent = inCombat
+    ? 'Finish or flee your fight before moving.'
+    : state.worldWalking
+      ? 'Walking...'
+      : pendingPath
+        ? ''
+        : "Click a tile to plan a route, or use the arrows. Re-walking known ground is free — only new ground costs supplies.";
+
+  const pathControls = document.getElementById('world-path-controls');
+  if (pendingPath && pendingPath.length > 0 && !state.worldWalking && !inCombat) {
+    pathControls.classList.remove('hidden');
+    const revealed = new Set(state.player.revealedTiles);
+    const newTiles = pendingPath.filter((t) => !revealed.has(`${t.x},${t.y}`)).length;
+    document.getElementById('world-path-status').textContent =
+      `Route: ${pendingPath.length} tile${pendingPath.length === 1 ? '' : 's'}` +
+      (newTiles > 0 ? ` (${newTiles} new — costs ${newTiles} supplies)` : ' (all known ground — free)');
+    document.getElementById('world-confirm-btn').disabled = newTiles > suppliesCount;
+  } else {
+    pathControls.classList.add('hidden');
+  }
+
+  const disabled = state.worldWalking || inCombat;
+  for (const btn of document.querySelectorAll('.dpad-btn[data-wdir]')) btn.disabled = disabled;
+
+  renderWorldGrid();
 }
 
 // --- skills tab ---
@@ -1037,58 +1060,105 @@ async function unlockPerkUI(perkId) {
 
 // --- combat tab ---
 //
-// A multi-enemy fight arena. The player picks up to 6 unlocked abilities
-// into a loadout (editable outside a fight); during a fight, each round the
-// player uses (or keeps charging) their current ability, then every living
-// enemy takes its own turn. See resolvePlayerTurn()/enemyTakeTurn()/
-// tickCombat() in server/store.js for the actual simulation.
+// Classic-Roguelike grid combat: the player and every enemy share a small
+// room. Moving into an empty tile just moves; moving into a tile an enemy
+// occupies attacks it instead ("bump to attack"); using a potion is the
+// only other legal turn. Each turn is one server round-trip that resolves
+// the whole exchange (player's move/attack/item, then every living enemy's
+// response) and returns it as a single-turn log plus the fresh player
+// state — see playCombatRound() below for how that's shown on screen.
 
-// How fast combat rounds play out — a saved preference that carries between
-// fights and can also be changed live during one. Shown both before a fight
-// starts and during it.
-const COMBAT_SPEEDS = [
-  { id: 'slow', label: 'Slow' },
-  { id: 'normal', label: 'Normal' },
-  { id: 'fast', label: 'Fast' },
-];
+const ENEMY_ICONS = {
+  giant_rat: '🐀',
+  wolf: '🐺',
+  bog_zombie: '🧟',
+  bandit: '🥷',
+  forest_spider: '🕷️',
+  forest_archer: '🏹',
+  marsh_wraith: '👻',
+  orc_raider: '👹',
+  stone_troll: '🗿',
+};
 
-function renderSpeedControls(containerId) {
-  const container = document.getElementById(containerId);
-  container.innerHTML = '<span>Combat speed:</span>';
-  for (const speed of COMBAT_SPEEDS) {
-    const btn = document.createElement('button');
-    btn.className = 'speed-btn' + (state.player.combatSpeed === speed.id ? ' active' : '');
-    btn.textContent = speed.label;
-    btn.addEventListener('click', () => setCombatSpeed(speed.id));
-    container.appendChild(btn);
+const COMBAT_DIRS = {
+  up: { dx: 0, dy: -1 },
+  down: { dx: 0, dy: 1 },
+  left: { dx: -1, dy: 0 },
+  right: { dx: 1, dy: 0 },
+};
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const FLOATING_NUMBER_MS = 1000; // how long a damage/heal number stays visible before fading out
+const HIT_FLASH_MS = 450; // how long a hit's flash/shake + floating number gets to read before the next turn can submit
+
+function spawnFloatingNumber(container, text, kind) {
+  if (!container) return;
+  const el = document.createElement('div');
+  el.className = `floating-number ${kind}`;
+  el.textContent = text;
+  container.appendChild(el);
+  setTimeout(() => el.remove(), FLOATING_NUMBER_MS);
+}
+
+function gridCellEl(x, y) {
+  return document.querySelector(`#combat-grid .grid-cell[data-x="${x}"][data-y="${y}"]`);
+}
+
+// Rebuilds the whole grid from scratch every render — cheap given it's at
+// most 9x7 tiles and only re-renders on real state changes, not every
+// frame. Dead enemies simply don't get drawn (their tile just shows as
+// floor), matching how a defeated monster would vanish in Rogue.
+function renderCombatGrid(c) {
+  const gridDiv = document.getElementById('combat-grid');
+  gridDiv.innerHTML = '';
+  gridDiv.style.gridTemplateColumns = `repeat(${c.grid.width}, 1fr)`;
+  gridDiv.style.gridTemplateRows = `repeat(${c.grid.height}, 1fr)`;
+  const wallSet = new Set(c.grid.walls.map((w) => `${w.x},${w.y}`));
+  for (let y = 0; y < c.grid.height; y++) {
+    for (let x = 0; x < c.grid.width; x++) {
+      const cell = document.createElement('div');
+      cell.dataset.x = x;
+      cell.dataset.y = y;
+      const wall = wallSet.has(`${x},${y}`);
+      cell.className = 'grid-cell' + (wall ? ' wall' : ' floor');
+      if (!wall) {
+        if (c.playerPos.x === x && c.playerPos.y === y) {
+          cell.classList.add('grid-player');
+          cell.textContent = '@';
+        } else {
+          const enemy = c.enemies.find((e) => e.hp > 0 && e.x === x && e.y === y);
+          if (enemy) {
+            cell.classList.add('grid-enemy');
+            cell.dataset.uid = enemy.uid;
+            cell.textContent = ENEMY_ICONS[enemy.enemyId] || '?';
+          }
+        }
+      }
+      gridDiv.appendChild(cell);
+    }
   }
 }
 
-async function setCombatSpeed(speed) {
-  try {
-    await post('/api/combat/speed', { playerId: state.playerId, speed });
-  } catch {
-    return;
-  }
-  await refreshMe();
-}
-
-// One card per enemy in the fight — HP bar, distance-from-player (mirrors
-// the arena canvas so players who prefer exact numbers over the visual
-// don't need it), and any affliction. Dead enemies stay visible but dimmed
-// rather than disappearing, so a multi-enemy fight's outcome reads clearly.
-function renderEnemyList(c) {
-  const listDiv = document.getElementById('enemy-list');
+// A compact HP list beside the grid — the grid glyphs alone don't show
+// numbers, so this is where "how much HP does that wolf have left" actually
+// comes from.
+function renderEnemyHpList(c) {
+  const listDiv = document.getElementById('combat-enemy-hp-list');
   listDiv.innerHTML = '';
   for (const e of c.enemies) {
-    const card = document.createElement('div');
-    card.className = 'enemy-card' + (e.alive ? '' : ' dead');
-    card.innerHTML = `
-      <div class="arena-combatant-header"><span>${e.name}</span><span>${e.hp} / ${e.maxHp} HP</span></div>
-      <div class="hp-bar-wrap"><div class="hp-bar-fill enemy" style="width:${(e.hp / e.maxHp) * 100}%"></div></div>
-      <div class="effect-label">${e.alive ? (e.dot ? `Afflicted: ${e.dot.type}` : '') : 'Defeated'}</div>
+    if (e.hp <= 0) continue;
+    const row = document.createElement('div');
+    row.className = 'enemy-hp-row';
+    row.innerHTML = `
+      <span class="enemy-hp-name">${ENEMY_ICONS[e.enemyId] || ''} ${e.name}</span>
+      <div class="hp-bar-wrap small"><div class="hp-bar-fill enemy" style="width:${(e.hp / e.maxHp) * 100}%"></div></div>
+      <span class="enemy-hp-num">${e.hp}/${e.maxHp}</span>
+      ${e.dot ? `<span class="effect-label">Afflicted: ${e.dot.type}</span>` : ''}
     `;
-    listDiv.appendChild(card);
+    listDiv.appendChild(row);
   }
 }
 
@@ -1101,30 +1171,43 @@ function renderCombatTab() {
     activeDiv.classList.remove('hidden');
     const c = state.player.combat;
 
-    renderSpeedControls('combat-speed-controls');
     document.getElementById('player-hp-fill').style.width = `${(c.playerHp / c.playerMaxHp) * 100}%`;
     document.getElementById('player-hp-label').textContent = `${c.playerHp} / ${c.playerMaxHp} HP`;
     document.getElementById('player-status-line').textContent = [
       c.dotOnPlayer ? `Afflicted: ${c.dotOnPlayer.type}` : '',
       c.buff ? `Buffed: ${c.buff.type}` : '',
-      c.armorBuffActive ? 'Guard up' : '',
-      c.evasionActive ? 'Evading' : '',
-      c.comboReady ? 'Combo ready!' : '',
-      c.hasteReady ? 'Haste ready!' : '',
     ]
       .filter(Boolean)
       .join(' | ');
 
-    renderEnemyList(c);
+    renderCombatGrid(c);
+    renderEnemyHpList(c);
+    document.getElementById('combat-message-line').textContent =
+      c.lastPlayerActionText || (c.ambush ? 'You are ambushed!' : 'Walk into an enemy to attack it.');
 
+    // The full text log lives in a collapsed-by-default sidebar — the grid
+    // and flashes are the primary way to follow a fight now, this is just
+    // an opt-in detailed record for anyone who wants exact numbers/order.
+    document.getElementById('combat-log-sidebar').classList.toggle('hidden', !state.combatLogSidebarOpen);
+    document.getElementById('combat-log-toggle').textContent = state.combatLogSidebarOpen ? '📜 Hide Battle Log' : '📜 Battle Log';
     const logDiv = document.getElementById('combat-log');
-    logDiv.innerHTML = [c.lastPlayerActionText, c.lastEnemyActionText].filter(Boolean).join('<br>');
+    if (state.combatLog.length > 0) {
+      logDiv.innerHTML = state.combatLog.map(roundLogHtml).join('');
+    } else {
+      logDiv.innerHTML = roundLogHtml({ player: c.lastPlayerActionText, enemies: c.lastEnemyActionTexts });
+    }
+    logDiv.scrollTop = logDiv.scrollHeight; // keep the newest turn in view
 
-    renderLiveAbilitySlots(c);
+    const disabled = state.combatActionPending || !!c.result;
+    for (const btn of document.querySelectorAll('.dpad-btn[data-dir]')) btn.disabled = disabled;
+    document.getElementById('item-btn').disabled = disabled;
 
     const resultDiv = document.getElementById('combat-result');
     const fleeBtn = document.getElementById('flee-btn');
     const continueBtn = document.getElementById('combat-continue-btn');
+    const dpad = document.getElementById('combat-dpad');
+    const turnActions = document.getElementById('combat-turn-actions');
+    const itemMenu = document.getElementById('combat-item-menu');
     if (c.result) {
       resultDiv.classList.remove('hidden');
       if (c.result === 'win') {
@@ -1133,24 +1216,21 @@ function renderCombatTab() {
       } else {
         resultDiv.textContent = 'Defeated...';
       }
-      fleeBtn.classList.add('hidden');
+      dpad.classList.add('hidden');
+      turnActions.classList.add('hidden');
+      itemMenu.classList.add('hidden');
       continueBtn.classList.remove('hidden');
     } else {
       resultDiv.classList.add('hidden');
-      fleeBtn.classList.remove('hidden');
+      dpad.classList.remove('hidden');
+      turnActions.classList.remove('hidden');
+      fleeBtn.disabled = disabled;
       continueBtn.classList.add('hidden');
-    }
-
-    const potionsDiv = document.getElementById('combat-potions');
-    potionsDiv.innerHTML = '';
-    if (!c.result) {
-      const ownedPotions = state.player.inventory.filter((i) => state.itemsMeta[i.id] && state.itemsMeta[i.id].type === 'potion');
-      for (const potion of ownedPotions) {
-        const btn = document.createElement('button');
-        btn.className = 'potion-btn';
-        btn.textContent = `${state.itemsMeta[potion.id].name} (${potion.count})`;
-        btn.addEventListener('click', () => usePotion(potion.id));
-        potionsDiv.appendChild(btn);
+      if (state.combatItemMenuOpen) {
+        renderCombatItemMenu(disabled);
+        itemMenu.classList.remove('hidden');
+      } else {
+        itemMenu.classList.add('hidden');
       }
     }
   } else {
@@ -1158,132 +1238,185 @@ function renderCombatTab() {
     activeDiv.classList.add('hidden');
     const loc = state.locations.find((l) => l.id === state.player.currentLocation);
     document.getElementById('combat-location-info').textContent = `Location: ${loc ? loc.name : '--'}`;
-    renderSpeedControls('combat-speed-controls-idle');
 
     const listDiv = document.getElementById('combat-enemy-list');
     listDiv.innerHTML = '';
-    if (loc && loc.combat && loc.combat.length > 0) {
-      for (const enemyId of loc.combat) {
+    // The pickable roster comes from the location's tier (see
+    // /api/world-tiers), not a fixed per-location list — the dungeon,
+    // exact enemy mix, and loot are all randomized by area every fight.
+    const tierEnemies = loc && loc.combat ? (state.worldTiers[loc.tier] || {}).enemies || [] : [];
+    if (tierEnemies.length > 0) {
+      for (const enemyId of tierEnemies) {
         const meta = state.enemiesMeta[enemyId];
         const btn = document.createElement('button');
         btn.className = 'enemy-btn';
-        btn.innerHTML = `<strong>${meta.name}</strong><br>${meta.maxHp} HP`;
+        btn.innerHTML = `<span class="enemy-icon">${ENEMY_ICONS[enemyId] || '❔'}</span><strong>${meta.name}</strong><br>${meta.maxHp} HP`;
         btn.addEventListener('click', () => startFight(enemyId));
         listDiv.appendChild(btn);
       }
       const hint = document.createElement('p');
       hint.className = 'card-sub';
-      hint.textContent = 'Sometimes 2-3 enemies from this area will join the fight together.';
+      hint.textContent = 'Sometimes 2-3 enemies from this area will join the fight together, and the dungeon layout and loot vary every time.';
       listDiv.appendChild(hint);
     } else {
       listDiv.innerHTML = '<p>No enemies here. Explore to find a combat area.</p>';
     }
-
-    renderLoadoutEditor();
-    renderAbilitySidebar();
   }
 }
 
-// A special marker meaning "Clear Slot" is selected — different from null,
-// which means nothing is selected. (The API separately uses abilityId: null
-// to mean "make this slot empty".)
-const CLEAR_SLOT_SENTINEL = '__clear__';
-
-// The persistent loadout, editable any time the player isn't mid-fight.
-// Selection flow mirrors the Gardening tab's seed-then-click-plots pattern:
-// pick an ability once in the sidebar (renderAbilitySidebar), then click any
-// number of slots to place it — the selection stays active so filling
-// several slots with the same ability doesn't require re-selecting each
-// time.
-function renderLoadoutEditor() {
-  const row = document.getElementById('loadout-slots');
-  row.innerHTML = '';
-  state.player.abilityLoadout.forEach((abilityId, index) => {
-    const slot = document.createElement('div');
-    const ability = abilityId ? state.player.abilities.find((a) => a.id === abilityId) : null;
-    slot.className = 'ability-slot' + (ability ? '' : ' empty');
-    slot.title = ability ? ability.description : 'Empty — select an ability from the panel on the right';
-    slot.innerHTML = ability
-      ? `<span class="ability-slot-name">${ability.name}</span><span>${ability.castRounds}${ability.castRounds === 1 ? ' round' : ' rounds'}</span>`
-      : '<span>Empty</span>';
-    slot.addEventListener('click', () => placeSelectedAbility(index));
-    row.appendChild(slot);
-  });
-
-  const statusEl = document.getElementById('ability-select-status');
-  if (state.selectedAbility === CLEAR_SLOT_SENTINEL) {
-    statusEl.textContent = 'Clearing slots — click a slot to empty it, or click "Clear Slot" again to stop.';
-  } else if (state.selectedAbility) {
-    const ability = state.player.abilities.find((a) => a.id === state.selectedAbility);
-    statusEl.textContent = `Placing ${ability.name} — click a slot to assign it, or click it again in the panel to stop.`;
-  } else {
-    statusEl.textContent = '';
-  }
+function roundLogHtml(r) {
+  const enemyLines = (r.enemies || []).filter(Boolean).map((t) => `<div class="log-enemy">${t}</div>`).join('');
+  const playerLine = r.player ? `<div class="log-player">${r.player}</div>` : '';
+  if (!playerLine && !enemyLines) return '';
+  return `<div class="log-round">${playerLine}${enemyLines}</div>`;
 }
 
-// Scrollable side panel listing every ability (locked ones included, greyed
-// out, so players can see what's coming and plan toward it) with a full
-// description — this doubles as both the "what do abilities do" reference
-// and the source you select from to fill loadout slots.
-function renderAbilitySidebar() {
-  const container = document.getElementById('ability-sidebar-list');
+function renderCombatItemMenu(disabled) {
+  const container = document.getElementById('combat-item-menu');
   container.innerHTML = '';
+  const backBtn = document.createElement('button');
+  backBtn.className = 'item-menu-btn';
+  backBtn.textContent = '← Back';
+  backBtn.addEventListener('click', () => {
+    state.combatItemMenuOpen = false;
+    renderCombatTab();
+  });
+  container.appendChild(backBtn);
 
-  const clearCard = document.createElement('div');
-  clearCard.className = 'ability-card selectable' + (state.selectedAbility === CLEAR_SLOT_SENTINEL ? ' selected' : '');
-  clearCard.innerHTML = `<h3>Clear Slot</h3><div class="card-sub">Empty out a loadout slot.</div>`;
-  clearCard.addEventListener('click', () => toggleAbilitySelection(CLEAR_SLOT_SENTINEL));
-  container.appendChild(clearCard);
-
-  for (const ability of state.player.abilities) {
-    const card = document.createElement('div');
-    if (ability.unlocked) {
-      card.className = 'ability-card selectable' + (state.selectedAbility === ability.id ? ' selected' : '');
-      card.innerHTML = `<h3>${ability.name}</h3><div class="card-sub">${ability.description}</div><div class="card-sub">Takes ${ability.castRounds} ${ability.castRounds === 1 ? 'round' : 'rounds'} to cast &mdash; ${ability.tags.join(', ')}</div>`;
-      card.addEventListener('click', () => toggleAbilitySelection(ability.id));
-    } else {
-      card.className = 'ability-card locked';
-      card.innerHTML = `<h3>${ability.name} 🔒</h3><div class="card-sub">${ability.description}</div><div class="card-sub">Unlocks at Combat level ${ability.unlockLevel}</div>`;
-    }
-    container.appendChild(card);
-  }
-}
-
-function toggleAbilitySelection(idOrSentinel) {
-  state.selectedAbility = state.selectedAbility === idOrSentinel ? null : idOrSentinel;
-  renderAbilitySidebar();
-  renderLoadoutEditor();
-}
-
-async function placeSelectedAbility(slotIndex) {
-  if (!state.selectedAbility) return;
-  const abilityId = state.selectedAbility === CLEAR_SLOT_SENTINEL ? null : state.selectedAbility;
-  try {
-    await post('/api/loadout/set', { playerId: state.playerId, slotIndex, abilityId });
-  } catch {
+  const ownedPotions = state.player.inventory.filter((i) => state.itemsMeta[i.id] && state.itemsMeta[i.id].type === 'potion');
+  if (ownedPotions.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'card-sub';
+    empty.textContent = "You aren't carrying any usable potions.";
+    container.appendChild(empty);
     return;
   }
-  await refreshMe();
+  for (const potion of ownedPotions) {
+    const meta = state.itemsMeta[potion.id];
+    const btn = document.createElement('button');
+    btn.className = 'item-menu-btn';
+    btn.disabled = disabled;
+    btn.textContent = `${meta.name} (${potion.count})`;
+    if (!disabled) btn.addEventListener('click', () => submitCombatItem(potion.id));
+    container.appendChild(btn);
+  }
 }
 
-// The live rotation during a fight — same 6 boxes as the editor, but
-// read-only, with the currently-executing slot highlighted. Its fill bar is
-// animated every frame in animate() (see drawAbilitySlotFill()), not here —
-// this just rebuilds the boxes/labels on each ~2s poll.
-function renderLiveAbilitySlots(c) {
-  const row = document.getElementById('ability-slots-live');
-  row.innerHTML = '';
-  c.loadout.forEach((ability, index) => {
-    const slot = document.createElement('div');
-    const isCurrent = index === c.abilityCursor;
-    slot.className = 'ability-slot live' + (ability ? '' : ' empty') + (isCurrent ? ' current' : '');
-    slot.id = `ability-slot-${index}`;
-    const statusText = isCurrent && c.castRoundsRemaining > 0 ? `charging (${c.castRoundsRemaining} left)` : isCurrent ? 'next up' : '';
-    slot.innerHTML = ability
-      ? `<span class="ability-slot-name">${ability.name}</span><span>${statusText}</span><div class="ability-slot-fill" id="ability-slot-fill-${index}"></div>`
-      : '<span>Empty</span>';
-    row.appendChild(slot);
-  });
+// Shows the already-resolved (server-authoritative) turn's effects as a
+// brief flash + floating number on the grid, then settles on the final
+// state — much lighter-weight than the old FF-style multi-second staged
+// playback, since a grid bump-attack is a single instant event rather than
+// a queue of abilities landing on a lined-up row of enemies. Renders the
+// final positions/HP first (so the grid is already correct), then animates
+// on top of it — the target of a kill still gets its flash even though its
+// glyph itself has already disappeared, since every tile always has a cell
+// element to animate regardless of what's currently drawn on it.
+async function playCombatRound(round, finalPlayer) {
+  state.combatLog.push(round);
+  state.player = finalPlayer;
+  renderCombatTab();
+
+  let animated = false;
+  if (round.playerHit) {
+    const hit = round.playerHit;
+    if (hit.type === 'damage' || hit.type === 'debuff') {
+      const pos = round.enemyPositions.find((e) => e.uid === hit.targetUid);
+      const cell = pos ? gridCellEl(pos.x, pos.y) : null;
+      if (cell) {
+        animated = true;
+        if (hit.type === 'damage') {
+          cell.classList.add('hit-flash');
+          spawnFloatingNumber(cell, hit.crit ? `-${hit.amount}!` : `-${hit.amount}`, hit.crit ? 'damage crit' : 'damage');
+        } else {
+          spawnFloatingNumber(cell, 'Poisoned!', 'miss');
+        }
+      }
+    } else if (hit.type === 'heal') {
+      const cell = gridCellEl(round.playerPos.x, round.playerPos.y);
+      if (cell) {
+        animated = true;
+        spawnFloatingNumber(cell, `+${hit.amount}`, 'heal');
+      }
+    }
+  }
+
+  const playerCell = gridCellEl(round.playerPos.x, round.playerPos.y);
+  for (const hit of round.enemyHits || []) {
+    if (!playerCell) continue;
+    animated = true;
+    if (hit.type === 'dodged') {
+      spawnFloatingNumber(playerCell, 'Dodged!', 'miss');
+    } else {
+      playerCell.classList.add('hit-shake');
+      spawnFloatingNumber(playerCell, hit.crit ? `-${hit.amount}!` : `-${hit.amount}`, hit.crit ? 'damage crit' : 'damage');
+    }
+  }
+
+  if (animated) await sleep(HIT_FLASH_MS);
+}
+
+// Bumping into a wall or the grid edge is checked client-side against data
+// the player already has (state.player.combat.grid) so it never round-trips
+// to the server at all — it's not a real action, just an invalid input, and
+// should feel instant rather than surfacing a scary "Error: blocked" banner
+// for something as routine as misjudging a corner.
+function isCombatMoveBlocked(direction) {
+  const c = state.player.combat;
+  const delta = COMBAT_DIRS[direction];
+  const nx = c.playerPos.x + delta.dx;
+  const ny = c.playerPos.y + delta.dy;
+  if (nx < 0 || ny < 0 || nx >= c.grid.width || ny >= c.grid.height) return true;
+  return c.grid.walls.some((w) => w.x === nx && w.y === ny);
+}
+
+async function submitCombatMove(direction) {
+  if (state.combatActionPending || !state.player.combat || state.player.combat.result) return;
+  if (isCombatMoveBlocked(direction)) {
+    const wrap = document.getElementById('combat-grid-wrap');
+    if (wrap) {
+      wrap.classList.add('blocked-shake');
+      setTimeout(() => wrap.classList.remove('blocked-shake'), 250);
+    }
+    return;
+  }
+  state.combatActionPending = true;
+  state.combatItemMenuOpen = false;
+  renderCombatTab(); // immediately grey out the controls so a slow response can't be double-submitted
+  let result;
+  try {
+    result = await api('/api/combat/move', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, direction }),
+    });
+  } catch {
+    state.combatActionPending = false;
+    renderCombatTab();
+    return;
+  }
+  state.combatActionPending = false;
+  await playCombatRound(result.log[0], result.player);
+}
+
+async function submitCombatItem(itemId) {
+  if (state.combatActionPending) return;
+  state.combatActionPending = true;
+  renderCombatTab();
+  let result;
+  try {
+    result = await api('/api/combat/item', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId: state.playerId, itemId }),
+    });
+  } catch {
+    state.combatActionPending = false;
+    renderCombatTab();
+    return;
+  }
+  state.combatActionPending = false;
+  state.combatItemMenuOpen = false;
+  await playCombatRound(result.log[0], result.player);
 }
 
 async function startFight(enemyId) {
@@ -1292,6 +1425,8 @@ async function startFight(enemyId) {
   } catch {
     return;
   }
+  state.combatLog = [];
+  state.combatItemMenuOpen = false;
   await refreshMe();
 }
 
@@ -1301,6 +1436,8 @@ async function endCombat() {
   } catch {
     return;
   }
+  state.combatLog = [];
+  state.combatItemMenuOpen = false;
   await refreshMe();
 }
 
@@ -1515,17 +1652,6 @@ async function craftKnownPotion(recipeId) {
     return;
   }
   showToast(`Brewed ${result.resultName}!`);
-  await refreshMe();
-}
-
-async function usePotion(itemId) {
-  let result;
-  try {
-    result = await post('/api/potion/use', { playerId: state.playerId, itemId });
-  } catch {
-    return;
-  }
-  showToast(`Used ${state.itemsMeta[itemId].name}!`);
   await refreshMe();
 }
 
@@ -1911,36 +2037,6 @@ function connectSocket() {
   });
 }
 
-// clientX/clientY-based (not the raw event) so touch handlers can share this
-// exact logic — a tap is just a click with coordinates read from
-// changedTouches instead of the event itself.
-function handlePointerClick(clientX, clientY) {
-  if (state.drawMode) return; // clicks while drawing are handled by the down/move/up flow instead
-  if (state.wasPanning) {
-    // this click is the tail end of a pan drag, not an intentional
-    // click-to-travel — suppress it once, then go back to normal
-    state.wasPanning = false;
-    return;
-  }
-  const rect = canvas.getBoundingClientRect();
-  const scaleX = canvas.width / rect.width;
-  const scaleY = canvas.height / rect.height;
-  const clickX = (clientX - rect.left) * scaleX;
-  const clickY = (clientY - rect.top) * scaleY;
-  for (const marker of state.markers) {
-    const dx = clickX - marker.x;
-    const dy = clickY - marker.y;
-    if (Math.sqrt(dx * dx + dy * dy) <= marker.r + 4) {
-      travelTo(marker.locationId);
-      return;
-    }
-  }
-}
-
-function onCanvasClick(e) {
-  handlePointerClick(e.clientX, e.clientY);
-}
-
 function showToast(text) {
   const el = document.getElementById('toast');
   el.textContent = text;
@@ -1949,74 +2045,13 @@ function showToast(text) {
   }, 4000);
 }
 
-// Split out from render() because this also needs to update live, every
-// animation frame, while the player is actively dragging a route — render()
-// itself only runs on data changes (poll/websocket), which is too infrequent
-// for a smooth "distance so far" readout during a drag.
-function renderExplorationPanel() {
-  const supplies = state.player.inventory.find((i) => i.id === 'supplies');
-  const suppliesCount = supplies ? supplies.count : 0;
-  const maxRange = state.player.maxExplorationRange;
-  document.getElementById('supplies-info').textContent =
-    `Supplies: ${suppliesCount} (max range: ${maxRange.toFixed(1)})`;
-
-  const exploreBtn = document.getElementById('explore-btn');
-  const drawHint = document.getElementById('draw-hint');
-  const drawStatus = document.getElementById('draw-status');
-  const drawControls = document.getElementById('draw-controls');
-  const confirmBtn = document.getElementById('confirm-btn');
-  const hasPendingPath = state.drawPath.length >= 2 && state.drawLength > 0;
-
-  if (state.player.expedition) {
-    exploreBtn.classList.remove('hidden');
-    exploreBtn.disabled = true;
-    // Calculate progress smoothly every frame instead of using the raw
-    // number from the server (which only updates once per poll) — otherwise
-    // this percentage would jump in visible steps while the map's progress
-    // line animates smoothly, even though they're the same progress.
-    const sync = state.expeditionSync;
-    const liveFraction = sync
-      ? Math.min(1, Math.max(0, (Date.now() - sync.startedAt) / 1000 / sync.durationSeconds))
-      : state.player.expedition.fraction;
-    exploreBtn.textContent = `Expedition underway (${Math.round(liveFraction * 100)}%)`;
-    drawHint.classList.add('hidden');
-    drawStatus.classList.add('hidden');
-    drawControls.classList.add('hidden');
-  } else if (state.drawMode) {
-    exploreBtn.classList.add('hidden');
-    drawHint.classList.toggle('hidden', hasPendingPath || state.isDrawing);
-    drawStatus.classList.remove('hidden');
-    const unitPerSupply = suppliesCount > 0 ? maxRange / suppliesCount : 0;
-    const suppliesCost = state.drawLength > 0 ? Math.max(1, Math.ceil(state.drawLength / unitPerSupply)) : 0;
-    drawStatus.textContent = `Route: ${state.drawLength.toFixed(1)} / ${maxRange.toFixed(1)}  —  Supplies to use: ${suppliesCost} / ${suppliesCount}`;
-    // Cancel must stay reachable the entire time draw mode is active (not
-    // just once a path exists) — without this, a player who clicks Explore
-    // and then doesn't draw anything has no visible way back out at all,
-    // since the Explore button itself is hidden for the whole time
-    // draw-mode is on. Confirm only makes sense once there's an actual path.
-    drawControls.classList.toggle('hidden', state.isDrawing);
-    confirmBtn.classList.toggle('hidden', !hasPendingPath);
-  } else {
-    exploreBtn.classList.remove('hidden');
-    exploreBtn.disabled = suppliesCount <= 0;
-    exploreBtn.textContent = suppliesCount <= 0 ? 'Need Supplies to Explore' : 'Explore';
-    drawHint.classList.add('hidden');
-    drawStatus.classList.add('hidden');
-    drawControls.classList.add('hidden');
-  }
-}
-
 function render() {
   if (!state.player) return;
 
   const gold = state.player.inventory.find((i) => i.id === 'gold');
   document.getElementById('gold-display').textContent = `Gold: ${gold ? gold.count : 0}`;
 
-  // sidebar: current location
-  const currentLoc = state.locations.find((l) => l.id === state.player.currentLocation);
-  document.getElementById('current-location').textContent = `Location: ${currentLoc ? currentLoc.name : '--'}`;
-
-  renderExplorationPanel();
+  renderOverworldTab();
   renderAllNodeSkills();
   renderCharacterTab();
   renderInventoryTab();
@@ -2049,128 +2084,6 @@ function render() {
   }
 }
 
-function drawMap() {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = '#24382c';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  state.markers = [];
-
-  const discovered = state.locations.filter((l) => state.player.discoveries.includes(l.id));
-
-  for (const loc of discovered) {
-    const { x, y } = percentToPixel(loc.x, loc.y);
-    const isCurrent = loc.id === state.player.currentLocation;
-    const radius = 10;
-
-    ctx.beginPath();
-    ctx.arc(x, y, radius, 0, Math.PI * 2);
-    ctx.fillStyle = isCurrent ? '#d8b04a' : loc.combat ? '#b3543f' : '#e8ddc7';
-    ctx.fill();
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = '#14110f';
-    ctx.stroke();
-
-    ctx.fillStyle = '#e8ddc7';
-    ctx.font = '14px Georgia, serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(loc.name, x, y - radius - 8);
-
-    state.markers.push({ x, y, r: radius, locationId: loc.id });
-  }
-
-  // other players, offset by index so multiple at the same spot don't fully overlap
-  const grouped = {};
-  for (const other of state.others) {
-    grouped[other.locationId] = grouped[other.locationId] || [];
-    grouped[other.locationId].push(other);
-  }
-  for (const [locationId, players] of Object.entries(grouped)) {
-    const loc = state.locations.find((l) => l.id === locationId);
-    if (!loc) continue;
-    const { x: baseX, y: baseY } = percentToPixel(loc.x, loc.y);
-    players.forEach((p, i) => {
-      const ox = baseX + 18 + (i % 3) * 14;
-      const oy = baseY + 14 + Math.floor(i / 3) * 14;
-      ctx.beginPath();
-      ctx.arc(ox, oy, 5, 0, Math.PI * 2);
-      ctx.fillStyle = '#7fae5a';
-      ctx.fill();
-      ctx.font = '11px Georgia, serif';
-      ctx.fillStyle = '#c9bfa7';
-      ctx.textAlign = 'left';
-      ctx.fillText(p.username, ox + 8, oy + 4);
-    });
-  }
-
-  drawExpedition();
-  drawInProgressPath();
-}
-
-// Draws the full route faintly, plus a brighter line that sweeps along it
-// as the expedition progresses. The sweep is calculated fresh every frame
-// from the expedition's fixed start time and duration, so it stays smooth
-// no matter how often the server is polled.
-function drawExpedition() {
-  const sync = state.expeditionSync;
-  if (!sync) return;
-
-  const fraction = Math.min(1, Math.max(0, (Date.now() - sync.startedAt) / 1000 / sync.durationSeconds));
-
-  const pixelPath = sync.path.map((p) => percentToPixel(p.x, p.y));
-
-  ctx.beginPath();
-  ctx.moveTo(pixelPath[0].x, pixelPath[0].y);
-  for (const p of pixelPath.slice(1)) ctx.lineTo(p.x, p.y);
-  ctx.strokeStyle = 'rgba(216, 176, 74, 0.35)';
-  ctx.lineWidth = 3;
-  ctx.setLineDash([6, 6]);
-  ctx.stroke();
-  ctx.setLineDash([]);
-
-  // The path's coordinates and totalLength are both in the map's own 0-100
-  // units, not screen pixels — so distance along the path must be measured
-  // in those same units too, or the sweep would be wildly off.
-  const targetLength = sync.totalLength * fraction;
-  let coveredLength = 0;
-  ctx.beginPath();
-  ctx.moveTo(pixelPath[0].x, pixelPath[0].y);
-  for (let i = 1; i < sync.path.length; i++) {
-    const aPct = sync.path[i - 1];
-    const bPct = sync.path[i];
-    const aPixel = pixelPath[i - 1];
-    const bPixel = pixelPath[i];
-    const segLength = Math.hypot(bPct.x - aPct.x, bPct.y - aPct.y);
-    if (coveredLength + segLength <= targetLength || sync.totalLength === 0) {
-      ctx.lineTo(bPixel.x, bPixel.y);
-      coveredLength += segLength;
-    } else {
-      const remaining = Math.max(0, targetLength - coveredLength);
-      const ratio = segLength > 0 ? remaining / segLength : 0;
-      ctx.lineTo(aPixel.x + (bPixel.x - aPixel.x) * ratio, aPixel.y + (bPixel.y - aPixel.y) * ratio);
-      break;
-    }
-  }
-  ctx.strokeStyle = '#ffd75e';
-  ctx.lineWidth = 3;
-  ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
-  ctx.stroke();
-}
-
-function drawInProgressPath() {
-  if (!state.drawMode || state.drawPath.length < 2) return;
-  const pixelPath = state.drawPath.map((p) => percentToPixel(p.x, p.y));
-  ctx.beginPath();
-  ctx.moveTo(pixelPath[0].x, pixelPath[0].y);
-  for (const p of pixelPath.slice(1)) ctx.lineTo(p.x, p.y);
-  ctx.strokeStyle = '#ffd75e';
-  ctx.lineWidth = 3;
-  ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
-  ctx.stroke();
-}
-
 // One item takes a few seconds — draw that as a clock-style pie fill
 // (starts at 12 o'clock, sweeps clockwise) so progress toward the next
 // item is visible in real time, not just on the ~2s server poll. Reused
@@ -2201,92 +2114,13 @@ function drawClock(clockCtx, size, fraction) {
   }
 }
 
-// The fight arena: the player is a dot fixed at the center. Each enemy sits
-// at its own fixed angle (picked once when the fight starts) and a distance
-// from center, so multiple enemies spread out instead of stacking on top of
-// each other. A dashed ring marks melee range, so it's obvious when a melee
-// attack would miss. The nearest living enemy — the default target — gets a
-// highlight ring so it's clear who an attack will hit.
-function drawArena(c) {
-  const canvas = document.getElementById('arena-canvas');
-  if (!canvas) return;
-  const actx = canvas.getContext('2d');
-  const size = canvas.width;
-  const cx = size / 2;
-  const cy = size / 2;
-  const maxR = size / 2 - 20;
-  actx.clearRect(0, 0, size, size);
-
-  const meleeR = (c.meleeRange / c.maxDistance) * maxR;
-  actx.beginPath();
-  actx.arc(cx, cy, meleeR, 0, Math.PI * 2);
-  actx.strokeStyle = 'rgba(216, 176, 74, 0.35)';
-  actx.lineWidth = 1;
-  actx.setLineDash([4, 4]);
-  actx.stroke();
-  actx.setLineDash([]);
-
-  const living = c.enemies.filter((e) => e.alive);
-  const target = living.reduce((a, b) => (!a || b.distance < a.distance ? b : a), null);
-
-  for (const e of c.enemies) {
-    const r = Math.min(maxR, (e.distance / c.maxDistance) * maxR);
-    const theta = (e.angle * Math.PI) / 180;
-    const ex = cx + Math.sin(theta) * r;
-    const ey = cy - Math.cos(theta) * r;
-
-    if (e.alive) {
-      actx.beginPath();
-      actx.moveTo(cx, cy);
-      actx.lineTo(ex, ey);
-      actx.strokeStyle = 'rgba(216, 176, 74, 0.2)';
-      actx.lineWidth = 1;
-      actx.stroke();
-    }
-
-    if (e.alive && target && e.uid === target.uid) {
-      actx.beginPath();
-      actx.arc(ex, ey, 17, 0, Math.PI * 2);
-      actx.strokeStyle = 'rgba(216, 176, 74, 0.7)';
-      actx.lineWidth = 2;
-      actx.stroke();
-    }
-
-    actx.beginPath();
-    actx.arc(ex, ey, 12, 0, Math.PI * 2);
-    actx.fillStyle = e.alive ? '#c0392b' : '#5a4a42';
-    actx.fill();
-    actx.strokeStyle = e.alive ? '#ffb3a1' : '#8a7a6f';
-    actx.lineWidth = 2;
-    actx.stroke();
-  }
-
-  actx.beginPath();
-  actx.arc(cx, cy, 10, 0, Math.PI * 2);
-  actx.fillStyle = '#d8b04a';
-  actx.fill();
-  actx.strokeStyle = '#fff3c9';
-  actx.lineWidth = 2;
-  actx.stroke();
-}
-
-// Animates the current ability's fill bar between polls, based on how much
-// time is left until the next combat round. Same trick as the mining/gather
-// clocks: the server sends a target time once, and the client recalculates
-// the fill fraction fresh every frame from that.
-function updateAbilitySlotFill(c) {
-  if (c.abilityCursor < 0 || c.abilityCursor > 5) return;
-  const fillEl = document.getElementById(`ability-slot-fill-${c.abilityCursor}`);
-  if (!fillEl || !c.nextTickAt || !c.tickIntervalSeconds) return;
-  const msUntilNextTick = c.nextTickAt - Date.now();
-  const fraction = Math.min(1, Math.max(0, 1 - msUntilNextTick / (c.tickIntervalSeconds * 1000)));
-  fillEl.style.width = `${fraction * 100}%`;
-}
-
-// biteAt is a fixed point in time from the server, so this just compares it
-// to the current time every frame — no extra math needed. Enabling the
-// button here is purely cosmetic; the server independently checks the real
-// timing and has the final say on whether a click actually counts.
+// biteAt is an absolute epoch-ms timestamp from the server (see
+// getFishingBite() in server/store.js), not a fixed-anchor progress fraction
+// like the clocks above — so no extrapolation math is needed at all, just a
+// direct Date.now() comparison every frame. The button is only ever
+// ENABLED here (a purely cosmetic client-side gate on when clicking is
+// worth trying); the server independently re-derives the same window and is
+// the sole authority on whether a click actually lands inside it.
 function updateFishingCatchButton() {
   const btn = document.getElementById('fishing-catch-btn');
   if (!btn) return;
@@ -2318,17 +2152,6 @@ function animate() {
       }
 
       updateFishingCatchButton();
-
-      if (state.player.combat && !state.player.combat.result) {
-        drawArena(state.player.combat);
-        updateAbilitySlotFill(state.player.combat);
-      }
-
-      drawMap();
-
-      if (state.drawMode || state.player.expedition) {
-        renderExplorationPanel();
-      }
     }
   } catch (err) {
     console.error('[animate] frame error (recovered):', err);

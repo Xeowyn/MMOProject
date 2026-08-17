@@ -62,11 +62,12 @@
   <main>
     <div id="tab-overworld" class="tab-panel">
       <div id="map-wrap">
-        <canvas id="map-canvas" width="1600" height="1000"></canvas>
-        <div id="map-controls">
-          <button id="zoom-in-btn" title="Zoom in">+</button>
-          <button id="zoom-out-btn" title="Zoom out">&minus;</button>
-          <button id="center-btn" title="Center on me">&#8982;</button>
+        <div id="world-grid-wrap">
+          <div id="world-grid"></div>
+        </div>
+        <div id="world-zoom-controls">
+          <button id="world-zoom-in-btn" title="Zoom in">+</button>
+          <button id="world-zoom-out-btn" title="Zoom out">&minus;</button>
         </div>
       </div>
 
@@ -74,13 +75,21 @@
         <section class="panel">
           <h2>Exploration</h2>
           <div id="current-location">Location: --</div>
-          <div id="supplies-info">Supplies: -- (max range --)</div>
-          <div id="draw-hint" class="hidden">Click and drag on the map to draw a route from your location, in any shape.</div>
-          <div id="draw-status" class="hidden"></div>
-          <button id="explore-btn">Explore</button>
-          <div id="draw-controls" class="hidden">
-            <button id="confirm-btn">Confirm Route</button>
-            <button id="cancel-btn">Cancel</button>
+          <div id="supplies-info">Supplies: --</div>
+          <p class="card-sub">Walking onto a tile you've never visited costs 1 supplies and reveals it for good. Re-walking known ground is free.</p>
+          <div id="world-message-line"></div>
+          <div id="world-dpad">
+            <button class="dpad-btn world-dpad-up" data-wdir="up">&uarr;</button>
+            <button class="dpad-btn world-dpad-left" data-wdir="left">&larr;</button>
+            <button class="dpad-btn world-dpad-right" data-wdir="right">&rarr;</button>
+            <button class="dpad-btn world-dpad-down" data-wdir="down">&darr;</button>
+          </div>
+          <div id="world-path-controls" class="hidden">
+            <div id="world-path-status"></div>
+            <div id="world-path-buttons">
+              <button id="world-confirm-btn">Confirm Route</button>
+              <button id="world-cancel-btn" class="btn-danger">Cancel</button>
+            </div>
           </div>
         </section>
 
@@ -188,45 +197,49 @@
       <div id="combat-idle">
         <div id="combat-idle-main">
           <div id="combat-location-info">Location: --</div>
-          <div id="combat-speed-controls-idle" class="speed-controls"></div>
           <div id="combat-enemy-list"></div>
-
-          <h3>Ability Loadout</h3>
-          <p class="card-sub">Abilities fire left to right, then loop back to the start. Select an ability from the panel on the right, then click a slot to place it &mdash; the selection stays active so you can fill several slots in a row.</p>
-          <div id="loadout-slots" class="ability-slot-row"></div>
-          <div id="ability-select-status" class="card-sub"></div>
+          <p class="card-sub">Once a fight starts: walk into an enemy to attack it, or use an item &mdash; each is one turn, then the enemy gets one back.</p>
         </div>
-
-        <aside id="ability-sidebar">
-          <h3>Abilities</h3>
-          <div id="ability-sidebar-list"></div>
-        </aside>
       </div>
 
       <div id="combat-active" class="hidden">
-        <div id="combat-speed-controls" class="speed-controls"></div>
+        <button id="combat-log-toggle">📜 Battle Log</button>
 
-        <div id="arena-wrap">
-          <canvas id="arena-canvas" width="360" height="360"></canvas>
+        <div id="combat-active-layout">
+          <div id="combat-active-main">
+            <div class="arena-combatant">
+              <div class="arena-combatant-header"><span>You</span><span id="player-hp-label"></span></div>
+              <div class="hp-bar-wrap"><div id="player-hp-fill" class="hp-bar-fill"></div></div>
+              <div id="player-status-line" class="effect-label"></div>
+            </div>
+
+            <div id="combat-grid-wrap"><div id="combat-grid"></div></div>
+            <div id="combat-enemy-hp-list"></div>
+
+            <div id="combat-message-line"></div>
+            <div id="combat-result" class="hidden"></div>
+
+            <div id="combat-dpad">
+              <button class="dpad-btn dpad-up" data-dir="up">&uarr;</button>
+              <button class="dpad-btn dpad-left" data-dir="left">&larr;</button>
+              <button class="dpad-btn dpad-right" data-dir="right">&rarr;</button>
+              <button class="dpad-btn dpad-down" data-dir="down">&darr;</button>
+            </div>
+
+            <div id="combat-turn-actions">
+              <button id="item-btn">🎒 Use Item</button>
+              <button id="flee-btn">Flee</button>
+            </div>
+            <div id="combat-item-menu" class="hidden"></div>
+
+            <button id="combat-continue-btn" class="hidden">Continue</button>
+          </div>
+
+          <aside id="combat-log-sidebar" class="hidden">
+            <h3>Battle Log</h3>
+            <div id="combat-log"></div>
+          </aside>
         </div>
-
-        <div class="arena-combatant">
-          <div class="arena-combatant-header"><span>You</span><span id="player-hp-label"></span></div>
-          <div class="hp-bar-wrap"><div id="player-hp-fill" class="hp-bar-fill"></div></div>
-          <div id="player-status-line" class="effect-label"></div>
-        </div>
-
-        <div id="enemy-list"></div>
-
-        <div id="combat-log"></div>
-
-        <h3>Ability Sequence</h3>
-        <div id="ability-slots-live" class="ability-slot-row"></div>
-
-        <div id="combat-result" class="hidden"></div>
-        <div id="combat-potions"></div>
-        <button id="flee-btn">Flee</button>
-        <button id="combat-continue-btn" class="hidden">Continue</button>
       </div>
     </div>
 

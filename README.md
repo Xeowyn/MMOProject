@@ -1,6 +1,6 @@
 # MMOProject
 
-This is a fantasy game you play in your web browser. You explore a map, fight monsters, collect stuff, grow plants, and chat with other players — all at the same time as your friends, because everyone connects to the same server.
+This is a fantasy game you play in your web browser. You walk around a huge world map, fight monsters in turn-based dungeon battles, collect stuff, grow plants, and chat with other players — all at the same time as your friends, because everyone connects to the same server.
 
 ## How to run it
 
@@ -20,12 +20,12 @@ npm install
 npm start
 ```
 
-Open **http://localhost:3000** in your browser, type in a username, and start playing. (Want the server to restart itself every time you save a code change? Use `npm run dev` instead of `npm start`.)
+Open **http://localhost:3002** in your browser, make an account, and start playing. (Want the server to restart itself every time you save a code change? Use `npm run dev` instead of `npm start`.)
 
 ## What you can do in the game
 
-- Walk around a big map and discover new places
-- Fight monsters in turn-based battles
+- Walk around a vast grid-based world, tile by tile, uncovering the map as you go — already-explored ground is always free to revisit, only new ground costs a supply
+- Fight monsters in classic-Roguelike dungeon battles: walk into an enemy to attack it, use potions as your turn, get stronger loot the farther you roam from the starting area
 - Buy and sell things at the shop, craft items, and grow crops in a garden
 - Talk to NPCs (computer-controlled characters) and do quests for them
 - Make an account with a username and password so your progress is saved
@@ -35,16 +35,17 @@ Open **http://localhost:3000** in your browser, type in a username, and start pl
 
 - **Backend (the server):** Node.js, Express, and a library called `ws` for real-time chat and updates
 - **Save file:** Everything is saved in one plain file (`data/db.json`) — no fancy database needed
-- **Frontend (what you see in the browser):** Plain JavaScript and an HTML5 Canvas (the drawing area), no extra tools required to build it
+- **Frontend (what you see in the browser):** Plain JavaScript and HTML, no extra tools required to build it
 
 ## How the project is organized
 
 - `server/server.js` — the Express app and WebSocket server. Handles every request the browser sends (`/api/...`) and keeps everyone's live game state in sync.
-- `server/store.js` — all the game data (items, monsters, NPCs, quests, recipes, and so on) plus the code that reads and writes player saves.
+- `server/store.js` — all the game data (items, monsters, NPCs, quests, recipes, the world map, and so on) plus the code that reads and writes player saves.
 - `public/` — everything the browser loads: `index.html`, `game.js`, `style.css`.
 - `data/db.json` — the save file. Everyone playing on the same server shares this one file — there's no separate database, your computer *is* the server.
 - `tools/start-playtest.bat` — a Windows shortcut that starts the server and opens a [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) so other people can connect over the internet without any port forwarding setup.
 - `MMOProject.exe` — the prebuilt standalone game. `npm run build-exe` rebuilds it from the current code.
+- `test/` — the automated test suite (`npm test`).
 
 ## Security basics
 
